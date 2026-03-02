@@ -13,9 +13,8 @@ This repo now runs **MakerStrategy v2**:
 
 1. Start in `DRY_RUN=true`.
 2. Use small quote size (`LEVEL_QUOTE_SIZE_USD=5..8`).
-3. Keep `KILL_SWITCH_FILE` enabled.
-4. Confirm signatures and endpoint behavior before live trading.
-5. Move to live only after observing stable dry-run behavior.
+3. Confirm signatures and endpoint behavior before live trading.
+4. Move to live only after observing stable dry-run behavior.
 
 ## Revolut X API Key / Private Key
 
@@ -42,6 +41,9 @@ npm run dev
 
 Dashboard:
 - `http://127.0.0.1:8787`
+- `http://127.0.0.1:8787/intel` (dedicated Intel Console)
+- `http://127.0.0.1:8787/performance` (performance analytics + adaptive controls)
+- Navigation uses a collapsible icon rail (state persisted in localStorage) and includes a direct Intel page link.
 
 ## V1 Control Room UI
 
@@ -57,8 +59,8 @@ The dashboard is now a premium dark "Control Room" layout and preserves all core
 - roadmap tab: current/next milestones with readiness indicators (edge, fills/hr, churn, pnl)
 
 Quick actions:
-- `Cancel All`, `Pause/Resume`, `Kill Switch`
-- keyboard shortcuts: `C` (cancel-all confirm), `P` (pause/resume), `Esc` (close modal)
+- `Cancel All`
+- keyboard shortcuts: `C` (cancel-all confirm), `Esc` (close modal)
 
 ## Commands
 
@@ -72,11 +74,78 @@ node dist/cli.js cancel-all      # cancel bot-tagged active orders
 node dist/cli.js cancel-all --all
 node dist/cli.js dry-run         # run one strategy cycle in dry-run mode
 node dist/cli.js simulate --minutes 5
+npm run signal-smoke            # cross-venue fair-price signal smoke test
+npm run test:elite-signals      # fair-mid model + regime classifier tests
+npm run test:adverse-guard      # adverse-selection guard transition tests
+npm run test:news-scorer        # deterministic headline scoring tests
+npm run test:news-engine        # decay-weighted aggregate news tests
+npm run test:news-guard         # news posture + cooldown tests
+npm run test:intel-cluster      # intel clustering + HALT confirmation rules
+npm run test:intel-smoke        # smoke test for /intel route (HTTP 200)
+npm run test:signals-scorer     # in-process signals scorer tests
+npm run test:signals-aggregate  # in-process signals aggregate/state tests
+npm run test:signals-guard      # in-process signals guard tests
+npm run test:performance-analysis # FIFO/edge/tox performance analytics tests
+npm run analysis-smoke           # sample fills/snapshots performance summary smoke script
 node dist/cli.js tune            # print spread tuning suggestion from last hour
 node dist/cli.js tune --apply    # apply BASE_HALF_SPREAD_BPS suggestion to .env
 npm run test:cancel-idempotency  # simulate 409 cancel response and verify idempotent handling
 npm run test:adaptive-events     # adaptive clamp + side cap + event ring buffer checks
+npm run test:runtime-overrides   # set/read/expire/clear runtime overrides smoke test
 ```
+
+## Runtime Overrides (No Redeploy)
+
+The dashboard now supports runtime overrides (per symbol) with validation and hard clamps.
+
+- UI:
+  - open `http://127.0.0.1:8787`
+  - go to `Overrides` tab
+  - apply a patch, review effective config, or clear overrides
+- API:
+  - `GET /api/overrides?symbol=BTC-USD`
+  - `POST /api/overrides/set`
+  - `POST /api/overrides/clear`
+  - `POST /api/overrides/reset-defaults` (same as clear)
+- Status:
+  - `/api/status` includes `overrides` and `effectiveConfig`
+- Audit trail:
+  - override changes are emitted as `OVERRIDE` events in recent events
+
+Examples:
+
+```bash
+curl -s http://127.0.0.1:8787/api/overrides?symbol=BTC-USD | jq .
+
+curl -s -X POST http://127.0.0.1:8787/api/overrides/set \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"BTC-USD","patch":{"levelsBuy":1,"levelsSell":1,"baseHalfSpreadBps":10,"allowBuy":true,"allowSell":true,"ttlSeconds":1800},"note":"tighten for low fill period"}'
+
+curl -s -X POST http://127.0.0.1:8787/api/overrides/clear \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"BTC-USD","note":"back to defaults"}'
+```
+
+Runtime path verification:
+- `curl -s http://127.0.0.1:8787/api/debug/fs | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/quote | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/signal | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/adverse | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/seed | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/venues | jq .`
+- `curl -s http://127.0.0.1:8787/api/news | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/news | jq .`
+- `curl -s http://127.0.0.1:8787/api/signals | jq .`
+- `curl -s http://127.0.0.1:8787/api/debug/signals | jq .`
+- `curl -s "http://127.0.0.1:8787/api/analysis/summary?window=1h" | jq .`
+- `curl -s "http://127.0.0.1:8787/api/analysis/fills?window=24h&limit=50" | jq .`
+- `curl -s "http://127.0.0.1:8787/api/analysis/equity_curve?window=24h" | jq .`
+- `curl -s http://127.0.0.1:8787/api/adaptive/status | jq .`
+
+Operational reference:
+- `RUNBOOK.md` (state interpretation + troubleshooting flow)
+- `RUNBOOK_NEWS.md` (news-source behavior and posture tuning)
+- `RUNBOOK_SIGNALS.md` (signals engine behavior and posture tuning)
 
 ## Environment Variables
 
@@ -113,6 +182,12 @@ Maker v2 quoting:
 - `TOB_QUOTE_SIZE_USD=3`
 - `TOB_MAX_VOL_BPS=35`
 - `TOB_QUOTE_SIZE_USD_NORMAL=3`
+- `SEED_MAX_SECONDS=120`
+- `SEED_MAX_REPOSTS=10`
+- `SEED_TAKER_USD=12`
+- `SEED_TAKER_SLIPPAGE_BPS=5`
+- `SEED_FORCE_TOB=true`
+- `SEED_HALF_SPREAD_BPS=2.5`
 - `TOB_MAX_INVENTORY_RATIO_FOR_BOTH=0.25`
 - `TOB_MAX_INVENTORY_RATIO_FOR_ONE_SIDED=0.60`
 - `SELL_THROTTLE_BELOW_LOWGATE=true`
@@ -126,6 +201,11 @@ Maker v2 quoting:
 
 Signals (influence-only):
 - `SIGNALS_ENABLED=true`
+- `SIGNAL_REFRESH_MS=1500`
+- `SIGNAL_MAX_QUOTE_AGE_MS=4500`
+- `SIGNAL_MIN_CONF=0.55`
+- `SIGNAL_USDT_DEGRADE=0.03`
+- `SIGNAL_VENUES=coinbase,kraken,binance`
 - `SIGNAL_MAX_SKEW_BPS=10`
 - `SIGNAL_ZSCORE_TO_SKEW=4`
 - `SIGNAL_DRIFT_TO_SKEW=0.25`
@@ -136,13 +216,177 @@ Signals (influence-only):
 - `SIGNAL_LEVELS_IN_HOT=1`
 Signals never place taker orders and only modulate spread width, skew, level count, and TOB micro gating.
 
+News signals:
+- `NEWS_ENABLED=true`
+- `NEWS_REFRESH_MS=60000`
+- `NEWS_MAX_ITEMS=200`
+- `NEWS_HALF_LIFE_MS=3600000`
+- `NEWS_MIN_CONF=0.60`
+- `NEWS_PAUSE_IMPACT=0.85`
+- `NEWS_PAUSE_SECONDS=180`
+- `NEWS_SPREAD_MULT=0.80`
+- `NEWS_SIZE_CUT_MULT=0.60`
+- `NEWS_SOURCES_RSS=` (optional comma-separated RSS URL override)
+- `NEWS_GDELT_QUERY=` (optional GDELT query override)
+- `NEWSAPI_KEY=` (optional; if missing NewsAPI provider is disabled)
+News modulates risk posture only: it can widen spreads, cut size, gate one side under inventory stress, or temporarily pause maker quotes during high-confidence shocks.
+
+In-process Signals Engine (same process, no second app):
+- `SIGNALS_ENABLED=true` (shared switch with existing signal features)
+- `SIGNALS_NEWS_REFRESH_MS=60000`
+- `SIGNALS_MACRO_ENABLED=true`
+- `SIGNALS_MACRO_REFRESH_MS=300000`
+- `SIGNALS_SYSTEM_REFRESH_MS=5000`
+- `SIGNALS_MAX_ITEMS=400`
+- `SIGNALS_HALF_LIFE_MS=3600000`
+- `SIGNALS_MIN_CONF=0.60`
+- `SIGNALS_PAUSE_IMPACT=0.90`
+- `SIGNALS_PAUSE_SECONDS=180`
+- `SIGNALS_SPREAD_MULT=0.80`
+- `SIGNALS_SIZE_CUT_MULT=0.60`
+- `SIGNALS_RSS_URLS=` (optional override list)
+- `SIGNALS_GDELT_QUERY=` (optional override query)
+- `SIGNALS_MACRO_URL=` (optional macro feed URL)
+- `SIGNALS_LLM_ENABLED=false`
+- `OPENAI_API_KEY=` (required only when `SIGNALS_LLM_ENABLED=true`)
+Signals endpoints on the same dashboard server:
+- `GET /api/signals`
+- `GET /api/signals/news`
+- `GET /api/signals/macro`
+- `GET /api/debug/signals`
+- `GET /api/intel/snapshot`
+- `GET /api/intel/health`
+- `GET /api/intel/commentary`
+- `GET /api/intel/debug`
+
+Intel UI routes:
+- `GET /` (trading cockpit, unchanged)
+- `GET /intel` (WorldMonitor-style Intel Console, 3-column)
+- `GET /?view=intel` (alias to Intel Console)
+
+Intel Console middle chart guide:
+- `Fair Price`: `signalFairMid` blended from cross-venue data.
+- `Global Mid`: robust cross-venue reference before RevX blending.
+- `RevX Mid`: current venue mid.
+- `Basis (bps)`: `(RevX - Fair) / Fair * 10,000` — large absolute values mean local dislocation.
+- `Dispersion (bps)`: cross-venue disagreement — rising dispersion means weaker price consensus.
+- `Confidence`: signal trust score from freshness + source agreement.
+- Threshold bands: `OK / WARN / RISK` bands are drawn from effective fair-price dispersion thresholds.
+- Current Action line maps posture to quoting behavior:
+  - `NORMAL`: baseline quoting.
+  - `CAUTION`: modest widen + size throttle.
+  - `RISK_OFF`: stronger widen + size throttle + TOB reduction.
+  - `HALT`: soft de-risk by default; hard block only when intel trade guard is explicitly enabled.
+
+Elite Intel + Fair Price + Adverse (in-process, optional):
+- `ENABLE_INTEL=true`
+- `ENABLE_INTEL_TRADE_GUARD=false` (default soft-only; does not hard-stop quoting)
+- `INTEL_MAX_ACTION=soften` (`soften|halt`)
+- `INTEL_CROSSVENUE_ACTION=soften` (`soften|ignore|halt`)
+- `INTEL_PROVIDER_DEGRADED_ACTION=ignore` (`ignore|soften|halt`)
+- `INTEL_FAST_POLL_SECONDS=10`
+- `INTEL_SLOW_POLL_SECONDS=60`
+- `INTEL_MAX_ITEMS=500`
+- `INTEL_DEDUPE_WINDOW_MIN=180`
+- `INTEL_DEDUPE_WINDOW_SECONDS=180`
+- `INTEL_EVENT_COOLDOWN_SECONDS=30`
+- `INTEL_MAX_HIGH_IMPACT_PER_MINUTE=2`
+- `ENABLE_FAIR_PRICE=true`
+- `FAIR_PRICE_MIN_VENUES=2`
+- `FAIR_PRICE_MAX_STALE_MS=15000`
+- `FAIR_PRICE_USDT_PENALTY_BPS=1.5`
+- `ENABLE_ADVERSE=true`
+- `INTEL_MAX_WIDEN_BPS=10`
+- `INTEL_MAX_SIZE_CUT=0.7`
+- `INTEL_MAX_SKEW_BPS=12`
+- `INTEL_HALT_IMPACT=0.95`
+- `INTEL_HALT_SECONDS=90`
+- `INTEL_DECAY_MINUTES=30`
+- `ENABLE_GDELT=true`
+- `ENABLE_RSS=true`
+- `ENABLE_CRYPTOPANIC=false`
+- `ENABLE_NEWSAPI=false`
+- `ENABLE_X=false`
+- `GDELT_QUERY=...`
+- `GDELT_MAX_ARTICLES=25`
+- `RSS_URLS=...`
+- `X_BEARER_TOKEN=`
+- `X_QUERY=...`
+- `X_MAX_RESULTS_PER_POLL=10`
+- `UI_SHOW_DIAGNOSTICS_DRAWER=true`
+- `UI_DIAGNOSTICS_DEFAULT_OPEN=false`
+- `UI_HEADER_MAX_ROWS=2`
+
+Intel posture decisioning (production safety):
+- Provider degradation never triggers HALT by itself; provider errors reduce confidence and stay in diagnostics.
+- Cross-venue dispersion spikes default to DE-RISK/soften, not hard HALT.
+- HALT requires either:
+1. High-impact intel cluster confirmed by >=2 independent providers.
+2. News + market anomaly alignment.
+- Otherwise posture prefers `DE-RISK` (spread widen + size throttle + optional TOB off), with hysteresis and cooldown to avoid flip-flopping.
+
+Cross-venue fair-price signals (analytics/fair-mid only):
+- `ENABLE_CROSS_VENUE_SIGNALS=true`
+- `VENUE_REFRESH_MS=1000`
+- `VENUE_STALE_MS=5000`
+- `VENUE_TIMEOUT_MS=1200`
+- `VENUE_MAX_BACKOFF_MS=30000`
+- `FAIR_DRIFT_MAX_BPS=8`
+- `FAIR_BASIS_MAX_BPS=10`
+- `FAIR_STALE_MS=2500`
+- `FAIR_MIN_VENUES=3`
+- `FAIR_MAX_DISPERSION_BPS=10`
+- `FAIR_MAX_BASIS_BPS=12`
+- `TOXIC_DRIFT_BPS=12`
+- `HOT_VOL_BPS=35`
+- `VENUE_WEIGHTS_JSON={"coinbase":1.0,"binance":1.0,"kraken":0.8}`
+These inputs do not place taker orders or force trades by themselves; they feed analytics + fair-mid telemetry.
+
 Spread control:
 - `MIN_INSIDE_SPREAD_BPS=0.5`
-- `MIN_VOL_MOVE_BPS_TO_QUOTE=5`
+- `MIN_VOL_MOVE_BPS_TO_QUOTE=0`
+- `VOL_PROTECT_MODE=widen` (`widen` or `block`)
+- `VOL_WIDEN_MULT_MIN=1.25`
+- `VOL_WIDEN_MULT_MAX=1.75`
 - `VOL_WINDOW_SECONDS=60`
 - `VOL_PAUSE_BPS=70`
 - `VOL_SPREAD_MULT_MIN=1.0`
 - `VOL_SPREAD_MULT_MAX=2.2`
+- `MAKER_FEE_BPS=0`
+- `TAKER_FEE_BPS=9`
+- `FEES_MAKER_BPS=1.0` (legacy alias; `MAKER_FEE_BPS` wins)
+- `FEES_TAKER_BPS=4.0` (legacy alias; `TAKER_FEE_BPS` wins)
+- `MIN_REALIZED_EDGE_BPS=4`
+- `MIN_TAKER_EDGE_BPS=14`
+- `EDGE_SAFETY_BPS=1.2`
+- `ENABLE_ADVERSE_SELECTION_LOOP=true`
+- `ADVERSE_ENABLED=true`
+- `ADVERSE_MARKOUT_WINDOWS_MS=5000,15000,60000`
+- `ADVERSE_TOXIC_MARKOUT_BPS=-4`
+- `ADVERSE_MIN_FILLS=3`
+- `ADVERSE_DECAY=0.90`
+- `ADVERSE_STATE_THRESHOLDS=0.35,0.55,0.75,0.90`
+- `ADVERSE_MAX_SPREAD_MULT=2.25`
+- `AS_HORIZON_SECONDS=10`
+- `AS_SAMPLE_FILLS=60`
+- `AS_BAD_AVG_BPS=4`
+- `AS_BAD_RATE=0.55`
+- `AS_BAD_FILL_BPS=-6`
+- `AS_WIDEN_STEP_BPS=2`
+- `AS_MAX_WIDEN_BPS=10`
+- `AS_DISABLE_TOB_ON_TOXIC=true`
+- `AS_COOLDOWN_SECONDS=120`
+- `AS_REDUCE_LEVELS_ON_TOXIC=true`
+- `AS_LEVELS_FLOOR=1`
+- `AS_DECAY_BPS_PER_MIN=1`
+- `SEED_ENABLED=true`
+- `ENABLE_TAKER_SEED=false`
+- `SEED_TAKER_MAX_USD=15`
+- `SEED_TAKER_MAX_SLIPPAGE_BPS=6`
+- `HEDGE_ENABLED=true`
+- `HEDGE_MAX_USD_PER_MIN=30`
+- `HEDGE_MAX_SLIPPAGE_BPS=8`
+- `HEDGE_ONLY_WHEN_CONFIDENT=true`
 Inside spread is not the main profit source for this maker strategy.
 The bot quotes wider (`BASE_HALF_SPREAD_BPS`) and needs enough movement to realize edge.
 
@@ -177,11 +421,10 @@ Metrics/runtime:
 - `DEBUG_BALANCES=false` (when true, logs one-time raw balance field diagnostics)
 - `DB_PATH=./revx-bot.sqlite`
 - `DRY_RUN=true`
-- `KILL_SWITCH_FILE=./KILL`
-- `PAUSE_SWITCH_FILE=./PAUSE`
 - `DASHBOARD_ENABLED=true`
 - `DASHBOARD_PORT=8787`
 - `MAX_UI_EVENTS=500` (dashboard event buffer and `/api/status?limit=` default)
+- `MAX_SIGNAL_POINTS=2000` (bounded signal/external snapshot history in store)
 - `MAX_EQUITY_POINTS=5000` (in-memory ring buffer for equity chart points)
 - `EQUITY_SAMPLE_MS=2000` (equity series bucket/dedupe interval in ms)
 - `PERSIST_EQUITY_SERIES=false` (persist equity series to localStorage between refreshes)
@@ -215,17 +458,18 @@ Storage backend notes:
 Each loop:
 1. Reconcile first (balances + active orders + fills).
 2. Read ticker and mid.
-3. Skip/cancel quoting only when both conditions are true:
-inside spread below `MIN_INSIDE_SPREAD_BPS` and movement below `MIN_VOL_MOVE_BPS_TO_QUOTE`.
-4. Compute volatility move in `VOL_WINDOW_SECONDS`.
-5. Pause if move exceeds `VOL_PAUSE_BPS`.
-6. Compute spread multiplier within `[VOL_SPREAD_MULT_MIN, VOL_SPREAD_MULT_MAX]`.
-7. Apply adaptive half-spread within `[MIN_HALF_SPREAD_BPS, MAX_HALF_SPREAD_BPS]` using recent fill rate and calm-vol checks.
-8. Compute inventory ratio from reconciled BTC notional vs dynamic or fixed target.
-9. Apply inventory skew (`SKEW_MAX_BPS`) and trend toxicity guard.
-10. Build side-aware multi-level quotes (`LEVELS`) with post-only-safe rounding.
-11. Manage cancel/replace/queue-refresh with minimum order age.
-12. Respect per-loop action budget (`MAX_ACTIONS_PER_LOOP`).
+3. Build a quote plan (buy/sell levels + TOB mode + blocked reasons) and persist it in `botStatus.quoting`.
+4. Apply low-movement protection using `VOL_PROTECT_MODE`:
+   `block` disables quoting; `widen` keeps quoting and widens half-spread.
+5. Compute volatility move in `VOL_WINDOW_SECONDS`.
+6. Pause if move exceeds `VOL_PAUSE_BPS`.
+7. Compute spread multiplier within `[VOL_SPREAD_MULT_MIN, VOL_SPREAD_MULT_MAX]`.
+8. Apply adaptive half-spread within `[MIN_HALF_SPREAD_BPS, MAX_HALF_SPREAD_BPS]` using recent fill rate and calm-vol checks.
+9. Compute inventory ratio from reconciled BTC notional vs dynamic or fixed target.
+10. Apply inventory skew (`SKEW_MAX_BPS`) and trend toxicity guard.
+11. Build side-aware multi-level quotes (`LEVELS`) with post-only-safe rounding.
+12. Manage cancel/replace/queue-refresh with minimum order age.
+13. Respect per-loop action budget (`MAX_ACTIONS_PER_LOOP`).
 
 Notes:
 - Orders are always limit + post_only.
@@ -317,5 +561,4 @@ Headers:
 1. `DRY_RUN=true`: dashboard/CLI shows changing target quotes.
 2. `DRY_RUN=false`: 2–4 active bot orders appear.
 3. Move in mid: orders reprice and tags/levels remain consistent.
-4. Create `./KILL`: bot cancels bot orders and exits.
-5. Sharp move > `VOL_PAUSE_BPS`: bot cancels and pauses for `PAUSE_SECONDS_ON_VOL`.
+4. Sharp move > `VOL_PAUSE_BPS`: bot cancels and pauses for `PAUSE_SECONDS_ON_VOL`.

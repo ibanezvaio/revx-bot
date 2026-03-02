@@ -4,6 +4,16 @@ const ASSET_ALIASES: Record<string, string> = {
   XBT: "BTC"
 };
 
+export const BASE_ASSET_ALIAS_GROUPS: Record<string, string[]> = {
+  BTC: ["BTC", "XBT"],
+  XBT: ["BTC", "XBT"]
+};
+
+export const QUOTE_ASSET_REPORTING_ALIAS_GROUPS: Record<string, string[]> = {
+  USD: ["USD", "USDC"],
+  USDC: ["USD", "USDC"]
+};
+
 export type BalanceDiagnostic = {
   asset: string;
   rawAsset: string;
@@ -72,6 +82,15 @@ export function findAsset(snapshots: BalanceSnapshot[], codes: string[]): Balanc
   }
 
   return null;
+}
+
+export function getAssetCandidates(asset: string, role: "base" | "quote"): string[] {
+  const normalized = normalizeAssetCode(asset);
+  if (!normalized) return [];
+  if (role === "base") {
+    return BASE_ASSET_ALIAS_GROUPS[normalized] ?? [normalized];
+  }
+  return QUOTE_ASSET_REPORTING_ALIAS_GROUPS[normalized] ?? [normalized];
 }
 
 function parseSingleBalanceRow(

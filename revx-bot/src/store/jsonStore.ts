@@ -1,9 +1,22 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
+import {
+  computeEffectiveRuntimeConfig,
+  EffectiveRuntimeConfig,
+  isRuntimeOverrideExpired,
+  RuntimeOverrideContext,
+  RuntimeOverrideDefaults,
+  RuntimeOverridesInput,
+  RuntimeOverridesMeta,
+  RuntimeOverridesRecord,
+  mergeRuntimeOverrides
+} from "../overrides/runtimeOverrides";
 import {
   BalanceSnapshot,
   BotEvent,
   BotStatus,
+  ExternalVenueSnapshot,
   FillRecord,
   MetricRecord,
   OrderHistoryRecord,
@@ -11,7 +24,10 @@ import {
   OrderUpsert,
   ReconcilerState,
   RollingMetrics,
+  VenueQuote,
+  SignalSnapshot,
   Store,
+  normalizeLegacyPauseFileBotStatus,
   StrategyDecision,
   TickerSnapshot
 } from "./Store";
@@ -27,6 +43,9 @@ type JsonDb = {
   strategyDecisions: StrategyDecision[];
   metrics: MetricRecord[];
   botEvents: BotEvent[];
+  externalPriceSnapshots: ExternalVenueSnapshot[];
+  signalSnapshots: SignalSnapshot[];
+  runtime_overrides: Record<string, RuntimeOverridesRecord>;
 };
 
 const ACTIVE_STATUSES = new Set([
@@ -45,6 +64,7 @@ const MAX_TICKER_SNAPSHOTS = 200_000;
 const MAX_STRATEGY_DECISIONS = 20_000;
 const MAX_METRICS = 60_000;
 const DEFAULT_MAX_BOT_EVENTS = 10_000;
+const DEFAULT_MAX_SIGNAL_POINTS = 2_000;
 
 export class JsonStore implements Store {
   private state: JsonDb = {
@@ -57,13 +77,24 @@ export class JsonStore implements Store {
     tickerSnapshots: [],
     strategyDecisions: [],
     metrics: [],
-    botEvents: []
+    botEvents: [],
+    externalPriceSnapshots: [],
+    signalSnapshots: [],
+    runtime_overrides: {}
   };
+  private readonly runtimeDefaults: RuntimeOverrideDefaults;
 
   constructor(
     private readonly filePath: string,
-    private readonly options?: { maxBotEvents?: number; eventDedupe?: boolean }
-  ) {}
+    private readonly options?: {
+      maxBotEvents?: number;
+      maxSignalPoints?: number;
+      eventDedupe?: boolean;
+      runtimeDefaults?: RuntimeOverrideDefaults;
+    }
+  ) {
+    this.runtimeDefaults = options?.runtimeDefaults ?? defaultRuntimeOverrideDefaults();
+  }
 
   init(): void {
     if (existsSync(this.filePath)) {
@@ -82,7 +113,17 @@ export class JsonStore implements Store {
         tickerSnapshots: Array.isArray(parsed.tickerSnapshots) ? parsed.tickerSnapshots : [],
         strategyDecisions: Array.isArray(parsed.strategyDecisions) ? parsed.strategyDecisions : [],
         metrics: Array.isArray(parsed.metrics) ? parsed.metrics : [],
-        botEvents: Array.isArray(parsed.botEvents) ? parsed.botEvents : []
+        botEvents: Array.isArray(parsed.botEvents) ? parsed.botEvents : [],
+        externalPriceSnapshots: Array.isArray(parsed.externalPriceSnapshots)
+          ? (parsed.externalPriceSnapshots as ExternalVenueSnapshot[])
+          : [],
+        signalSnapshots: Array.isArray(parsed.signalSnapshots)
+          ? (parsed.signalSnapshots as SignalSnapshot[])
+          : [],
+        runtime_overrides:
+          parsed.runtime_overrides && typeof parsed.runtime_overrides === "object"
+            ? (parsed.runtime_overrides as Record<string, RuntimeOverridesRecord>)
+            : {}
       };
 
       if (this.state.orderHistory.length === 0 && this.state.orders.length > 0) {
@@ -105,6 +146,17 @@ export class JsonStore implements Store {
 
       if (this.state.botEvents.length > this.maxBotEvents()) {
         trimTail(this.state.botEvents, this.maxBotEvents());
+      }
+      if (this.state.externalPriceSnapshots.length > this.maxSignalPoints() * 8) {
+        trimTail(this.state.externalPriceSnapshots, this.maxSignalPoints() * 8);
+      }
+      if (this.state.signalSnapshots.length > this.maxSignalPoints()) {
+        trimTail(this.state.signalSnapshots, this.maxSignalPoints());
+      }
+      const normalizedStatus = normalizeLegacyPauseFileBotStatus(this.state.botStatus);
+      if (normalizedStatus !== this.state.botStatus) {
+        this.state.botStatus = normalizedStatus;
+        this.flush();
       }
 
       return;
@@ -199,6 +251,10 @@ export class JsonStore implements Store {
     return this.state.orders
       .filter((o) => o.is_bot === 1)
       .filter((o) => (symbol ? o.symbol === symbol : true))
+      .filter((o) => {
+        const venueOrderId = String(o.venue_order_id ?? "").trim();
+        return venueOrderId.length > 0;
+      })
       .filter((o) => ACTIVE_STATUSES.has(normalizeStatus(o.status)))
       .sort((a, b) => b.updated_at - a.updated_at);
   }
@@ -239,11 +295,16 @@ export class JsonStore implements Store {
   }
 
   upsertBotStatus(status: BotStatus): void {
-    this.state.botStatus = status;
+    this.state.botStatus = normalizeLegacyPauseFileBotStatus(status);
     this.flush();
   }
 
   getBotStatus(): BotStatus | null {
+    const normalized = normalizeLegacyPauseFileBotStatus(this.state.botStatus);
+    if (normalized !== this.state.botStatus) {
+      this.state.botStatus = normalized;
+      this.flush();
+    }
     return this.state.botStatus;
   }
 
@@ -322,6 +383,64 @@ export class JsonStore implements Store {
   getRecentTickerSnapshots(symbol: string, limit: number): TickerSnapshot[] {
     return this.state.tickerSnapshots
       .filter((t) => t.symbol === symbol)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
+  }
+
+  recordExternalPriceSnapshot(snapshot: ExternalVenueSnapshot): void {
+    const exists = this.state.externalPriceSnapshots.some(
+      (row) =>
+        row.symbol === snapshot.symbol &&
+        row.venue === snapshot.venue &&
+        row.ts === snapshot.ts
+    );
+    if (exists) return;
+    this.state.externalPriceSnapshots.push(snapshot);
+    trimTail(this.state.externalPriceSnapshots, this.maxSignalPoints() * 8);
+    this.flush();
+  }
+
+  recordSignalSnapshot(snapshot: SignalSnapshot): void {
+    const exists = this.state.signalSnapshots.some(
+      (row) => row.symbol === snapshot.symbol && row.ts === snapshot.ts
+    );
+    if (exists) return;
+    this.state.signalSnapshots.push(snapshot);
+    trimTail(this.state.signalSnapshots, this.maxSignalPoints());
+    this.flush();
+  }
+
+  getRecentExternalPriceSnapshots(symbol: string, limit: number): ExternalVenueSnapshot[] {
+    return this.state.externalPriceSnapshots
+      .filter((row) => row.symbol === symbol)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
+  }
+
+  getLatestVenueQuotes(symbol: string): VenueQuote[] {
+    const latestByVenue = new Map<string, ExternalVenueSnapshot>();
+    for (const row of this.state.externalPriceSnapshots) {
+      if (row.symbol !== symbol) continue;
+      const current = latestByVenue.get(row.venue);
+      if (!current || row.ts > current.ts) {
+        latestByVenue.set(row.venue, row);
+      }
+    }
+    return Array.from(latestByVenue.values())
+      .sort((a, b) => a.venue.localeCompare(b.venue))
+      .map((row) => ({
+        venue: row.venue,
+        bid: row.bid ?? null,
+        ask: row.ask ?? null,
+        mid: row.mid ?? null,
+        ts: row.ts,
+        error: row.error ?? null
+      }));
+  }
+
+  getRecentSignalSnapshots(symbol: string, limit: number): SignalSnapshot[] {
+    return this.state.signalSnapshots
+      .filter((row) => row.symbol === symbol)
       .sort((a, b) => b.ts - a.ts)
       .slice(0, limit);
   }
@@ -436,12 +555,126 @@ export class JsonStore implements Store {
     };
   }
 
+  getRuntimeOverrides(symbol: string): RuntimeOverridesRecord | null {
+    const key = normalizeSymbol(symbol);
+    const current = this.state.runtime_overrides[key] ?? null;
+    if (!current) return null;
+    if (!isRuntimeOverrideExpired(current)) {
+      return current;
+    }
+
+    delete this.state.runtime_overrides[key];
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "EXPIRE",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        action: "EXPIRE",
+        expired_at_ms: current.expiresAtMs,
+        updated_at_ms: current.updatedAtMs
+      })
+    });
+    this.flush();
+    return null;
+  }
+
+  setRuntimeOverrides(
+    symbol: string,
+    patch: Partial<RuntimeOverridesInput>,
+    meta?: RuntimeOverridesMeta
+  ): RuntimeOverridesRecord {
+    const key = normalizeSymbol(symbol);
+    const existing = this.getRuntimeOverrides(key);
+    const result = mergeRuntimeOverrides(
+      key,
+      existing,
+      patch as Partial<Record<string, unknown>>,
+      this.runtimeDefaults,
+      meta,
+      { usdTotal: latestAssetTotal(this.state.balances, "USD") }
+    );
+    this.state.runtime_overrides[key] = result.overrides;
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "SET",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        warnings: result.warnings,
+        unknown_keys: result.unknownKeys,
+        overrides: result.overrides
+      })
+    });
+    this.flush();
+    return result.overrides;
+  }
+
+  clearRuntimeOverrides(symbol: string, meta?: RuntimeOverridesMeta): void {
+    const key = normalizeSymbol(symbol);
+    const existing = this.state.runtime_overrides[key];
+    if (!existing) return;
+    delete this.state.runtime_overrides[key];
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: meta?.nowMs ?? Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "CLEAR",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        action: "CLEAR",
+        source: meta?.source ?? "dashboard",
+        note: meta?.note ?? "",
+        previous: existing
+      })
+    });
+    this.flush();
+  }
+
+  getEffectiveConfig(symbol: string, context?: RuntimeOverrideContext): EffectiveRuntimeConfig {
+    const key = normalizeSymbol(symbol);
+    const effective = computeEffectiveRuntimeConfig(this.runtimeDefaults, this.getRuntimeOverrides(key));
+    const usdTotal =
+      context?.usdTotal ??
+      latestAssetTotal(this.state.balances, "USD");
+    if (Number.isFinite(usdTotal ?? Number.NaN) && effective.cashReserveUsd > Number(usdTotal)) {
+      effective.cashReserveUsd = Math.max(0, Number(usdTotal));
+    }
+    return effective;
+  }
+
   private flush(): void {
-    writeFileSync(this.filePath, JSON.stringify(this.state), "utf8");
+    const tmpPath = `${this.filePath}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify(this.state), "utf8");
+    renameSync(tmpPath, this.filePath);
   }
 
   private maxBotEvents(): number {
     return Math.max(500, this.options?.maxBotEvents ?? DEFAULT_MAX_BOT_EVENTS);
+  }
+
+  private maxSignalPoints(): number {
+    return Math.max(200, this.options?.maxSignalPoints ?? DEFAULT_MAX_SIGNAL_POINTS);
   }
 }
 
@@ -458,4 +691,48 @@ function dayStartTs(nowTs: number): number {
   const d = new Date(nowTs);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
+}
+
+function normalizeSymbol(symbol: string): string {
+  return symbol.trim().toUpperCase().replace("/", "-");
+}
+
+function latestAssetTotal(rows: BalanceSnapshot[], asset: string): number | undefined {
+  const needle = asset.trim().toUpperCase();
+  let latestTs = -1;
+  let total: number | undefined;
+  for (const row of rows) {
+    if (row.asset.toUpperCase() !== needle) continue;
+    if (row.ts >= latestTs) {
+      latestTs = row.ts;
+      total = row.total;
+    }
+  }
+  return total;
+}
+
+function defaultRuntimeOverrideDefaults(): RuntimeOverrideDefaults {
+  return {
+    symbol: "BTC-USD",
+    enabled: true,
+    allowBuy: true,
+    allowSell: true,
+    levelsBuy: 2,
+    levelsSell: 2,
+    levelQuoteSizeUsd: 8,
+    baseHalfSpreadBps: 18,
+    levelStepBps: 10,
+    minMarketSpreadBps: 0.5,
+    repriceMoveBps: 10,
+    queueRefreshSeconds: 90,
+    tobEnabled: false,
+    tobQuoteSizeUsd: 3,
+    targetBtcNotionalUsd: 80,
+    maxBtcNotionalUsd: 120,
+    skewMaxBps: 25,
+    cashReserveUsd: 60,
+    workingCapUsd: 100,
+    maxActiveOrders: 10,
+    maxActionsPerLoop: 4
+  };
 }

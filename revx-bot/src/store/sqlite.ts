@@ -1,8 +1,21 @@
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import {
+  computeEffectiveRuntimeConfig,
+  EffectiveRuntimeConfig,
+  isRuntimeOverrideExpired,
+  RuntimeOverrideContext,
+  RuntimeOverrideDefaults,
+  RuntimeOverridesInput,
+  RuntimeOverridesMeta,
+  RuntimeOverridesRecord,
+  mergeRuntimeOverrides
+} from "../overrides/runtimeOverrides";
 import {
   BalanceSnapshot,
   BotEvent,
   BotStatus,
+  ExternalVenueSnapshot,
   FillRecord,
   MetricRecord,
   OrderHistoryRecord,
@@ -10,7 +23,10 @@ import {
   OrderUpsert,
   ReconcilerState,
   RollingMetrics,
+  VenueQuote,
+  SignalSnapshot,
   Store,
+  normalizeLegacyPauseFileBotStatus,
   StrategyDecision,
   TickerSnapshot
 } from "./Store";
@@ -26,12 +42,17 @@ const ACTIVE_STATUSES = [
   "SUBMITTING"
 ];
 
+const MAX_SIGNAL_SNAPSHOTS = 50_000;
+const MAX_EXTERNAL_SNAPSHOTS = 200_000;
+
 export class SQLiteStore implements Store {
   private readonly db: Database.Database;
+  private readonly runtimeDefaults: RuntimeOverrideDefaults;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, runtimeDefaults?: RuntimeOverrideDefaults) {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    this.runtimeDefaults = runtimeDefaults ?? defaultRuntimeOverrideDefaults();
   }
 
   init(): void {
@@ -97,6 +118,8 @@ export class SQLiteStore implements Store {
         tob_mode TEXT,
         tob_reason TEXT,
         sell_throttle_state TEXT,
+        quoting_json TEXT,
+        quoting_inputs_json TEXT,
         allow_buy INTEGER NOT NULL,
         allow_sell INTEGER NOT NULL,
         buy_reasons TEXT NOT NULL,
@@ -150,6 +173,47 @@ export class SQLiteStore implements Store {
 
       CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_symbol_ts ON ticker_snapshots(symbol, ts);
 
+      CREATE TABLE IF NOT EXISTS external_price_snapshots (
+        symbol TEXT NOT NULL,
+        venue TEXT NOT NULL,
+        quote TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        bid REAL,
+        ask REAL,
+        mid REAL,
+        spread_bps REAL,
+        latency_ms INTEGER NOT NULL,
+        ok INTEGER NOT NULL,
+        error TEXT,
+        PRIMARY KEY(symbol, venue, ts)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_external_price_snapshots_symbol_ts
+        ON external_price_snapshots(symbol, ts);
+
+      CREATE TABLE IF NOT EXISTS signal_snapshots (
+        symbol TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        revx_mid REAL NOT NULL,
+        global_mid REAL NOT NULL,
+        fair_mid REAL NOT NULL,
+        basis_bps REAL NOT NULL,
+        drift_bps REAL NOT NULL,
+        stdev_bps REAL NOT NULL,
+        z_score REAL NOT NULL,
+        confidence REAL NOT NULL,
+        dispersion_bps REAL NOT NULL,
+        vol_regime TEXT NOT NULL,
+        drift_component_bps REAL NOT NULL,
+        basis_correction_bps REAL NOT NULL,
+        healthy_venues INTEGER NOT NULL,
+        total_venues INTEGER NOT NULL,
+        PRIMARY KEY(symbol, ts)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_signal_snapshots_symbol_ts
+        ON signal_snapshots(symbol, ts);
+
       CREATE TABLE IF NOT EXISTS strategy_decisions (
         ts INTEGER PRIMARY KEY,
         mid REAL NOT NULL,
@@ -177,11 +241,19 @@ export class SQLiteStore implements Store {
         venue_order_id TEXT,
         client_order_id TEXT NOT NULL,
         reason TEXT NOT NULL,
-        bot_tag TEXT NOT NULL
+        bot_tag TEXT NOT NULL,
+        details_json TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_bot_events_ts ON bot_events(ts);
       CREATE INDEX IF NOT EXISTS idx_bot_events_type_ts ON bot_events(type, ts);
+
+      CREATE TABLE IF NOT EXISTS runtime_overrides (
+        symbol TEXT PRIMARY KEY,
+        json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
 
     ensureColumn(this.db, "orders", "bot_tag", "TEXT");
@@ -207,8 +279,11 @@ export class SQLiteStore implements Store {
     ensureColumn(this.db, "bot_status", "tob_mode", "TEXT");
     ensureColumn(this.db, "bot_status", "tob_reason", "TEXT");
     ensureColumn(this.db, "bot_status", "sell_throttle_state", "TEXT");
+    ensureColumn(this.db, "bot_status", "quoting_json", "TEXT");
+    ensureColumn(this.db, "bot_status", "quoting_inputs_json", "TEXT");
     ensureColumn(this.db, "fills", "mid_at_fill", "REAL");
     ensureColumn(this.db, "fills", "edge_bps", "REAL");
+    ensureColumn(this.db, "bot_events", "details_json", "TEXT");
   }
 
   close(): void {
@@ -318,9 +393,11 @@ export class SQLiteStore implements Store {
         .prepare(
           `
           SELECT *
-            FROM orders
+           FROM orders
            WHERE is_bot = 1
              AND symbol = ?
+             AND venue_order_id IS NOT NULL
+             AND TRIM(venue_order_id) <> ''
              AND status IN (${placeholders})
            ORDER BY updated_at DESC
         `
@@ -334,6 +411,8 @@ export class SQLiteStore implements Store {
         SELECT *
           FROM orders
          WHERE is_bot = 1
+           AND venue_order_id IS NOT NULL
+           AND TRIM(venue_order_id) <> ''
            AND status IN (${placeholders})
          ORDER BY updated_at DESC
       `
@@ -466,11 +545,13 @@ export class SQLiteStore implements Store {
           tob_mode,
           tob_reason,
           sell_throttle_state,
+          quoting_json,
+          quoting_inputs_json,
           allow_buy,
           allow_sell,
           buy_reasons,
           sell_reasons
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           ts = excluded.ts,
           mid = excluded.mid,
@@ -495,6 +576,8 @@ export class SQLiteStore implements Store {
           tob_mode = excluded.tob_mode,
           tob_reason = excluded.tob_reason,
           sell_throttle_state = excluded.sell_throttle_state,
+          quoting_json = excluded.quoting_json,
+          quoting_inputs_json = excluded.quoting_inputs_json,
           allow_buy = excluded.allow_buy,
           allow_sell = excluded.allow_sell,
           buy_reasons = excluded.buy_reasons,
@@ -525,6 +608,8 @@ export class SQLiteStore implements Store {
         status.tob_mode ?? null,
         status.tob_reason ?? null,
         status.sell_throttle_state ?? null,
+        status.quoting ? JSON.stringify(status.quoting) : null,
+        status.quoting_inputs ? JSON.stringify(status.quoting_inputs) : null,
         status.allow_buy ? 1 : 0,
         status.allow_sell ? 1 : 0,
         JSON.stringify(status.buy_reasons),
@@ -540,7 +625,7 @@ export class SQLiteStore implements Store {
                spread_mult, inventory_ratio, skew_bps_applied,
                fills_30m, fills_1h, avg_edge_buy_1h, avg_edge_sell_1h, cancels_1h, rejects_1h,
                adaptive_spread_bps_delta, churn_warning, action_budget_used, action_budget_max, adaptive_reasons,
-               tob_mode, tob_reason, sell_throttle_state,
+               tob_mode, tob_reason, sell_throttle_state, quoting_json, quoting_inputs_json,
                allow_buy, allow_sell, buy_reasons, sell_reasons
           FROM bot_status
          WHERE id = 1
@@ -571,6 +656,8 @@ export class SQLiteStore implements Store {
           tob_mode: string | null;
           tob_reason: string | null;
           sell_throttle_state: string | null;
+          quoting_json: string | null;
+          quoting_inputs_json: string | null;
           allow_buy: number;
           allow_sell: number;
           buy_reasons: string;
@@ -579,7 +666,7 @@ export class SQLiteStore implements Store {
       | undefined;
 
     if (!row) return null;
-    return {
+    const status: BotStatus = {
       ts: row.ts,
       mid: row.mid,
       exposure_usd: row.exposure_usd,
@@ -603,11 +690,19 @@ export class SQLiteStore implements Store {
       tob_mode: row.tob_mode ?? undefined,
       tob_reason: row.tob_reason ?? undefined,
       sell_throttle_state: row.sell_throttle_state ?? undefined,
+      quoting: row.quoting_json ? tryParseQuotedPlan(row.quoting_json) : undefined,
+      quoting_inputs: row.quoting_inputs_json ? tryParseQuotedInputs(row.quoting_inputs_json) : undefined,
       allow_buy: row.allow_buy === 1,
       allow_sell: row.allow_sell === 1,
       buy_reasons: tryParseStringArray(row.buy_reasons),
       sell_reasons: tryParseStringArray(row.sell_reasons)
     };
+    const normalized = normalizeLegacyPauseFileBotStatus(status);
+    if (normalized && normalized !== status) {
+      this.upsertBotStatus(normalized);
+      return normalized;
+    }
+    return status;
   }
 
   upsertReconcilerState(state: ReconcilerState): void {
@@ -817,6 +912,160 @@ export class SQLiteStore implements Store {
       .all(symbol, limit) as TickerSnapshot[];
   }
 
+  recordExternalPriceSnapshot(snapshot: ExternalVenueSnapshot): void {
+    this.db
+      .prepare(
+        `
+        INSERT OR IGNORE INTO external_price_snapshots (
+          symbol, venue, quote, ts, bid, ask, mid, spread_bps, latency_ms, ok, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        snapshot.symbol,
+        snapshot.venue,
+        snapshot.quote,
+        snapshot.ts,
+        snapshot.bid,
+        snapshot.ask,
+        snapshot.mid,
+        snapshot.spread_bps,
+        Math.max(0, Math.round(snapshot.latency_ms)),
+        snapshot.ok ? 1 : 0,
+        snapshot.error ?? null
+      );
+    this.db
+      .prepare(
+        `
+        DELETE FROM external_price_snapshots
+         WHERE rowid IN (
+           SELECT rowid
+             FROM external_price_snapshots
+            ORDER BY ts DESC
+            LIMIT -1 OFFSET ?
+         )
+      `
+      )
+      .run(MAX_EXTERNAL_SNAPSHOTS);
+  }
+
+  recordSignalSnapshot(snapshot: SignalSnapshot): void {
+    this.db
+      .prepare(
+        `
+        INSERT OR REPLACE INTO signal_snapshots (
+          symbol, ts, revx_mid, global_mid, fair_mid, basis_bps, drift_bps, stdev_bps, z_score,
+          confidence, dispersion_bps, vol_regime, drift_component_bps, basis_correction_bps,
+          healthy_venues, total_venues
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        snapshot.symbol,
+        snapshot.ts,
+        snapshot.revx_mid,
+        snapshot.global_mid,
+        snapshot.fair_mid,
+        snapshot.basis_bps,
+        snapshot.drift_bps,
+        snapshot.stdev_bps,
+        snapshot.z_score,
+        snapshot.confidence,
+        snapshot.dispersion_bps,
+        snapshot.vol_regime,
+        snapshot.drift_component_bps,
+        snapshot.basis_correction_bps,
+        snapshot.healthy_venues,
+        snapshot.total_venues
+      );
+    this.db
+      .prepare(
+        `
+        DELETE FROM signal_snapshots
+         WHERE rowid IN (
+           SELECT rowid
+             FROM signal_snapshots
+            ORDER BY ts DESC
+            LIMIT -1 OFFSET ?
+         )
+      `
+      )
+      .run(MAX_SIGNAL_SNAPSHOTS);
+  }
+
+  getRecentExternalPriceSnapshots(symbol: string, limit: number): ExternalVenueSnapshot[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT symbol, venue, quote, ts, bid, ask, mid, spread_bps, latency_ms, ok, error
+          FROM external_price_snapshots
+         WHERE symbol = ?
+         ORDER BY ts DESC
+         LIMIT ?
+      `
+      )
+      .all(symbol, limit) as Array<
+      Omit<ExternalVenueSnapshot, "ok"> & { ok: number }
+    >;
+    return rows.map((row) => ({
+      ...row,
+      ok: row.ok === 1
+    }));
+  }
+
+  getLatestVenueQuotes(symbol: string): VenueQuote[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT eps.venue, eps.bid, eps.ask, eps.mid, eps.ts, eps.error
+          FROM external_price_snapshots eps
+          JOIN (
+            SELECT venue, MAX(ts) AS max_ts
+              FROM external_price_snapshots
+             WHERE symbol = ?
+             GROUP BY venue
+          ) latest
+            ON latest.venue = eps.venue
+           AND latest.max_ts = eps.ts
+         WHERE eps.symbol = ?
+         ORDER BY eps.venue ASC
+      `
+      )
+      .all(symbol, symbol) as Array<{
+      venue: string;
+      bid: number | null;
+      ask: number | null;
+      mid: number | null;
+      ts: number;
+      error?: string | null;
+    }>;
+    return rows.map((row) => ({
+      venue: row.venue,
+      bid: row.bid ?? null,
+      ask: row.ask ?? null,
+      mid: row.mid ?? null,
+      ts: row.ts,
+      error: row.error ?? null
+    }));
+  }
+
+  getRecentSignalSnapshots(symbol: string, limit: number): SignalSnapshot[] {
+    return this.db
+      .prepare(
+        `
+        SELECT
+          symbol, ts, revx_mid, global_mid, fair_mid, basis_bps, drift_bps, stdev_bps, z_score,
+          confidence, dispersion_bps, vol_regime, drift_component_bps, basis_correction_bps,
+          healthy_venues, total_venues
+        FROM signal_snapshots
+        WHERE symbol = ?
+        ORDER BY ts DESC
+        LIMIT ?
+      `
+      )
+      .all(symbol, limit) as SignalSnapshot[];
+  }
+
   recordStrategyDecision(decision: StrategyDecision): void {
     this.db
       .prepare(
@@ -878,8 +1127,8 @@ export class SQLiteStore implements Store {
       .prepare(
         `
         INSERT OR IGNORE INTO bot_events (
-          event_id, ts, type, side, price, quote_size_usd, venue_order_id, client_order_id, reason, bot_tag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          event_id, ts, type, side, price, quote_size_usd, venue_order_id, client_order_id, reason, bot_tag, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       )
       .run(
@@ -892,7 +1141,8 @@ export class SQLiteStore implements Store {
         event.venue_order_id,
         event.client_order_id,
         event.reason,
-        event.bot_tag
+        event.bot_tag,
+        event.details_json ?? null
       );
   }
 
@@ -900,7 +1150,7 @@ export class SQLiteStore implements Store {
     return this.db
       .prepare(
         `
-        SELECT event_id, ts, type, side, price, quote_size_usd, venue_order_id, client_order_id, reason, bot_tag
+        SELECT event_id, ts, type, side, price, quote_size_usd, venue_order_id, client_order_id, reason, bot_tag, details_json
           FROM bot_events
          ORDER BY ts DESC
          LIMIT ?
@@ -964,6 +1214,135 @@ export class SQLiteStore implements Store {
     };
   }
 
+  getRuntimeOverrides(symbol: string): RuntimeOverridesRecord | null {
+    const key = normalizeSymbol(symbol);
+    const row = this.db
+      .prepare(
+        `
+        SELECT json
+          FROM runtime_overrides
+         WHERE symbol = ?
+      `
+      )
+      .get(key) as { json: string } | undefined;
+    if (!row) return null;
+    const parsed = tryParseRuntimeOverrides(row.json);
+    if (!parsed) return null;
+    if (!isRuntimeOverrideExpired(parsed)) {
+      return parsed;
+    }
+
+    this.db.prepare(`DELETE FROM runtime_overrides WHERE symbol = ?`).run(key);
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "EXPIRE",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        action: "EXPIRE",
+        expired_at_ms: parsed.expiresAtMs,
+        updated_at_ms: parsed.updatedAtMs
+      })
+    });
+    return null;
+  }
+
+  setRuntimeOverrides(
+    symbol: string,
+    patch: Partial<RuntimeOverridesInput>,
+    meta?: RuntimeOverridesMeta
+  ): RuntimeOverridesRecord {
+    const key = normalizeSymbol(symbol);
+    const existing = this.getRuntimeOverrides(key);
+    const result = mergeRuntimeOverrides(
+      key,
+      existing,
+      patch as Partial<Record<string, unknown>>,
+      this.runtimeDefaults,
+      meta,
+      { usdTotal: latestAssetTotal(this.getLatestBalances(), "USD") }
+    );
+    this.db
+      .prepare(
+        `
+        INSERT INTO runtime_overrides (symbol, json, updated_at, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+          json = excluded.json,
+          updated_at = excluded.updated_at,
+          created_at = excluded.created_at
+      `
+      )
+      .run(
+        key,
+        JSON.stringify(result.overrides),
+        result.overrides.updatedAtMs,
+        result.overrides.createdAtMs
+      );
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "SET",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        warnings: result.warnings,
+        unknown_keys: result.unknownKeys,
+        overrides: result.overrides
+      })
+    });
+    return result.overrides;
+  }
+
+  clearRuntimeOverrides(symbol: string, meta?: RuntimeOverridesMeta): void {
+    const key = normalizeSymbol(symbol);
+    const existing = this.getRuntimeOverrides(key);
+    if (!existing) return;
+    this.db.prepare(`DELETE FROM runtime_overrides WHERE symbol = ?`).run(key);
+    this.recordBotEvent({
+      event_id: randomUUID(),
+      ts: meta?.nowMs ?? Date.now(),
+      type: "OVERRIDE",
+      side: "-",
+      price: 0,
+      quote_size_usd: 0,
+      venue_order_id: null,
+      client_order_id: "-",
+      reason: "CLEAR",
+      bot_tag: "override",
+      details_json: JSON.stringify({
+        symbol: key,
+        action: "CLEAR",
+        source: meta?.source ?? "dashboard",
+        note: meta?.note ?? "",
+        previous: existing
+      })
+    });
+  }
+
+  getEffectiveConfig(symbol: string, context?: RuntimeOverrideContext): EffectiveRuntimeConfig {
+    const key = normalizeSymbol(symbol);
+    const effective = computeEffectiveRuntimeConfig(this.runtimeDefaults, this.getRuntimeOverrides(key));
+    const usdTotal = context?.usdTotal ?? latestAssetTotal(this.getLatestBalances(), "USD");
+    if (Number.isFinite(usdTotal ?? Number.NaN) && effective.cashReserveUsd > Number(usdTotal)) {
+      effective.cashReserveUsd = Math.max(0, Number(usdTotal));
+    }
+    return effective;
+  }
+
   private appendOrderHistory(row: OrderHistoryRecord): void {
     this.db
       .prepare(
@@ -1021,6 +1400,160 @@ function tryParseOrderMap(raw: string): Record<string, OrderRecord> {
   }
 }
 
+function tryParseQuotedPlan(raw: string): BotStatus["quoting"] | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const row = parsed as Record<string, unknown>;
+    const tob = String(row.tobPlanned ?? "").toUpperCase();
+    if (tob !== "OFF" && tob !== "BUY" && tob !== "SELL" && tob !== "BOTH") return undefined;
+    return {
+      pausePolicy:
+        row.pausePolicy && typeof row.pausePolicy === "object"
+          ? (row.pausePolicy as NonNullable<BotStatus["quoting"]>["pausePolicy"])
+          : undefined,
+      quoteEnabled: Boolean(row.quoteEnabled),
+      hardHalt: Boolean(row.hardHalt),
+      hardHaltReasons: Array.isArray(row.hardHaltReasons)
+        ? row.hardHaltReasons.filter((x): x is string => typeof x === "string")
+        : [],
+      quoteBlockedReasons: Array.isArray(row.quoteBlockedReasons)
+        ? row.quoteBlockedReasons.filter((x): x is string => typeof x === "string")
+        : [],
+      buyLevelsPlanned: Number.isFinite(Number(row.buyLevelsPlanned))
+        ? Math.max(0, Math.floor(Number(row.buyLevelsPlanned)))
+        : 0,
+      sellLevelsPlanned: Number.isFinite(Number(row.sellLevelsPlanned))
+        ? Math.max(0, Math.floor(Number(row.sellLevelsPlanned)))
+        : 0,
+      tobPlanned: tob,
+      effectiveTargetLevels:
+        row.effectiveTargetLevels && typeof row.effectiveTargetLevels === "object"
+          ? (row.effectiveTargetLevels as NonNullable<BotStatus["quoting"]>["effectiveTargetLevels"])
+          : undefined,
+      targetLevels:
+        row.targetLevels && typeof row.targetLevels === "object"
+          ? (row.targetLevels as NonNullable<BotStatus["quoting"]>["targetLevels"])
+          : undefined,
+      minLevelsFloorApplied: row.minLevelsFloorApplied === true,
+      tobPolicy:
+        row.tobPolicy === "JOIN" ||
+        row.tobPolicy === "JOIN+1" ||
+        row.tobPolicy === "JOIN+2" ||
+        row.tobPolicy === "OFF"
+          ? row.tobPolicy
+          : undefined,
+      appliedSpreadMult: Number.isFinite(Number(row.appliedSpreadMult))
+        ? Number(row.appliedSpreadMult)
+        : undefined,
+      appliedSizeMult: Number.isFinite(Number(row.appliedSizeMult))
+        ? Number(row.appliedSizeMult)
+        : undefined,
+      lowVolMode:
+        row.lowVolMode === "KEEP_QUOTING"
+          ? "KEEP_QUOTING"
+          : undefined,
+      volMoveBps: Number.isFinite(Number(row.volMoveBps))
+        ? Number(row.volMoveBps)
+        : undefined,
+      minVolMoveBps: Number.isFinite(Number(row.minVolMoveBps))
+        ? Number(row.minVolMoveBps)
+        : undefined,
+      whyNotQuoting:
+        typeof row.whyNotQuoting === "string" && row.whyNotQuoting.trim().length > 0
+          ? row.whyNotQuoting
+          : undefined,
+      whyNotQuotingDetails:
+        typeof row.whyNotQuotingDetails === "string" && row.whyNotQuotingDetails.trim().length > 0
+          ? row.whyNotQuotingDetails
+          : undefined,
+      lastPlannerOutputSummary:
+        row.lastPlannerOutputSummary && typeof row.lastPlannerOutputSummary === "object"
+          ? {
+              desiredCount: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).desiredCount))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).desiredCount)))
+                : 0,
+              buyLevels: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).buyLevels))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).buyLevels)))
+                : 0,
+              sellLevels: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).sellLevels))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).sellLevels)))
+                : 0,
+              tob:
+                (row.lastPlannerOutputSummary as Record<string, unknown>).tob === "BUY" ||
+                (row.lastPlannerOutputSummary as Record<string, unknown>).tob === "SELL" ||
+                (row.lastPlannerOutputSummary as Record<string, unknown>).tob === "BOTH"
+                  ? ((row.lastPlannerOutputSummary as Record<string, unknown>).tob as "BUY" | "SELL" | "BOTH")
+                  : "OFF",
+              actionBudget: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).actionBudget))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).actionBudget)))
+                : 0,
+              actionsUsed: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).actionsUsed))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).actionsUsed)))
+                : 0,
+              openBuyVenue: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).openBuyVenue))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).openBuyVenue)))
+                : 0,
+              openSellVenue: Number.isFinite(Number((row.lastPlannerOutputSummary as Record<string, unknown>).openSellVenue))
+                ? Math.max(0, Math.floor(Number((row.lastPlannerOutputSummary as Record<string, unknown>).openSellVenue)))
+                : 0
+            }
+          : undefined,
+      forceBaselineApplied: row.forceBaselineApplied === true,
+      overrideApplied: row.overrideApplied === true,
+      overrideReasons: Array.isArray(row.overrideReasons)
+        ? row.overrideReasons.filter((x): x is string => typeof x === "string")
+        : undefined,
+      lastDecisionTs: Number.isFinite(Number(row.lastDecisionTs))
+        ? Math.max(0, Math.floor(Number(row.lastDecisionTs)))
+        : 0
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function tryParseQuotedInputs(raw: string): BotStatus["quoting_inputs"] | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const row = parsed as Record<string, unknown>;
+    const thresholds =
+      row.thresholds && typeof row.thresholds === "object"
+        ? (row.thresholds as Record<string, unknown>)
+        : {};
+    const mode =
+      String(thresholds.volProtectMode ?? "").toLowerCase() === "block" ? "block" : "widen";
+    return {
+      volMoveBps: Number.isFinite(Number(row.volMoveBps)) ? Number(row.volMoveBps) : 0,
+      marketSpreadBps: Number.isFinite(Number(row.marketSpreadBps)) ? Number(row.marketSpreadBps) : 0,
+      usd_free: Number.isFinite(Number(row.usd_free)) ? Number(row.usd_free) : 0,
+      btcNotional: Number.isFinite(Number(row.btcNotional)) ? Number(row.btcNotional) : 0,
+      trendMoveBps: Number.isFinite(Number(row.trendMoveBps)) ? Number(row.trendMoveBps) : 0,
+      thresholds: {
+        minVolMoveBpsToQuote: Number.isFinite(Number(thresholds.minVolMoveBpsToQuote))
+          ? Number(thresholds.minVolMoveBpsToQuote)
+          : 0,
+        minMarketSpreadBps: Number.isFinite(Number(thresholds.minMarketSpreadBps))
+          ? Number(thresholds.minMarketSpreadBps)
+          : 0,
+        trendPauseBps: Number.isFinite(Number(thresholds.trendPauseBps))
+          ? Number(thresholds.trendPauseBps)
+          : 0,
+        volProtectMode: mode,
+        volWidenMultMin: Number.isFinite(Number(thresholds.volWidenMultMin))
+          ? Number(thresholds.volWidenMultMin)
+          : 1.25,
+        volWidenMultMax: Number.isFinite(Number(thresholds.volWidenMultMax))
+          ? Number(thresholds.volWidenMultMax)
+          : 1.75
+      }
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function ensureColumn(db: Database.Database, table: string, column: string, ddl: string): void {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (rows.some((r) => r.name === column)) return;
@@ -1031,4 +1564,58 @@ function dayStartTs(nowTs: number): number {
   const d = new Date(nowTs);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
+}
+
+function normalizeSymbol(symbol: string): string {
+  return symbol.trim().toUpperCase().replace("/", "-");
+}
+
+function tryParseRuntimeOverrides(raw: string): RuntimeOverridesRecord | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as RuntimeOverridesRecord;
+  } catch {
+    return null;
+  }
+}
+
+function latestAssetTotal(rows: BalanceSnapshot[], asset: string): number | undefined {
+  const needle = asset.trim().toUpperCase();
+  let latestTs = -1;
+  let total: number | undefined;
+  for (const row of rows) {
+    if (row.asset.toUpperCase() !== needle) continue;
+    if (row.ts >= latestTs) {
+      latestTs = row.ts;
+      total = row.total;
+    }
+  }
+  return total;
+}
+
+function defaultRuntimeOverrideDefaults(): RuntimeOverrideDefaults {
+  return {
+    symbol: "BTC-USD",
+    enabled: true,
+    allowBuy: true,
+    allowSell: true,
+    levelsBuy: 2,
+    levelsSell: 2,
+    levelQuoteSizeUsd: 8,
+    baseHalfSpreadBps: 18,
+    levelStepBps: 10,
+    minMarketSpreadBps: 0.5,
+    repriceMoveBps: 10,
+    queueRefreshSeconds: 90,
+    tobEnabled: false,
+    tobQuoteSizeUsd: 3,
+    targetBtcNotionalUsd: 80,
+    maxBtcNotionalUsd: 120,
+    skewMaxBps: 25,
+    cashReserveUsd: 60,
+    workingCapUsd: 100,
+    maxActiveOrders: 10,
+    maxActionsPerLoop: 4
+  };
 }

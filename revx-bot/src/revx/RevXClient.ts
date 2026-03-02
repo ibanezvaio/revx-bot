@@ -4,6 +4,7 @@ import nacl from "tweetnacl";
 import { fetch } from "undici";
 import { BotConfig } from "../config";
 import { Logger } from "../logger";
+import { BalanceState } from "../recon/BalanceState";
 import { canonicalJsonStringify } from "../util/canonicalJson";
 import { sleep } from "../util/time";
 import { endpointCandidates, withId, withSymbol } from "./endpoints";
@@ -11,6 +12,15 @@ import { endpointCandidates, withId, withSymbol } from "./endpoints";
 type HttpMethod = "GET" | "POST" | "DELETE";
 
 type QueryValue = string | number | boolean | undefined;
+
+type DegradedReadEndpoint = "orders-active" | "order-by-id";
+
+type RevXReadHealth = {
+  degraded: boolean;
+  openEndpoints: DegradedReadEndpoint[];
+  openUntilMs: number | null;
+  lastDegradedTs: number | null;
+};
 
 export type PlaceOrderPayload = {
   client_order_id: string;
@@ -75,6 +85,18 @@ class RevXHttpError extends Error {
   }
 }
 
+class RevXDegradedError extends Error {
+  endpoint: DegradedReadEndpoint;
+  openUntilMs: number;
+
+  constructor(endpoint: DegradedReadEndpoint, openUntilMs: number, message?: string) {
+    super(message ?? `RevX degraded for ${endpoint} until ${new Date(openUntilMs).toISOString()}`);
+    this.name = "RevXDegradedError";
+    this.endpoint = endpoint;
+    this.openUntilMs = openUntilMs;
+  }
+}
+
 class RequestScheduler {
   private queue: Promise<void> = Promise.resolve();
   private nextAtMs = 0;
@@ -100,7 +122,139 @@ class RequestScheduler {
   }
 }
 
+type CircuitState = {
+  failures: number[];
+  openUntilMs: number;
+  halfOpenLogged: boolean;
+  lastDegradedTs: number | null;
+};
+
+class ReadCircuitBreaker {
+  private readonly states: Record<DegradedReadEndpoint, CircuitState> = {
+    "orders-active": {
+      failures: [],
+      openUntilMs: 0,
+      halfOpenLogged: false,
+      lastDegradedTs: null
+    },
+    "order-by-id": {
+      failures: [],
+      openUntilMs: 0,
+      halfOpenLogged: false,
+      lastDegradedTs: null
+    }
+  };
+
+  constructor(
+    private readonly logger: Logger,
+    private readonly threshold: number,
+    private readonly windowMs: number,
+    private readonly openMs: number
+  ) {}
+
+  shouldBlock(endpoint: DegradedReadEndpoint, nowMs: number): boolean {
+    const state = this.states[endpoint];
+    if (nowMs < state.openUntilMs) {
+      return true;
+    }
+    if (state.openUntilMs > 0 && !state.halfOpenLogged) {
+      state.halfOpenLogged = true;
+      this.logger.warn(
+        { endpoint, openUntilMs: state.openUntilMs },
+        "RevX read circuit breaker half-open"
+      );
+    }
+    return false;
+  }
+
+  recordFailure(
+    endpoint: DegradedReadEndpoint,
+    nowMs: number,
+    status: number,
+    path: string
+  ): void {
+    const state = this.states[endpoint];
+    state.failures = state.failures.filter((ts) => nowMs - ts <= this.windowMs);
+    state.failures.push(nowMs);
+
+    const isHalfOpenFailure = state.openUntilMs > 0 && nowMs >= state.openUntilMs && state.halfOpenLogged;
+    if (isHalfOpenFailure || state.failures.length >= this.threshold) {
+      state.openUntilMs = nowMs + this.openMs;
+      state.halfOpenLogged = false;
+      state.lastDegradedTs = nowMs;
+      this.logger.error(
+        {
+          endpoint,
+          status,
+          path,
+          failuresInWindow: state.failures.length,
+          windowMs: this.windowMs,
+          openMs: this.openMs
+        },
+        "RevX read circuit breaker opened"
+      );
+    }
+  }
+
+  recordSuccess(endpoint: DegradedReadEndpoint, nowMs: number, path: string): void {
+    const state = this.states[endpoint];
+    const wasOpen = state.openUntilMs > 0;
+    state.failures = state.failures.filter((ts) => nowMs - ts <= this.windowMs);
+    state.openUntilMs = 0;
+    state.halfOpenLogged = false;
+    if (wasOpen) {
+      this.logger.info({ endpoint, path }, "RevX read circuit breaker closed");
+    }
+  }
+
+  getOpenUntil(endpoint: DegradedReadEndpoint): number {
+    return this.states[endpoint].openUntilMs;
+  }
+
+  getHealth(nowMs: number): RevXReadHealth {
+    const openEndpoints = (Object.keys(this.states) as DegradedReadEndpoint[]).filter(
+      (endpoint) => nowMs < this.states[endpoint].openUntilMs
+    );
+    let openUntilMs: number | null = null;
+    let lastDegradedTs: number | null = null;
+
+    for (const endpoint of Object.keys(this.states) as DegradedReadEndpoint[]) {
+      const state = this.states[endpoint];
+      if (state.openUntilMs > 0) {
+        openUntilMs =
+          openUntilMs === null ? state.openUntilMs : Math.max(openUntilMs, state.openUntilMs);
+      }
+      if (state.lastDegradedTs !== null) {
+        lastDegradedTs =
+          lastDegradedTs === null ? state.lastDegradedTs : Math.max(lastDegradedTs, state.lastDegradedTs);
+      }
+    }
+
+    return {
+      degraded: openEndpoints.length > 0,
+      openEndpoints,
+      openUntilMs,
+      lastDegradedTs
+    };
+  }
+}
+
+type RequestCacheEntry<T> = {
+  value?: T;
+  expiresAtMs: number;
+  inFlight?: Promise<T>;
+  lastAccessMs: number;
+};
+
 type SignerFn = (message: string) => string;
+
+const READ_BREAKER_WINDOW_MS = 30_000;
+const READ_BREAKER_FAILURE_THRESHOLD = 6;
+const READ_BREAKER_OPEN_MS = 60_000;
+const ACTIVE_ORDERS_CACHE_TTL_MS = 1_000;
+const ORDER_BY_ID_CACHE_TTL_MS = 1_500;
+const MAX_ACTIVE_ORDERS_CACHE_ENTRIES = 16;
+const MAX_ORDER_BY_ID_CACHE_ENTRIES = 800;
 
 export class RevXClient {
   private readonly baseUrl: string;
@@ -109,6 +263,9 @@ export class RevXClient {
   private readonly scheduler: RequestScheduler;
   private readonly mockMode: boolean;
   private readonly maxRetries = 4;
+  private readonly readCircuitBreaker: ReadCircuitBreaker;
+  private readonly activeOrdersCache = new Map<string, RequestCacheEntry<RevXOrder[]>>();
+  private readonly orderByIdCache = new Map<string, RequestCacheEntry<unknown>>();
   private mockMid = 50_000;
   private readonly mockOrders: RevXOrder[] = [];
 
@@ -120,6 +277,16 @@ export class RevXClient {
 
     const minIntervalMs = Math.ceil((60_000 / Math.max(config.requestsPerMinute, 1)) * 1.05);
     this.scheduler = new RequestScheduler(minIntervalMs);
+    this.readCircuitBreaker = new ReadCircuitBreaker(
+      logger,
+      READ_BREAKER_FAILURE_THRESHOLD,
+      READ_BREAKER_WINDOW_MS,
+      READ_BREAKER_OPEN_MS
+    );
+  }
+
+  getReadHealth(): RevXReadHealth {
+    return this.readCircuitBreaker.getHealth(Date.now());
   }
 
   async getAllTickers(): Promise<unknown[]> {
@@ -165,17 +332,24 @@ export class RevXClient {
 
   async getBalances(): Promise<unknown[]> {
     if (this.mockMode) {
-      return [
+      const payload = [
         { asset: "USD", free: 160, total: 160, timestamp: Date.now() },
         { asset: "BTC", free: 0, total: 0, timestamp: Date.now() }
       ];
+      BalanceState.markRawSuccess(payload, Date.now());
+      return payload;
     }
-
-    const payload = await this.requestWithCandidates<unknown>({
-      method: "GET",
-      pathCandidates: endpointCandidates.balances
-    });
-    return coerceArray(payload);
+    try {
+      const payload = await this.requestWithCandidates<unknown>({
+        method: "GET",
+        pathCandidates: endpointCandidates.balances
+      });
+      BalanceState.markRawSuccess(payload, Date.now());
+      return coerceArray(payload);
+    } catch (error) {
+      BalanceState.markRawError(error);
+      throw error;
+    }
   }
 
   async getActiveOrders(symbol?: string): Promise<RevXOrder[]> {
@@ -191,21 +365,46 @@ export class RevXClient {
       return active.map((o) => ({ ...o }));
     }
 
-    const payload = await this.requestWithCandidates<unknown>({
-      method: "GET",
-      pathCandidates: endpointCandidates.activeOrders,
-      query: symbol ? { symbol } : undefined
-    });
+    const symbolKey = symbol ? normalizeSymbol(symbol) : "*";
+    const cached = this.getCachedValue(this.activeOrdersCache, symbolKey);
+    if (cached) {
+      return cached.map((order) => ({ ...order }));
+    }
 
-    const orders = coerceArray(payload) as RevXOrder[];
-    return orders.filter((order) => {
-      const state = String(order.state ?? order.status ?? "").toUpperCase();
-      const symbolMatches = symbol
-        ? normalizeSymbol(String(order.symbol ?? order.pair ?? "")) === normalizeSymbol(symbol)
-        : true;
-      if (!symbolMatches) return false;
-      return state.length === 0 || isActiveOrderState(state);
-    });
+    try {
+      const loaded = await this.getCachedOrLoad(
+        this.activeOrdersCache,
+        symbolKey,
+        ACTIVE_ORDERS_CACHE_TTL_MS,
+        MAX_ACTIVE_ORDERS_CACHE_ENTRIES,
+        async () => {
+          const payload = await this.requestWithCandidates<unknown>({
+            method: "GET",
+            pathCandidates: endpointCandidates.activeOrders,
+            query: symbol ? { symbol } : undefined
+          });
+          const orders = coerceArray(payload) as RevXOrder[];
+          return orders.filter((order) => {
+            const state = String(order.state ?? order.status ?? "").toUpperCase();
+            const symbolMatches = symbol
+              ? normalizeSymbol(String(order.symbol ?? order.pair ?? "")) === normalizeSymbol(symbol)
+              : true;
+            if (!symbolMatches) return false;
+            return state.length === 0 || isActiveOrderState(state);
+          });
+        }
+      );
+      return loaded.map((order) => ({ ...order }));
+    } catch (error) {
+      if (error instanceof RevXDegradedError) {
+        const stale = this.getStaleValue(this.activeOrdersCache, symbolKey);
+        if (stale) {
+          return stale.map((order) => ({ ...order }));
+        }
+        return [];
+      }
+      throw error;
+    }
   }
 
   async placeOrder(payload: PlaceOrderPayload): Promise<unknown> {
@@ -269,11 +468,36 @@ export class RevXClient {
       return { ...order };
     }
 
-    const paths = endpointCandidates.orderById.map((p) => withId(p, venueOrderId));
-    return this.requestWithCandidates<unknown>({
-      method: "GET",
-      pathCandidates: paths
-    });
+    const key = venueOrderId.trim();
+    const cached = this.getCachedValue(this.orderByIdCache, key);
+    if (cached !== undefined) {
+      return cloneUnknown(cached);
+    }
+
+    try {
+      const loaded = await this.getCachedOrLoad(
+        this.orderByIdCache,
+        key,
+        ORDER_BY_ID_CACHE_TTL_MS,
+        MAX_ORDER_BY_ID_CACHE_ENTRIES,
+        async () => {
+          const paths = endpointCandidates.orderById.map((p) => withId(p, venueOrderId));
+          return this.requestWithCandidates<unknown>({
+            method: "GET",
+            pathCandidates: paths
+          });
+        }
+      );
+      return cloneUnknown(loaded);
+    } catch (error) {
+      if (error instanceof RevXDegradedError) {
+        const stale = this.getStaleValue(this.orderByIdCache, key);
+        if (stale !== undefined) {
+          return cloneUnknown(stale);
+        }
+      }
+      throw error;
+    }
   }
 
   async getOrderFills(venueOrderId: string): Promise<RevXFill[]> {
@@ -315,6 +539,90 @@ export class RevXClient {
     return coerceArray(payload) as RevXFill[];
   }
 
+  private getCachedValue<T>(
+    cache: Map<string, RequestCacheEntry<T>>,
+    key: string
+  ): T | undefined {
+    const entry = cache.get(key);
+    if (!entry || entry.value === undefined) return undefined;
+    if (entry.expiresAtMs <= Date.now()) return undefined;
+    entry.lastAccessMs = Date.now();
+    return entry.value;
+  }
+
+  private getStaleValue<T>(
+    cache: Map<string, RequestCacheEntry<T>>,
+    key: string
+  ): T | undefined {
+    const entry = cache.get(key);
+    if (!entry || entry.value === undefined) return undefined;
+    entry.lastAccessMs = Date.now();
+    return entry.value;
+  }
+
+  private trimCache<T>(
+    cache: Map<string, RequestCacheEntry<T>>,
+    maxEntries: number
+  ): void {
+    if (cache.size <= maxEntries) return;
+    const ordered = [...cache.entries()].sort(
+      (a, b) => (a[1].lastAccessMs || 0) - (b[1].lastAccessMs || 0)
+    );
+    const toRemove = cache.size - maxEntries;
+    for (let i = 0; i < toRemove; i += 1) {
+      cache.delete(ordered[i][0]);
+    }
+  }
+
+  private async getCachedOrLoad<T>(
+    cache: Map<string, RequestCacheEntry<T>>,
+    key: string,
+    ttlMs: number,
+    maxEntries: number,
+    loader: () => Promise<T>
+  ): Promise<T> {
+    const now = Date.now();
+    const existing = cache.get(key);
+    if (existing?.inFlight) {
+      return existing.inFlight;
+    }
+
+    const loadPromise = loader()
+      .then((value) => {
+        cache.set(key, {
+          value,
+          expiresAtMs: Date.now() + ttlMs,
+          lastAccessMs: Date.now()
+        });
+        this.trimCache(cache, maxEntries);
+        return value;
+      })
+      .catch((error) => {
+        const entry = cache.get(key);
+        if (entry?.inFlight === loadPromise) {
+          if (entry.value === undefined) {
+            cache.delete(key);
+          } else {
+            cache.set(key, {
+              value: entry.value,
+              expiresAtMs: entry.expiresAtMs,
+              lastAccessMs: Date.now()
+            });
+          }
+        }
+        throw error;
+      });
+
+    cache.set(key, {
+      value: existing?.value,
+      expiresAtMs: existing?.expiresAtMs ?? now,
+      inFlight: loadPromise,
+      lastAccessMs: now
+    });
+
+    return loadPromise;
+  }
+
   private async requestWithCandidates<T>(params: {
     method: HttpMethod;
     pathCandidates: string[];
@@ -350,12 +658,45 @@ export class RevXClient {
     query?: Record<string, QueryValue>;
     body?: unknown;
   }): Promise<T> {
+    const degradedEndpoint = classifyDegradedReadEndpoint(params.method, params.path);
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      if (
+        degradedEndpoint &&
+        this.readCircuitBreaker.shouldBlock(degradedEndpoint, Date.now())
+      ) {
+        throw new RevXDegradedError(
+          degradedEndpoint,
+          this.readCircuitBreaker.getOpenUntil(degradedEndpoint)
+        );
+      }
       try {
-        return await this.scheduler.schedule(() => this.requestOnce<T>(params));
+        const result = await this.scheduler.schedule(() => this.requestOnce<T>(params));
+        if (degradedEndpoint) {
+          this.readCircuitBreaker.recordSuccess(degradedEndpoint, Date.now(), params.path);
+        }
+        return result;
       } catch (error) {
+        if (error instanceof RevXDegradedError) {
+          throw error;
+        }
+
         if (!(error instanceof RevXHttpError)) {
           throw error;
+        }
+
+        if (degradedEndpoint && error.status >= 500) {
+          this.readCircuitBreaker.recordFailure(
+            degradedEndpoint,
+            Date.now(),
+            error.status,
+            params.path
+          );
+          if (this.readCircuitBreaker.shouldBlock(degradedEndpoint, Date.now())) {
+            throw new RevXDegradedError(
+              degradedEndpoint,
+              this.readCircuitBreaker.getOpenUntil(degradedEndpoint)
+            );
+          }
         }
 
         if (!isRetryableStatus(error.status) || attempt === this.maxRetries) {
@@ -521,6 +862,21 @@ function ensureLeadingSlash(path: string): string {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
+function classifyDegradedReadEndpoint(
+  method: HttpMethod,
+  path: string
+): DegradedReadEndpoint | null {
+  if (method !== "GET") return null;
+  const normalized = ensureLeadingSlash(path).replace(/\/+$/, "");
+  if (/\/orders\/active$/i.test(normalized)) {
+    return "orders-active";
+  }
+  if (/\/orders\/[^/]+$/i.test(normalized)) {
+    return "order-by-id";
+  }
+  return null;
+}
+
 function unwrapPayload<T>(payload: unknown): T {
   if (payload && typeof payload === "object") {
     const obj = payload as Record<string, unknown>;
@@ -589,4 +945,14 @@ function jitter(maxMs: number): number {
   return Math.floor(Math.random() * (maxMs + 1));
 }
 
-export { RevXHttpError };
+function cloneUnknown<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "object") return value;
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return value;
+  }
+}
+
+export { RevXHttpError, RevXDegradedError };

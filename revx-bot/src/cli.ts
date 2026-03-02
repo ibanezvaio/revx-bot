@@ -9,6 +9,7 @@ import { findAsset, parseBalancesPayload } from "./recon/balanceParsing";
 import { Reconciler } from "./recon/Reconciler";
 import { RevXClient } from "./revx/RevXClient";
 import { RiskManager } from "./risk/RiskManager";
+import { CrossVenueSignalEngine } from "./signal/CrossVenueSignalEngine";
 import { SignalEngine } from "./signals/SignalEngine";
 import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
@@ -32,6 +33,7 @@ async function run(): Promise<void> {
       const marketData = new MarketData(dryClient, dryLogger);
       const risk = new RiskManager(dryConfig, dryLogger);
       const signalEngine = new SignalEngine(dryConfig);
+      const crossVenueSignalEngine = new CrossVenueSignalEngine(dryConfig, dryLogger);
       const execution = new Execution(dryConfig, dryLogger, dryClient, dryStore, true);
       const dryReconciler = new Reconciler(dryConfig, dryLogger, dryClient, dryStore, marketData);
       const strategy = new MakerStrategy(
@@ -43,7 +45,8 @@ async function run(): Promise<void> {
         execution,
         dryReconciler,
         risk,
-        signalEngine
+        signalEngine,
+        crossVenueSignalEngine
       );
 
       await strategy.runSingleCycle();
@@ -71,6 +74,7 @@ async function run(): Promise<void> {
       const marketData = new MarketData(dryClient, dryLogger);
       const risk = new RiskManager(dryConfig, dryLogger);
       const signalEngine = new SignalEngine(dryConfig);
+      const crossVenueSignalEngine = new CrossVenueSignalEngine(dryConfig, dryLogger);
       const execution = new Execution(dryConfig, dryLogger, dryClient, dryStore, true);
       const dryReconciler = new Reconciler(dryConfig, dryLogger, dryClient, dryStore, marketData);
       const strategy = new MakerStrategy(
@@ -82,7 +86,8 @@ async function run(): Promise<void> {
         execution,
         dryReconciler,
         risk,
-        signalEngine
+        signalEngine,
+        crossVenueSignalEngine
       );
 
       const cycles = Math.max(1, Math.ceil((minutes * 60) / Math.max(dryConfig.refreshSeconds, 1)));

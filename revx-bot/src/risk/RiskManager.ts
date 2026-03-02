@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { BotConfig } from "../config";
 import { Logger } from "../logger";
 import { BalanceSnapshot } from "../store/Store";
@@ -9,16 +8,10 @@ type MidPoint = { ts: number; mid: number };
 export class RiskManager {
   private readonly mids: MidPoint[] = [];
   private consecutiveErrors = 0;
-  private pausedUntilMs = 0;
-  private pauseReason = "";
   private baselineDay = "";
   private baselineEquityUsd: number | null = null;
 
   constructor(private readonly config: BotConfig, private readonly logger: Logger) {}
-
-  checkKillSwitch(): boolean {
-    return existsSync(this.config.killSwitchFile);
-  }
 
   recordSuccess(): void {
     this.consecutiveErrors = 0;
@@ -53,26 +46,7 @@ export class RiskManager {
     const newest = this.mids[this.mids.length - 1].mid;
     const moveBps = ((newest - oldest) / oldest) * 10_000;
 
-    if (Math.abs(moveBps) >= this.config.pauseVolMoveBps) {
-      this.pauseFor(5 * 60_000, `Volatility guard triggered (${moveBps.toFixed(2)} bps)`);
-      return { moveBps, tripped: true };
-    }
-
-    return { moveBps, tripped: false };
-  }
-
-  isPaused(now = Date.now()): { paused: boolean; untilMs: number; reason: string } {
-    return {
-      paused: now < this.pausedUntilMs,
-      untilMs: this.pausedUntilMs,
-      reason: this.pauseReason
-    };
-  }
-
-  pauseFor(durationMs: number, reason: string): void {
-    this.pausedUntilMs = Date.now() + durationMs;
-    this.pauseReason = reason;
-    this.logger.warn({ pausedUntilMs: this.pausedUntilMs, reason }, "Quoting paused");
+    return { moveBps, tripped: Math.abs(moveBps) >= this.config.pauseVolMoveBps };
   }
 
   evaluateDailyLoss(

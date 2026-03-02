@@ -1,24 +1,33 @@
 import { dirname, extname, basename, join } from "node:path";
 import { BotConfig } from "../config";
 import { Logger } from "../logger";
+import { buildRuntimeOverrideDefaults } from "../overrides/runtimeOverrides";
 import { Store } from "./Store";
 import { JsonStore } from "./jsonStore";
 
 export function createStore(config: BotConfig, logger: Logger): Store {
+  const runtimeDefaults = buildRuntimeOverrideDefaults(config);
   if (config.storeBackend === "json") {
     const jsonPath = toJsonPath(config.dbPath);
     logger.info({ jsonPath }, "Using JSON store");
     return new JsonStore(jsonPath, {
       maxBotEvents: Math.max(config.maxApiEvents, config.maxUiEvents, 500),
-      eventDedupe: config.eventDedupe
+      maxSignalPoints: config.maxSignalPoints,
+      eventDedupe: config.eventDedupe,
+      runtimeDefaults
     });
   }
 
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const sqliteModule = require("./sqlite") as { SQLiteStore: new (dbPath: string) => Store };
+    const sqliteModule = require("./sqlite") as {
+      SQLiteStore: new (
+        dbPath: string,
+        runtimeDefaults: ReturnType<typeof buildRuntimeOverrideDefaults>
+      ) => Store;
+    };
     logger.info({ dbPath: config.dbPath }, "Using SQLite store");
-    return new sqliteModule.SQLiteStore(config.dbPath);
+    return new sqliteModule.SQLiteStore(config.dbPath, runtimeDefaults);
   } catch (error) {
     const reason = (error as Error).message;
     const installHint = "Install: npm i better-sqlite3";

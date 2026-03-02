@@ -3,9 +3,15 @@ import { Execution } from "./exec/Execution";
 import { buildLogger } from "./logger";
 import { MarketData } from "./md/MarketData";
 import { Reconciler } from "./recon/Reconciler";
+import { ExternalQuoteService } from "./quotes/ExternalQuoteService";
 import { RevXClient } from "./revx/RevXClient";
 import { RiskManager } from "./risk/RiskManager";
+import { CrossVenueSignalEngine } from "./signal/CrossVenueSignalEngine";
+import { NewsEngine } from "./news/NewsEngine";
+import { IntelEngine } from "./intel/IntelEngine";
+import { PerformanceEngine } from "./performance/PerformanceEngine";
 import { SignalEngine } from "./signals/SignalEngine";
+import { SignalsEngine } from "./signals/SignalsEngine";
 import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
 import { DashboardServer } from "./web/DashboardServer";
@@ -13,6 +19,13 @@ import { DashboardServer } from "./web/DashboardServer";
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = buildLogger(config);
+  logger.info(
+    {
+      cwd: process.cwd(),
+      runtimeBaseDir: config.runtimeBaseDir
+    },
+    "Resolved runtime paths"
+  );
 
   logEffectiveConfig(logger, config);
 
@@ -26,13 +39,21 @@ async function main(): Promise<void> {
 
   const client = new RevXClient(config, logger);
   const marketData = new MarketData(client, logger);
+  const externalQuoteService = new ExternalQuoteService(config, logger);
   const risk = new RiskManager(config, logger);
   const signalEngine = new SignalEngine(config);
+  const crossVenueSignalEngine = new CrossVenueSignalEngine(config, logger);
+  const newsEngine = new NewsEngine(config, logger, store);
+  const signalsEngine = new SignalsEngine(config, logger, store);
+  const intelEngine = new IntelEngine(config, logger, newsEngine, signalsEngine);
+  const performanceEngine = config.performanceEnabled
+    ? new PerformanceEngine(config, logger, store, marketData)
+    : undefined;
   const execution = new Execution(config, logger, client, store, config.dryRun);
-  const reconciler = new Reconciler(config, logger, client, store, marketData);
+  const reconciler = new Reconciler(config, logger, client, store, marketData, performanceEngine);
   const dashboard = new DashboardServer(config, logger, store, execution.getRunId(), {
     cancelAllBotOrders: async () => execution.cancelAllBotOrders(config.symbol)
-  });
+  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine);
   const strategy = new MakerStrategy(
     config,
     logger,
@@ -42,7 +63,11 @@ async function main(): Promise<void> {
     execution,
     reconciler,
     risk,
-    signalEngine
+    signalEngine,
+    crossVenueSignalEngine,
+    newsEngine,
+    signalsEngine,
+    intelEngine
   );
 
   let shuttingDown = false;
@@ -53,6 +78,11 @@ async function main(): Promise<void> {
 
     strategy.stop();
     reconciler.stop();
+    externalQuoteService.stop();
+    newsEngine.stop();
+    signalsEngine.stop();
+    intelEngine.stop();
+    performanceEngine?.stop();
     dashboard.stop();
 
     try {
@@ -75,9 +105,19 @@ async function main(): Promise<void> {
 
   try {
     dashboard.start();
+    externalQuoteService.start();
+    newsEngine.start();
+    signalsEngine.start();
+    intelEngine.start();
+    performanceEngine?.start();
     reconciler.start();
     await strategy.start();
   } finally {
+    externalQuoteService.stop();
+    newsEngine.stop();
+    signalsEngine.stop();
+    intelEngine.stop();
+    performanceEngine?.stop();
     dashboard.stop();
     reconciler.stop();
     store.close();
@@ -108,6 +148,12 @@ function logEffectiveConfig(
         levelQuoteSizeUsd: config.levelQuoteSizeUsd,
         enableTopOfBook: config.enableTopOfBook,
         tobQuoteSizeUsd: config.tobQuoteSizeUsd,
+        seedMaxSeconds: config.seedMaxSeconds,
+        seedMaxReposts: config.seedMaxReposts,
+        seedTakerUsd: config.seedTakerUsd,
+        seedTakerSlippageBps: config.seedTakerSlippageBps,
+        seedForceTob: config.seedForceTob,
+        seedHalfSpreadBps: config.seedHalfSpreadBps,
         baseHalfSpreadBps: config.baseHalfSpreadBps,
         minHalfSpreadBps: config.minHalfSpreadBps,
         maxHalfSpreadBps: config.maxHalfSpreadBps,
@@ -126,12 +172,96 @@ function logEffectiveConfig(
         edgeMaxSideAdjustBps: config.edgeMaxSideAdjustBps,
         maxCancelsPerHour: config.maxCancelsPerHour,
         trackPostOnlyRejects: config.trackPostOnlyRejects,
+        signalRefreshMs: config.signalRefreshMs,
+        signalMaxQuoteAgeMs: config.signalMaxQuoteAgeMs,
+        signalMinConf: config.signalMinConf,
+        signalUsdtDegrade: config.signalUsdtDegrade,
+        signalVenues: config.signalVenues,
+        enableCrossVenueSignals: config.enableCrossVenueSignals,
+        venueRefreshMs: config.venueRefreshMs,
+        venueStaleMs: config.venueStaleMs,
+        venueTimeoutMs: config.venueTimeoutMs,
+        venueMaxBackoffMs: config.venueMaxBackoffMs,
+        fairDriftMaxBps: config.fairDriftMaxBps,
+        fairBasisMaxBps: config.fairBasisMaxBps,
+        fairStaleMs: config.fairStaleMs,
+        fairMinVenues: config.fairMinVenues,
+        fairMaxDispersionBps: config.fairMaxDispersionBps,
+        fairMaxBasisBps: config.fairMaxBasisBps,
+        toxicDriftBps: config.toxicDriftBps,
+        makerFeeBps: config.makerFeeBps,
+        takerFeeBps: config.takerFeeBps,
+        minRealizedEdgeBps: config.minRealizedEdgeBps,
+        minTakerEdgeBps: config.minTakerEdgeBps,
+        enableAdverseSelectionLoop: config.enableAdverseSelectionLoop,
+        asHorizonSeconds: config.asHorizonSeconds,
+        asSampleFills: config.asSampleFills,
+        asBadAvgBps: config.asBadAvgBps,
+        asBadRate: config.asBadRate,
+        asBadFillBps: config.asBadFillBps,
+        asWidenStepBps: config.asWidenStepBps,
+        asMaxWidenBps: config.asMaxWidenBps,
+        asDisableTobOnToxic: config.asDisableTobOnToxic,
+        asCooldownSeconds: config.asCooldownSeconds,
+        asReduceLevelsOnToxic: config.asReduceLevelsOnToxic,
+        asLevelsFloor: config.asLevelsFloor,
+        asDecayBpsPerMin: config.asDecayBpsPerMin,
+        adverseEnabled: config.adverseEnabled,
+        adverseMarkoutWindowsMs: config.adverseMarkoutWindowsMs,
+        adverseToxicMarkoutBps: config.adverseToxicMarkoutBps,
+        adverseMinFills: config.adverseMinFills,
+        adverseDecay: config.adverseDecay,
+        adverseStateThresholdsCsv: config.adverseStateThresholdsCsv,
+        adverseMaxSpreadMult: config.adverseMaxSpreadMult,
+        edgeSafetyBps: config.edgeSafetyBps,
+        hotVolBps: config.hotVolBps,
+        venueWeights: config.venueWeights,
+        seedEnabled: config.seedEnabled,
+        enableTakerSeed: config.enableTakerSeed,
+        seedTakerMaxUsd: config.seedTakerMaxUsd,
+        seedTakerMaxSlippageBps: config.seedTakerMaxSlippageBps,
+        hedgeEnabled: config.hedgeEnabled,
+        hedgeMaxUsdPerMin: config.hedgeMaxUsdPerMin,
+        hedgeMaxSlippageBps: config.hedgeMaxSlippageBps,
+        hedgeOnlyWhenConfident: config.hedgeOnlyWhenConfident,
+        newsEnabled: config.newsEnabled,
+        newsRefreshMs: config.newsRefreshMs,
+        newsMaxItems: config.newsMaxItems,
+        newsHalfLifeMs: config.newsHalfLifeMs,
+        newsMinConf: config.newsMinConf,
+        newsPauseImpact: config.newsPauseImpact,
+        newsPauseSeconds: config.newsPauseSeconds,
+        newsSpreadMult: config.newsSpreadMult,
+        newsSizeCutMult: config.newsSizeCutMult,
+        newsSourcesRss: config.newsSourcesRss,
+        newsGdeltQuery: config.newsGdeltQuery,
+        newsApiKey: config.newsApiKey ? "<configured>" : undefined,
+        signalsEnabled: config.signalsEnabled,
+        signalsNewsRefreshMs: config.signalsNewsRefreshMs,
+        signalsMacroEnabled: config.signalsMacroEnabled,
+        signalsMacroRefreshMs: config.signalsMacroRefreshMs,
+        signalsSystemRefreshMs: config.signalsSystemRefreshMs,
+        signalsMaxItems: config.signalsMaxItems,
+        signalsHalfLifeMs: config.signalsHalfLifeMs,
+        signalsMinConf: config.signalsMinConf,
+        signalsPauseImpact: config.signalsPauseImpact,
+        signalsPauseSeconds: config.signalsPauseSeconds,
+        signalsSpreadMult: config.signalsSpreadMult,
+        signalsSizeCutMult: config.signalsSizeCutMult,
+        signalsRssUrls: config.signalsRssUrls,
+        signalsGdeltQuery: config.signalsGdeltQuery,
+        signalsMacroUrl: config.signalsMacroUrl,
+        signalsLlmEnabled: config.signalsLlmEnabled,
+        openAiApiKey: config.openAiApiKey ? "<configured>" : undefined,
         maxUiEvents: config.maxUiEvents,
+        maxSignalPoints: config.maxSignalPoints,
         maxEquityPoints: config.maxEquityPoints,
         equitySampleMs: config.equitySampleMs,
         persistEquitySeries: config.persistEquitySeries,
         maxApiEvents: config.maxApiEvents,
         eventDedupe: config.eventDedupe,
+        externalVenues: config.externalVenues,
+        externalQuotesRefreshSeconds: config.externalQuotesRefreshSeconds,
         requestsPerMinute: config.requestsPerMinute,
         revxApiKey: redact(config.revxApiKey),
         revxPrivateKeyBase64: config.revxPrivateKeyBase64 ? "<redacted>" : undefined,
