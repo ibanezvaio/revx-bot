@@ -20,3 +20,6 @@ data/
 data/
 *.last-good.*
 .polymarket-creds.json
+# Runtime logs
+logs/
+*.jsonl
