@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig } from "./config";
@@ -14,6 +15,11 @@ import { SignalEngine } from "./signals/SignalEngine";
 import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
 import { sleep } from "./util/time";
+import { PolymarketEngine } from "./polymarket/PolymarketEngine";
+import { PolymarketClient } from "./polymarket/PolymarketClient";
+import { GammaSeedScanner } from "./polymarket/GammaSeedScanner";
+import { MarketScanner } from "./polymarket/MarketScanner";
+
 
 async function run(): Promise<void> {
   const command = process.argv[2] ?? "status";
@@ -129,6 +135,322 @@ async function run(): Promise<void> {
       dryStore.close();
       // eslint-disable-next-line no-console
       console.log("Simulation complete.");
+      return;
+    }
+
+    if (command === "polymarket") {
+      const subcommand = args[0] ?? "";
+      const isPing = subcommand === "ping" || args.includes("--ping");
+      const isWhoAmI = subcommand === "whoami";
+      const isDeriveCreds = subcommand === "derive-creds";
+      const isPaperRun = subcommand === "paper";
+      const isScan = subcommand === "scan";
+      const isBook = subcommand === "book";
+      const isResolveEvent = subcommand === "resolve-event";
+      const btc5m = args.includes("--btc5m");
+      if (!isPing && !isWhoAmI && !isDeriveCreds && !isPaperRun && !isScan && !isBook && !isResolveEvent && !btc5m) {
+        throw new Error("polymarket command requires one of: ping | whoami | derive-creds | scan --btc5m | resolve-event --slug <slug> | book --token-id <id> | paper --btc5m | --btc5m");
+      }
+      if (isPaperRun && !btc5m) {
+        throw new Error("polymarket paper requires --btc5m");
+      }
+      if (isScan && !btc5m) {
+        throw new Error("polymarket scan requires --btc5m");
+      }
+
+      const mode = isPaperRun
+        ? "paper"
+        : args.includes("--live")
+          ? "live"
+          : args.includes("--paper")
+            ? "paper"
+            : config.polymarket.mode;
+      const forceTrade = args.includes("--force-trade")
+        ? true
+        : config.polymarket.paper.forceTrade;
+      const forceIntervalSec = parseArgNumber(
+        args,
+        "--force-interval-sec",
+        config.polymarket.paper.forceIntervalSec
+      );
+      const forceNotional = parseArgNumber(
+        args,
+        "--force-notional",
+        config.polymarket.paper.forceNotional
+      );
+      const effectiveConfig = {
+        ...config,
+        polymarket: {
+          ...config.polymarket,
+          enabled: true,
+          mode,
+          execution: {
+            ...config.polymarket.execution,
+            cancelAllOnStart:
+              args.includes("--cancel-all-on-start") || config.polymarket.execution.cancelAllOnStart
+          },
+          paper: {
+            ...config.polymarket.paper,
+            forceTrade,
+            forceIntervalSec: clamp(forceIntervalSec, 10, 24 * 60 * 60),
+            forceNotional: clamp(forceNotional, 0.01, 100_000)
+          }
+        }
+      } as typeof config;
+      validatePolymarketLiveConfig(effectiveConfig, {
+        allowMissingApiCreds: isDeriveCreds
+      });
+      const pmLogger = buildLogger(effectiveConfig);
+      const client = new PolymarketClient(effectiveConfig, pmLogger);
+
+      if (isPing) {
+        try {
+          const result = await client.ping();
+          // eslint-disable-next-line no-console
+          console.log("Polymarket ping: OK");
+          // eslint-disable-next-line no-console
+          console.log(JSON.stringify(result, null, 2));
+        } catch (error) {
+          const status = extractStatus(error);
+          if (status === 401) {
+            // eslint-disable-next-line no-console
+            console.error("Polymarket ping auth failed (401 Unauthorized/Invalid api key).");
+            // eslint-disable-next-line no-console
+            console.error(
+              "Likely causes: wrong signatureType/funder for this account, stale creds, or creds derived from a different wallet."
+            );
+            // eslint-disable-next-line no-console
+            console.error(
+              "Try: node dist/cli.js polymarket whoami --live  and  node dist/cli.js polymarket derive-creds --live"
+            );
+          }
+          throw error;
+        }
+        return;
+      }
+
+      if (isWhoAmI) {
+        const who = await client.whoAmI();
+        // eslint-disable-next-line no-console
+        console.log("Polymarket whoami:");
+        // eslint-disable-next-line no-console
+        console.log(JSON.stringify(who, null, 2));
+        return;
+      }
+
+      if (isDeriveCreds) {
+        const printSecrets = args.includes("--print-secrets");
+        const derived = await client.deriveCreds({
+          printSecrets,
+          useCache: !args.includes("--fresh"),
+          saveCache: true
+        });
+        // eslint-disable-next-line no-console
+        console.log("Polymarket derive-creds:");
+        const output = printSecrets
+          ? derived
+          : { apiKey: String((derived as Record<string, unknown>).apiKey || "") };
+        // eslint-disable-next-line no-console
+        console.log(JSON.stringify(output, null, 2));
+        return;
+      }
+
+      if (isScan) {
+        const scanner = new MarketScanner(effectiveConfig, pmLogger, client);
+        const diagnostics = await scanner.scanBtc5m(Date.now(), {
+          debug: args.includes("--debug")
+        });
+        // eslint-disable-next-line no-console
+        console.log("Polymarket BTC-5m scan counters:");
+        // eslint-disable-next-line no-console
+        console.log(
+          JSON.stringify(
+            {
+              fetchedTotal: diagnostics.counters.fetchedTotal,
+              tradableTotal: diagnostics.counters.tradableTotal,
+              btcTotal: diagnostics.counters.btcTotal,
+              cadenceTotal: diagnostics.counters.cadenceTotal,
+              directionTotal: diagnostics.counters.directionTotal,
+              btc5mCandidates: diagnostics.counters.btc5mCandidates,
+              activeWindows: diagnostics.counters.activeWindows,
+              pagesScanned: diagnostics.counters.pagesScanned,
+              recentEventsCount: diagnostics.counters.recentEventsCount,
+              prefixMatchesCount: diagnostics.counters.prefixMatchesCount,
+              selectedSlug: diagnostics.selectedSlug
+            },
+            null,
+            2
+          )
+        );
+        // eslint-disable-next-line no-console
+        console.log("First 20 BTC-5m candidates:");
+        // eslint-disable-next-line no-console
+        console.table(
+          diagnostics.candidates.slice(0, 20).map((row) => ({
+            id: row.marketId,
+            question: row.question,
+            accepting_orders: row.acceptingOrders,
+            enable_order_book: row.enableOrderBook,
+            closed: row.closed,
+            active: row.active
+          }))
+        );
+        if (args.includes("--debug")) {
+          // eslint-disable-next-line no-console
+          console.log("First rejected non-tradable candidates:");
+          // eslint-disable-next-line no-console
+          console.table(
+            diagnostics.rejectedNotTradable.map((row) => ({
+              id: row.marketId,
+              question: row.question,
+              reasons: row.reasons.join(","),
+              accepting_orders: row.acceptingOrders,
+              enable_order_book: row.enableOrderBook,
+              closed: row.closed,
+              active: row.active
+            }))
+          );
+        }
+        return;
+      }
+
+      if (isResolveEvent) {
+        const slug = parseArgString(args, "--slug", "");
+        if (!slug) {
+          throw new Error("polymarket resolve-event requires --slug <event-slug>");
+        }
+        const seedScanner = new GammaSeedScanner(effectiveConfig, pmLogger, client);
+        const resolved = await seedScanner.resolveEventBySlug(slug);
+        if (!resolved) {
+          throw new Error(`Failed to resolve event slug: ${slug}`);
+        }
+        // eslint-disable-next-line no-console
+        console.log(
+          JSON.stringify(
+            {
+              slug: resolved.slug,
+              conditionId: resolved.conditionId,
+              outcomes: resolved.outcomes,
+              tokenUpId: resolved.tokenUpId,
+              tokenDownId: resolved.tokenDownId,
+              windowStart: resolved.windowStartTs ? new Date(resolved.windowStartTs).toISOString() : null,
+              windowEnd: new Date(resolved.windowEndTs).toISOString(),
+              acceptingOrders: resolved.acceptingOrders,
+              enableOrderBook: resolved.enableOrderBook,
+              active: resolved.active,
+              closed: resolved.closed
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
+      if (isBook) {
+        const tokenId = parseArgString(args, "--token-id", "");
+        if (!tokenId) {
+          throw new Error("polymarket book requires --token-id <id>");
+        }
+        const book = await client.getTokenOrderBook(tokenId);
+        // eslint-disable-next-line no-console
+        console.log(
+          JSON.stringify(
+            {
+              tokenId,
+              bestBid: book.bestBid,
+              bestAsk: book.bestAsk,
+              bids: book.bids.slice(0, 5),
+              asks: book.asks.slice(0, 5)
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
+      const engine = new PolymarketEngine(effectiveConfig, pmLogger);
+
+      // eslint-disable-next-line no-console
+      console.log("Polymarket module starting with strict safety defaults:");
+      // eslint-disable-next-line no-console
+      console.log(
+        JSON.stringify(
+          {
+            mode,
+            loopMs: effectiveConfig.polymarket.loopMs,
+            marketQuery: effectiveConfig.polymarket.marketQuery,
+            threshold: effectiveConfig.polymarket.threshold,
+            sizing: effectiveConfig.polymarket.sizing,
+            risk: effectiveConfig.polymarket.risk,
+            authEnv: {
+              apiKeyEnv: effectiveConfig.polymarket.auth.apiKeyEnv,
+              apiSecretEnv: effectiveConfig.polymarket.auth.apiSecretEnv,
+              legacySecretEnv: effectiveConfig.polymarket.auth.legacySecretEnv,
+              passphraseEnv: effectiveConfig.polymarket.auth.passphraseEnv,
+              privateKeyEnv: effectiveConfig.polymarket.auth.privateKeyEnv,
+              funderEnv: effectiveConfig.polymarket.auth.funderEnv
+            },
+            chainId: effectiveConfig.polymarket.auth.chainId,
+            network: effectiveConfig.polymarket.auth.network,
+            signatureType: effectiveConfig.polymarket.auth.signatureType,
+            autoDeriveApiKey: effectiveConfig.polymarket.auth.autoDeriveApiKey,
+            execution: effectiveConfig.polymarket.execution,
+            paper: effectiveConfig.polymarket.paper
+          },
+          null,
+          2
+        )
+      );
+      // eslint-disable-next-line no-console
+      console.log(
+        "Safety warning: start paper mode, tiny sizing, and never allow new orders in the last 30s. Consider --cancel-all-on-start for live sessions."
+      );
+      // eslint-disable-next-line no-console
+      console.log("Decision logs: logs/polymarket-decisions.jsonl");
+      // eslint-disable-next-line no-console
+      console.log(
+        `Paper force-trade: ${effectiveConfig.polymarket.paper.forceTrade ? "ENABLED" : "disabled"} (intervalSec=${effectiveConfig.polymarket.paper.forceIntervalSec}, notional=${effectiveConfig.polymarket.paper.forceNotional}, side=${effectiveConfig.polymarket.paper.forceSide})`
+      );
+
+      await engine.start();
+
+      const runMs = isPaperRun
+        ? Math.floor(clamp(parseArgNumber(args, "--hours", 12), 0.01, 168) * 60 * 60 * 1000)
+        : 0;
+      if (isPaperRun) {
+        // eslint-disable-next-line no-console
+        console.log(`Polymarket paper overnight mode: running for ${fmt(runMs / (60 * 60 * 1000), 2)} hours`);
+      }
+
+      await new Promise<void>((resolve) => {
+        let stopping = false;
+        let timeout: NodeJS.Timeout | null = null;
+        const stop = async (signal: string): Promise<void> => {
+          if (stopping) return;
+          stopping = true;
+          if (timeout) {
+            clearTimeout(timeout);
+            timeout = null;
+          }
+          await engine.stop(signal);
+          resolve();
+        };
+
+        process.once("SIGINT", () => {
+          void stop("SIGINT");
+        });
+        process.once("SIGTERM", () => {
+          void stop("SIGTERM");
+        });
+        if (runMs > 0) {
+          timeout = setTimeout(() => {
+            void stop("TIMEBOX_COMPLETE");
+          }, runMs);
+        }
+      });
+
       return;
     }
 
@@ -409,7 +731,7 @@ async function run(): Promise<void> {
     console.error(
       "Unknown command: " +
         command +
-        ". Use: status | balances [--raw] | cancel-all [--all] | dry-run | simulate [--minutes N] | tune [--apply]"
+        ". Use: status | balances [--raw] | cancel-all [--all] | dry-run | simulate [--minutes N] | tune [--apply] | polymarket ping [--paper|--live] | polymarket whoami [--paper|--live] | polymarket derive-creds [--paper|--live] [--print-secrets] [--fresh] | polymarket scan --btc5m [--debug] | polymarket resolve-event --slug <slug> | polymarket book --token-id <id> [--paper|--live] | polymarket paper --btc5m [--hours N] [--force-trade] [--force-interval-sec N] [--force-notional X] | polymarket --btc5m [--paper|--live] [--cancel-all-on-start]"
     );
     process.exitCode = 1;
   } finally {
@@ -423,6 +745,43 @@ function parseBotTag(tag: string): { side: string; level: number; tag: string } 
   const m = /-(BUY|SELL)-L(\d+)$/.exec(tag);
   if (!m) return { side: "?", level: -1, tag };
   return { side: m[1], level: Number(m[2]), tag };
+}
+
+function validatePolymarketLiveConfig(
+  config: ReturnType<typeof loadConfig>,
+  options?: { allowMissingApiCreds?: boolean }
+): void {
+  if (config.polymarket.mode !== "live") {
+    return;
+  }
+  if (!config.polymarket.liveConfirmed) {
+    throw new Error("POLYMARKET_MODE=live requires POLYMARKET_LIVE_CONFIRMED=true");
+  }
+
+  const auth = config.polymarket.auth;
+  if (!auth.privateKey) {
+    throw new Error(`${auth.privateKeyEnv} is required when running polymarket --live`);
+  }
+  if (!auth.funder) {
+    throw new Error(`${auth.funderEnv} is required when running polymarket --live`);
+  }
+  const hasApiCreds = Boolean(auth.apiKey && auth.apiSecret && auth.passphrase);
+  if (!hasApiCreds && !auth.autoDeriveApiKey && !options?.allowMissingApiCreds) {
+    throw new Error(
+      `Live Polymarket mode requires (${auth.apiKeyEnv}, ${auth.apiSecretEnv} or ${auth.legacySecretEnv}, ${auth.passphraseEnv}) or POLYMARKET_AUTO_DERIVE_API_KEY=true`
+    );
+  }
+}
+
+function extractStatus(error: unknown): number {
+  if (!error || typeof error !== "object") return 0;
+  const obj = error as Record<string, unknown>;
+  const status = Number(obj.status);
+  if (Number.isFinite(status)) return status;
+  const response = obj.response && typeof obj.response === "object" ? (obj.response as Record<string, unknown>) : {};
+  const nested = Number(response.status);
+  if (Number.isFinite(nested)) return nested;
+  return 0;
 }
 
 function parseDecisionDetails(raw: string): Record<string, unknown> {
@@ -468,6 +827,13 @@ function parseArgNumber(args: string[], flag: string, fallback: number): number 
   const raw = args[idx + 1];
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseArgString(args: string[], flag: string, fallback: string): string {
+  const idx = args.findIndex((arg) => arg === flag);
+  if (idx < 0) return fallback;
+  const raw = String(args[idx + 1] || "").trim();
+  return raw.length > 0 ? raw : fallback;
 }
 
 function upsertEnvValue(raw: string, key: string, value: string): string {

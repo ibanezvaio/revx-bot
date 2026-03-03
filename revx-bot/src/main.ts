@@ -15,6 +15,7 @@ import { SignalsEngine } from "./signals/SignalsEngine";
 import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
 import { DashboardServer } from "./web/DashboardServer";
+import { PolymarketEngine } from "./polymarket/PolymarketEngine";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -69,6 +70,14 @@ async function main(): Promise<void> {
     signalsEngine,
     intelEngine
   );
+  const pmLogger =
+    config.polymarket.enabled
+      ? logger.child({ module: "polymarket" })
+      : null;
+  const polymarketEngine =
+    config.polymarket.enabled
+      ? new PolymarketEngine(config, pmLogger ?? logger, { store })
+      : undefined;
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -77,6 +86,7 @@ async function main(): Promise<void> {
     logger.warn({ signal }, "Shutdown requested");
 
     strategy.stop();
+    await polymarketEngine?.stop("SHUTDOWN");
     reconciler.stop();
     externalQuoteService.stop();
     newsEngine.stop();
@@ -105,6 +115,31 @@ async function main(): Promise<void> {
 
   try {
     dashboard.start();
+    if (config.polymarket.enabled) {
+      pmLogger?.warn(
+        {
+          enabled: config.polymarket.enabled,
+          mode: config.polymarket.mode,
+          liveConfirmed: config.polymarket.liveConfirmed,
+          killSwitch: config.polymarket.killSwitch,
+          seedSeriesPrefix: config.polymarket.marketQuery.seedSeriesPrefix || null,
+          seedEventSlugs: config.polymarket.marketQuery.seedEventSlugs,
+          sizing: config.polymarket.sizing,
+          risk: config.polymarket.risk,
+          cancelAllOnStart: config.polymarket.execution.cancelAllOnStart,
+          paperForceTrade: config.polymarket.paper.forceTrade,
+          paperForceIntervalSec: config.polymarket.paper.forceIntervalSec,
+          paperForceNotional: config.polymarket.paper.forceNotional
+        },
+        "Polymarket enabled in combined runtime"
+      );
+    }
+    if (config.polymarket.enabled) {
+      // Start Polymarket on its own async loop; never block RevX strategy cycle startup.
+      void polymarketEngine?.start().catch((error) => {
+        pmLogger?.error({ error }, "Polymarket engine failed to start in combined runtime");
+      });
+    }
     externalQuoteService.start();
     newsEngine.start();
     signalsEngine.start();
@@ -113,6 +148,7 @@ async function main(): Promise<void> {
     reconciler.start();
     await strategy.start();
   } finally {
+    await polymarketEngine?.stop("FINALIZER");
     externalQuoteService.stop();
     newsEngine.stop();
     signalsEngine.stop();
@@ -253,6 +289,37 @@ function logEffectiveConfig(
         signalsMacroUrl: config.signalsMacroUrl,
         signalsLlmEnabled: config.signalsLlmEnabled,
         openAiApiKey: config.openAiApiKey ? "<configured>" : undefined,
+        polymarket: {
+          enabled: config.polymarket.enabled,
+          mode: config.polymarket.mode,
+          liveConfirmed: config.polymarket.liveConfirmed,
+          killSwitch: config.polymarket.killSwitch,
+          loopMs: config.polymarket.loopMs,
+          marketQuery: config.polymarket.marketQuery,
+          threshold: config.polymarket.threshold,
+          sizing: config.polymarket.sizing,
+          risk: config.polymarket.risk,
+          http: config.polymarket.http,
+          authEnv: {
+            apiKeyEnv: config.polymarket.auth.apiKeyEnv,
+            apiSecretEnv: config.polymarket.auth.apiSecretEnv,
+            legacySecretEnv: config.polymarket.auth.legacySecretEnv,
+            passphraseEnv: config.polymarket.auth.passphraseEnv,
+            privateKeyEnv: config.polymarket.auth.privateKeyEnv,
+            funderEnv: config.polymarket.auth.funderEnv,
+            chainIdEnv: config.polymarket.auth.chainIdEnv,
+            networkEnv: config.polymarket.auth.networkEnv
+          },
+          authConfigured: Boolean(config.polymarket.auth.apiKey),
+          funderConfigured: Boolean(config.polymarket.auth.funder),
+          privateKeyConfigured: Boolean(config.polymarket.auth.privateKey),
+          autoDeriveApiKey: config.polymarket.auth.autoDeriveApiKey,
+          signatureType: config.polymarket.auth.signatureType,
+          chainId: config.polymarket.auth.chainId,
+          network: config.polymarket.auth.network,
+          baseUrls: config.polymarket.baseUrls,
+          paper: config.polymarket.paper
+        },
         maxUiEvents: config.maxUiEvents,
         maxSignalPoints: config.maxSignalPoints,
         maxEquityPoints: config.maxEquityPoints,

@@ -19,3 +19,4 @@ data/
 .env.*
 data/
 *.last-good.*
+.polymarket-creds.json

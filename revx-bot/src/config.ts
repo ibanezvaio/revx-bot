@@ -6,6 +6,126 @@ dotenv.config();
 
 const RUNTIME_BASE_DIR = resolveRuntimeBaseDir(process.env.REVX_RUNTIME_DIR);
 
+export type PolymarketMode = "paper" | "live";
+
+export type PolymarketConfig = {
+  enabled: boolean;
+  mode: PolymarketMode;
+  liveConfirmed: boolean;
+  killSwitch: boolean;
+  loopMs: number;
+  marketQuery: {
+    symbol: string;
+    cadenceMinutes: number;
+    search: string;
+    minWindowSec: number;
+    maxWindowSec: number;
+    maxMarkets: number;
+    maxScanMarkets: number;
+    scanPageSize: number;
+    scanTargetCandidates: number;
+    seedSeriesPrefix?: string;
+    seedEventSlugs: string[];
+    patterns: {
+      btc: string;
+      cadence: string;
+      direction: string;
+    };
+  };
+  threshold: {
+    baseEdge: number;
+    volK: number;
+    closePenalty: number;
+    maxSpread: number;
+  };
+  sizing: {
+    fractionalKelly: number;
+    maxNotionalPerWindow: number;
+    maxDailyLoss: number;
+    maxConcurrentWindows: number;
+    minOrderNotional: number;
+  };
+  risk: {
+    staleMs: number;
+    staleKillAfterMs: number;
+    noNewOrdersInLastSec: number;
+    maxOpenOrders: number;
+    maxExposure: number;
+  };
+  auth: {
+    apiKeyEnv: string;
+    apiSecretEnv: string;
+    legacySecretEnv: string;
+    passphraseEnv: string;
+    privateKeyEnv: string;
+    funderEnv: string;
+    chainIdEnv: string;
+    networkEnv: string;
+    apiKey?: string;
+    apiSecret?: string;
+    passphrase?: string;
+    privateKey?: string;
+    funder?: string;
+    chainId: number;
+    network: "polygon" | "amoy";
+    signatureType: number;
+    autoDeriveApiKey: boolean;
+  };
+  baseUrls: {
+    gamma: string;
+    clob: string;
+  };
+  http: {
+    requestsPerMinute: number;
+    maxRetries: number;
+    baseBackoffMs: number;
+    maxBackoffMs: number;
+    jitterMs: number;
+    timeoutMs: number;
+  };
+  oracle: {
+    emaHalfLifeSec: number;
+    madThreshold: number;
+    trimFraction: number;
+  };
+  vol: {
+    lookbackSec: number;
+    minSigmaBps: number;
+  };
+  execution: {
+    orderTtlMs: number;
+    takerPriceBuffer: number;
+    enableMakerQuoting: boolean;
+    cancelAllOnStart: boolean;
+  };
+  paper: {
+    ledgerPath: string;
+    slippageBps: number;
+    feeBps: number;
+    maxNotionalPerWindow: number;
+    maxTradesPerHour: number;
+    minEdgeThreshold: number;
+    minNetEdge: number;
+    probExtreme: number;
+    extremeHighPrice: number;
+    extremeLowPrice: number;
+    entryMinElapsedSec: number;
+    entryMaxElapsedSec: number;
+    entryMaxRemainingSec: number;
+    entryMinRemainingSec: number;
+    resolveGraceMs: number;
+    allowMultipleTradesPerWindow: boolean;
+    stopLossEdge: number;
+    stopLossConsecutiveTicks: number;
+    takeProfitUsd: number;
+    takeProfitDelta: number;
+    forceTrade: boolean;
+    forceIntervalSec: number;
+    forceNotional: number;
+    forceSide: "YES" | "NO" | "AUTO";
+  };
+};
+
 export type BotConfig = {
   revxApiKey: string;
   revxPrivateKeyBase64?: string;
@@ -309,6 +429,7 @@ export type BotConfig = {
   maxApiEvents: number;
   eventDedupe: boolean;
   envFilePath: string;
+  polymarket: PolymarketConfig;
 };
 
 let warnedEnvDuplicates = false;
@@ -852,6 +973,291 @@ export function loadConfig(): BotConfig {
     -100_000,
     0
   );
+  const polymarketApiKeyEnv = withDefault("POLYMARKET_API_KEY_ENV", "POLYMARKET_API_KEY");
+  const polymarketApiSecretEnv = withDefault(
+    "POLYMARKET_API_SECRET_ENV",
+    "POLYMARKET_API_SECRET"
+  );
+  const polymarketLegacySecretEnv = withDefault("POLYMARKET_SECRET_ENV", "POLYMARKET_SECRET");
+  const polymarketPassphraseEnv = withDefault(
+    "POLYMARKET_PASSPHRASE_ENV",
+    "POLYMARKET_PASSPHRASE"
+  );
+  const polymarketPrivateKeyEnv = withDefault(
+    "POLYMARKET_PRIVATE_KEY_ENV",
+    "POLYMARKET_PRIVATE_KEY"
+  );
+  const polymarketFunderEnv = withDefault("POLYMARKET_FUNDER_ENV", "POLYMARKET_FUNDER");
+  const polymarketChainIdEnv = withDefault("POLYMARKET_CHAIN_ID_ENV", "POLYMARKET_CHAIN_ID");
+  const polymarketNetworkEnv = withDefault("POLYMARKET_NETWORK_ENV", "POLYMARKET_NETWORK");
+
+  const polymarketApiKey = optional(polymarketApiKeyEnv);
+  const polymarketApiSecret = optional(polymarketApiSecretEnv) ?? optional(polymarketLegacySecretEnv);
+  const polymarketPassphrase = optional(polymarketPassphraseEnv);
+  const polymarketPrivateKey = optional(polymarketPrivateKeyEnv);
+  const polymarketFunder = optional(polymarketFunderEnv);
+  const polymarketNetwork = parsePolymarketNetwork(optional(polymarketNetworkEnv));
+  const polymarketChainId = parsePolymarketChainId(optional(polymarketChainIdEnv), polymarketNetwork);
+  const polymarketSignatureType = clampInt(numberWithDefault("POLYMARKET_SIGNATURE_TYPE", 0), 0, 2);
+  const polymarketAutoDeriveApiKey = boolWithDefault("POLYMARKET_AUTO_DERIVE_API_KEY", false);
+
+  const polymarketEnabled = boolWithDefault("POLYMARKET_ENABLED", false);
+  const polymarketMode = parsePolymarketMode(optional("POLYMARKET_MODE"));
+  const polymarketLiveConfirmed = boolWithDefault("POLYMARKET_LIVE_CONFIRMED", false);
+  const polymarketKillSwitch = boolWithDefault("POLYMARKET_KILL_SWITCH", false);
+  const polymarketLoopMs = clampInt(numberWithDefault("POLYMARKET_LOOP_MS", 2_000), 250, 60_000);
+  const polymarketMarketSymbol = withDefault("POLYMARKET_MARKET_SYMBOL", "BTC-USD")
+    .trim()
+    .toUpperCase();
+  const polymarketCadenceMinutes = clampInt(numberWithDefault("POLYMARKET_CADENCE_MINUTES", 5), 1, 60);
+  const polymarketSearch = withDefault(
+    "POLYMARKET_MARKET_SEARCH",
+    "btc 5 minute up down"
+  );
+  const polymarketMinWindowSec = clampInt(numberWithDefault("POLYMARKET_MIN_WINDOW_SEC", 240), 10, 7_200);
+  const polymarketMaxWindowSec = clampInt(numberWithDefault("POLYMARKET_MAX_WINDOW_SEC", 360), 10, 7_200);
+  const polymarketMaxMarkets = clampInt(numberWithDefault("POLYMARKET_MAX_MARKETS", 40), 1, 500);
+  const polymarketMaxScanMarkets = clampInt(
+    numberWithDefault("POLYMARKET_SCAN_MAX_MARKETS", 5_000),
+    100,
+    50_000
+  );
+  const polymarketScanPageSize = clampInt(numberWithDefault("POLYMARKET_SCAN_PAGE_SIZE", 200), 20, 1_000);
+  const polymarketScanTargetCandidates = clampInt(
+    numberWithDefault("POLYMARKET_SCAN_TARGET_CANDIDATES", 20),
+    1,
+    1_000
+  );
+  const polymarketSeedSeriesPrefix = optional("POLYMARKET_SEED_SERIES_PREFIX");
+  const polymarketSeedEventSlugs = parseCsvListRaw(optional("POLYMARKET_SEED_EVENT_SLUGS"));
+  const polymarketPatternBtc = withDefault(
+    "POLYMARKET_PATTERN_BTC",
+    "(?:\\bbtc\\b|bitcoin|\\$btc)"
+  );
+  const polymarketPatternCadence = withDefault(
+    "POLYMARKET_PATTERN_CADENCE",
+    "(?:\\b5m\\b|\\b5\\s*min(?:ute)?s?\\b|5-minute|5\\s*minute|minute market)"
+  );
+  const polymarketPatternDirection = withDefault(
+    "POLYMARKET_PATTERN_DIRECTION",
+    "(?:up\\s*/\\s*down|up\\s+down|direction|higher\\s*/\\s*lower|higher|lower|above\\s*/\\s*below|above|below)"
+  );
+
+  const polymarketBaseEdge = clampNumber(numberWithDefault("POLYMARKET_BASE_EDGE", 0.02), 0, 0.5);
+  const polymarketVolK = clampNumber(numberWithDefault("POLYMARKET_VOL_K", 3), 0, 200);
+  const polymarketClosePenalty = clampNumber(numberWithDefault("POLYMARKET_CLOSE_PENALTY", 0.05), 0, 1);
+  const polymarketMaxSpread = clampNumber(numberWithDefault("POLYMARKET_MAX_SPREAD", 0.06), 0, 1);
+
+  const polymarketFractionalKelly = clampNumber(
+    numberWithDefault("POLYMARKET_FRACTIONAL_KELLY", 0.2),
+    0,
+    1
+  );
+  const polymarketMaxNotionalPerWindow = clampNumber(
+    numberWithDefault("POLYMARKET_MAX_NOTIONAL_PER_WINDOW", 10),
+    0.1,
+    100_000
+  );
+  const polymarketMaxNotionalPerWindowRaw = optional("POLYMARKET_MAX_NOTIONAL_PER_WINDOW");
+  const polymarketMaxDailyLoss = clampNumber(numberWithDefault("POLYMARKET_MAX_DAILY_LOSS", 25), 0.1, 1_000_000);
+  const polymarketMaxDailyLossRaw = optional("POLYMARKET_MAX_DAILY_LOSS");
+  const polymarketMaxConcurrentWindows = clampInt(
+    numberWithDefault("POLYMARKET_MAX_CONCURRENT_WINDOWS", 3),
+    1,
+    100
+  );
+  const polymarketMinOrderNotional = clampNumber(
+    numberWithDefault("POLYMARKET_MIN_ORDER_NOTIONAL", 1),
+    0.01,
+    10_000
+  );
+
+  const polymarketStaleMs = clampInt(numberWithDefault("POLYMARKET_STALE_MS", 5000), 250, 120_000);
+  const polymarketStaleKillAfterMs = clampInt(
+    numberWithDefault("POLYMARKET_STALE_KILL_AFTER_SEC", 60) * 1000,
+    polymarketStaleMs,
+    30 * 60 * 1000
+  );
+  const polymarketNoNewOrdersInLastSec = clampInt(
+    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", 30),
+    0,
+    300
+  );
+  const polymarketMaxOpenOrders = clampInt(numberWithDefault("POLYMARKET_MAX_OPEN_ORDERS", 6), 1, 100);
+  const polymarketMaxExposure = clampNumber(numberWithDefault("POLYMARKET_MAX_EXPOSURE", 30), 0.1, 1_000_000);
+
+  const polymarketGammaBaseUrl = withDefault(
+    "POLYMARKET_GAMMA_BASE_URL",
+    "https://gamma-api.polymarket.com"
+  );
+  const polymarketBaseUrl = withDefault("POLYMARKET_BASE_URL", "https://clob.polymarket.com");
+  const polymarketClobBaseUrl = withDefault("POLYMARKET_CLOB_BASE_URL", polymarketBaseUrl);
+  const polymarketHttpRequestsPerMinute = clampInt(
+    numberWithDefault("POLYMARKET_HTTP_RPM", 360),
+    30,
+    10_000
+  );
+  const polymarketHttpMaxRetries = clampInt(numberWithDefault("POLYMARKET_HTTP_MAX_RETRIES", 4), 0, 20);
+  const polymarketHttpBaseBackoffMs = clampInt(
+    numberWithDefault("POLYMARKET_HTTP_BASE_BACKOFF_MS", 300),
+    10,
+    60_000
+  );
+  const polymarketHttpMaxBackoffMs = clampInt(
+    numberWithDefault("POLYMARKET_HTTP_MAX_BACKOFF_MS", 3_000),
+    polymarketHttpBaseBackoffMs,
+    120_000
+  );
+  const polymarketHttpJitterMs = clampInt(numberWithDefault("POLYMARKET_HTTP_JITTER_MS", 120), 0, 10_000);
+  const polymarketHttpTimeoutMs = clampInt(
+    numberWithDefault("POLYMARKET_HTTP_TIMEOUT_MS", 8_000),
+    500,
+    120_000
+  );
+
+  const polymarketOracleEmaHalfLifeSec = clampNumber(
+    numberWithDefault("POLYMARKET_ORACLE_EMA_HALFLIFE_SEC", 12),
+    1,
+    600
+  );
+  const polymarketOracleMadThreshold = clampNumber(
+    numberWithDefault("POLYMARKET_ORACLE_MAD_THRESHOLD", 4),
+    0.5,
+    20
+  );
+  const polymarketOracleTrimFraction = clampNumber(
+    numberWithDefault("POLYMARKET_ORACLE_TRIM_FRACTION", 0.15),
+    0,
+    0.45
+  );
+  const polymarketVolLookbackSec = clampInt(
+    numberWithDefault("POLYMARKET_VOL_LOOKBACK_SEC", 600),
+    30,
+    24 * 60 * 60
+  );
+  const polymarketMinSigmaBps = clampNumber(
+    numberWithDefault("POLYMARKET_MIN_SIGMA_BPS", 5),
+    0.1,
+    1000
+  );
+  const polymarketOrderTtlMs = clampInt(numberWithDefault("POLYMARKET_ORDER_TTL_MS", 1_500), 100, 60_000);
+  const polymarketTakerPriceBuffer = clampNumber(
+    numberWithDefault("POLYMARKET_TAKER_PRICE_BUFFER", 0.01),
+    0,
+    0.25
+  );
+  const polymarketEnableMakerQuoting = boolWithDefault("POLYMARKET_ENABLE_MAKER_QUOTING", false);
+  const polymarketCancelAllOnStart = boolWithDefault("POLYMARKET_CANCEL_ALL_ON_START", false);
+  const polymarketCancelAllOnStartRaw = optional("POLYMARKET_CANCEL_ALL_ON_START");
+  const polymarketPaperLedgerPath = withDefault(
+    "POLYMARKET_PAPER_LEDGER_PATH",
+    "data/polymarket-paper-ledger.jsonl"
+  );
+  const polymarketPaperSlippageBps = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_SLIPPAGE_BPS", 2),
+    0,
+    500
+  );
+  const polymarketPaperFeeBps = clampNumber(numberWithDefault("POLYMARKET_PAPER_FEE_BPS", 5), 0, 500);
+  const polymarketPaperMaxNotionalPerWindow = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_MAX_NOTIONAL_PER_WINDOW", polymarketMaxNotionalPerWindow),
+    0.1,
+    100_000
+  );
+  const polymarketPaperMaxTradesPerHour = clampInt(
+    numberWithDefault("POLYMARKET_PAPER_MAX_TRADES_PER_HOUR", 50),
+    1,
+    10_000
+  );
+  const polymarketPaperMinEdgeThreshold = clampNumber(
+    numberWithFallback(
+      ["POLYMARKET_PAPER_MIN_EDGE", "POLYMARKET_PAPER_MIN_EDGE_THRESHOLD"],
+      polymarketBaseEdge
+    ),
+    0,
+    0.5
+  );
+  const polymarketMinNetEdge = clampNumber(
+    numberWithDefault("POLYMARKET_MIN_NET_EDGE", 0.01),
+    0,
+    0.5
+  );
+  const polymarketProbExtreme = clampNumber(
+    numberWithDefault("POLYMARKET_PROB_EXTREME", 0.9),
+    0.5,
+    0.9999
+  );
+  const polymarketExtremeHighPrice = clampNumber(
+    numberWithDefault("POLYMARKET_EXTREME_HIGH_PRICE", 0.97),
+    0.5,
+    0.9999
+  );
+  const polymarketExtremeLowPrice = clampNumber(
+    numberWithDefault("POLYMARKET_EXTREME_LOW_PRICE", 0.1),
+    0.0001,
+    0.5
+  );
+  const polymarketEntryMinElapsedSec = clampInt(
+    numberWithDefault("POLYMARKET_ENTRY_MIN_ELAPSED_SEC", 20),
+    0,
+    299
+  );
+  const polymarketEntryMaxElapsedSec = clampInt(
+    numberWithDefault("POLYMARKET_ENTRY_MAX_ELAPSED_SEC", 240),
+    1,
+    300
+  );
+  const polymarketEntryMaxRemainingSec = clampInt(
+    numberWithDefault("POLYMARKET_ENTRY_MAX_REMAINING_SEC", 90),
+    1,
+    300
+  );
+  const polymarketEntryMinRemainingSec = clampInt(
+    numberWithDefault("POLYMARKET_ENTRY_MIN_REMAINING_SEC", 20),
+    0,
+    300
+  );
+  const polymarketResolveGraceMs = clampInt(
+    numberWithDefault("POLYMARKET_RESOLVE_GRACE_MS", 2_000),
+    0,
+    120_000
+  );
+  const polymarketPaperAllowMultipleTradesPerWindow = boolWithDefault(
+    "POLYMARKET_PAPER_ALLOW_MULTIPLE_TRADES_PER_WINDOW",
+    false
+  );
+  const polymarketPaperStopLossEdge = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_STOP_LOSS_EDGE", 0.02),
+    0.0001,
+    0.5
+  );
+  const polymarketPaperStopLossConsecutiveTicks = clampInt(
+    numberWithDefault("POLYMARKET_PAPER_STOP_LOSS_CONSECUTIVE_TICKS", 3),
+    1,
+    50
+  );
+  const polymarketPaperTakeProfitUsd = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TAKE_PROFIT_USD", 0.25),
+    0.01,
+    1_000_000
+  );
+  const polymarketPaperTakeProfitDelta = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TAKE_PROFIT_DELTA", 0.06),
+    0.0001,
+    0.99
+  );
+  const polymarketPaperForceTrade = boolWithDefault("POLYMARKET_PAPER_FORCE_TRADE", false);
+  const polymarketPaperForceIntervalSec = clampInt(
+    numberWithDefault("POLYMARKET_PAPER_FORCE_INTERVAL_SEC", 300),
+    10,
+    24 * 60 * 60
+  );
+  const polymarketPaperForceNotional = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_FORCE_NOTIONAL", 1),
+    0.01,
+    100_000
+  );
+  const polymarketPaperForceSide = parsePolymarketPaperForceSide(optional("POLYMARKET_PAPER_FORCE_SIDE"));
 
   if (volSpreadMultMax < volSpreadMultMin) {
     throw new Error("VOL_SPREAD_MULT_MAX must be >= VOL_SPREAD_MULT_MIN");
@@ -873,6 +1279,54 @@ export function loadConfig(): BotConfig {
   if (minQuoteSizeUsd > levelQuoteSizeUsd) {
     throw new Error("MIN_QUOTE_SIZE_USD must be <= LEVEL_QUOTE_SIZE_USD");
   }
+  if (polymarketMaxWindowSec < polymarketMinWindowSec) {
+    throw new Error("POLYMARKET_MAX_WINDOW_SEC must be >= POLYMARKET_MIN_WINDOW_SEC");
+  }
+  if (polymarketEntryMaxElapsedSec < polymarketEntryMinElapsedSec) {
+    throw new Error("POLYMARKET_ENTRY_MAX_ELAPSED_SEC must be >= POLYMARKET_ENTRY_MIN_ELAPSED_SEC");
+  }
+  if (polymarketEntryMaxRemainingSec < polymarketEntryMinRemainingSec) {
+    throw new Error("POLYMARKET_ENTRY_MAX_REMAINING_SEC must be >= POLYMARKET_ENTRY_MIN_REMAINING_SEC");
+  }
+  if (polymarketExtremeHighPrice <= polymarketExtremeLowPrice) {
+    throw new Error("POLYMARKET_EXTREME_HIGH_PRICE must be > POLYMARKET_EXTREME_LOW_PRICE");
+  }
+  if (polymarketScanPageSize > polymarketMaxScanMarkets) {
+    throw new Error("POLYMARKET_SCAN_PAGE_SIZE must be <= POLYMARKET_SCAN_MAX_MARKETS");
+  }
+  if (polymarketEnabled && polymarketMode === "live") {
+    if (!polymarketLiveConfirmed) {
+      throw new Error(
+        "POLYMARKET_MODE=live requires POLYMARKET_LIVE_CONFIRMED=true. Refusing to start live Polymarket trading without explicit confirmation."
+      );
+    }
+    if (!polymarketPrivateKey) {
+      throw new Error(`${polymarketPrivateKeyEnv} is required when POLYMARKET_MODE=live`);
+    }
+    if (!polymarketFunder) {
+      throw new Error(`${polymarketFunderEnv} is required when POLYMARKET_MODE=live`);
+    }
+    const hasApiCreds = Boolean(polymarketApiKey && polymarketApiSecret && polymarketPassphrase);
+    if (!hasApiCreds && !polymarketAutoDeriveApiKey) {
+      throw new Error(
+        `Live Polymarket mode requires (${polymarketApiKeyEnv}, ${polymarketApiSecretEnv} or ${polymarketLegacySecretEnv}, ${polymarketPassphraseEnv}) or POLYMARKET_AUTO_DERIVE_API_KEY=true`
+      );
+    }
+  }
+
+  const polymarketSafetyLiveMode = polymarketEnabled && polymarketMode === "live" && polymarketLiveConfirmed;
+  const polymarketEffectiveMaxNotionalPerWindow =
+    polymarketSafetyLiveMode && !polymarketMaxNotionalPerWindowRaw
+      ? Math.min(polymarketMaxNotionalPerWindow, 0.25)
+      : polymarketMaxNotionalPerWindow;
+  const polymarketEffectiveMaxDailyLoss =
+    polymarketSafetyLiveMode && !polymarketMaxDailyLossRaw
+      ? Math.min(polymarketMaxDailyLoss, 2)
+      : polymarketMaxDailyLoss;
+  const polymarketEffectiveCancelAllOnStart =
+    polymarketSafetyLiveMode && !polymarketCancelAllOnStartRaw
+      ? true
+      : polymarketCancelAllOnStart;
 
   const externalVenues = parseCsvList(optional("EXTERNAL_VENUES"));
   const externalQuotesRefreshSeconds = clampNumber(
@@ -1182,7 +1636,124 @@ export function loadConfig(): BotConfig {
     persistEquitySeries: boolWithDefault("PERSIST_EQUITY_SERIES", false),
     maxApiEvents: clampInt(numberWithDefault("MAX_API_EVENTS", 500), 50, 10_000),
     eventDedupe: boolWithDefault("EVENT_DEDUPE", true),
-    envFilePath
+    envFilePath,
+    polymarket: {
+      enabled: polymarketEnabled,
+      mode: polymarketMode,
+      liveConfirmed: polymarketLiveConfirmed,
+      killSwitch: polymarketKillSwitch,
+      loopMs: polymarketLoopMs,
+      marketQuery: {
+        symbol: polymarketMarketSymbol,
+        cadenceMinutes: polymarketCadenceMinutes,
+        search: polymarketSearch,
+        minWindowSec: polymarketMinWindowSec,
+        maxWindowSec: polymarketMaxWindowSec,
+        maxMarkets: polymarketMaxMarkets,
+        maxScanMarkets: polymarketMaxScanMarkets,
+        scanPageSize: polymarketScanPageSize,
+        scanTargetCandidates: polymarketScanTargetCandidates,
+        seedSeriesPrefix: polymarketSeedSeriesPrefix,
+        seedEventSlugs: polymarketSeedEventSlugs,
+        patterns: {
+          btc: polymarketPatternBtc,
+          cadence: polymarketPatternCadence,
+          direction: polymarketPatternDirection
+        }
+      },
+      threshold: {
+        baseEdge: polymarketBaseEdge,
+        volK: polymarketVolK,
+        closePenalty: polymarketClosePenalty,
+        maxSpread: polymarketMaxSpread
+      },
+      sizing: {
+        fractionalKelly: polymarketFractionalKelly,
+        maxNotionalPerWindow: polymarketEffectiveMaxNotionalPerWindow,
+        maxDailyLoss: polymarketEffectiveMaxDailyLoss,
+        maxConcurrentWindows: polymarketMaxConcurrentWindows,
+        minOrderNotional: polymarketMinOrderNotional
+      },
+      risk: {
+        staleMs: polymarketStaleMs,
+        staleKillAfterMs: polymarketStaleKillAfterMs,
+        noNewOrdersInLastSec: polymarketNoNewOrdersInLastSec,
+        maxOpenOrders: polymarketMaxOpenOrders,
+        maxExposure: polymarketMaxExposure
+      },
+      auth: {
+        apiKeyEnv: polymarketApiKeyEnv,
+        apiSecretEnv: polymarketApiSecretEnv,
+        legacySecretEnv: polymarketLegacySecretEnv,
+        passphraseEnv: polymarketPassphraseEnv,
+        privateKeyEnv: polymarketPrivateKeyEnv,
+        funderEnv: polymarketFunderEnv,
+        chainIdEnv: polymarketChainIdEnv,
+        networkEnv: polymarketNetworkEnv,
+        apiKey: polymarketApiKey,
+        apiSecret: polymarketApiSecret,
+        passphrase: polymarketPassphrase,
+        privateKey: polymarketPrivateKey,
+        funder: polymarketFunder,
+        chainId: polymarketChainId,
+        network: polymarketNetwork,
+        signatureType: polymarketSignatureType,
+        autoDeriveApiKey: polymarketAutoDeriveApiKey
+      },
+      baseUrls: {
+        gamma: polymarketGammaBaseUrl,
+        clob: polymarketClobBaseUrl
+      },
+      http: {
+        requestsPerMinute: polymarketHttpRequestsPerMinute,
+        maxRetries: polymarketHttpMaxRetries,
+        baseBackoffMs: polymarketHttpBaseBackoffMs,
+        maxBackoffMs: polymarketHttpMaxBackoffMs,
+        jitterMs: polymarketHttpJitterMs,
+        timeoutMs: polymarketHttpTimeoutMs
+      },
+      oracle: {
+        emaHalfLifeSec: polymarketOracleEmaHalfLifeSec,
+        madThreshold: polymarketOracleMadThreshold,
+        trimFraction: polymarketOracleTrimFraction
+      },
+      vol: {
+        lookbackSec: polymarketVolLookbackSec,
+        minSigmaBps: polymarketMinSigmaBps
+      },
+      execution: {
+        orderTtlMs: polymarketOrderTtlMs,
+        takerPriceBuffer: polymarketTakerPriceBuffer,
+        enableMakerQuoting: polymarketEnableMakerQuoting,
+        cancelAllOnStart: polymarketEffectiveCancelAllOnStart
+      },
+      paper: {
+        ledgerPath: polymarketPaperLedgerPath,
+        slippageBps: polymarketPaperSlippageBps,
+        feeBps: polymarketPaperFeeBps,
+        maxNotionalPerWindow: polymarketPaperMaxNotionalPerWindow,
+        maxTradesPerHour: polymarketPaperMaxTradesPerHour,
+        minEdgeThreshold: polymarketPaperMinEdgeThreshold,
+        minNetEdge: polymarketMinNetEdge,
+        probExtreme: polymarketProbExtreme,
+        extremeHighPrice: polymarketExtremeHighPrice,
+        extremeLowPrice: polymarketExtremeLowPrice,
+        entryMinElapsedSec: polymarketEntryMinElapsedSec,
+        entryMaxElapsedSec: polymarketEntryMaxElapsedSec,
+        entryMaxRemainingSec: polymarketEntryMaxRemainingSec,
+        entryMinRemainingSec: polymarketEntryMinRemainingSec,
+        resolveGraceMs: polymarketResolveGraceMs,
+        allowMultipleTradesPerWindow: polymarketPaperAllowMultipleTradesPerWindow,
+        stopLossEdge: polymarketPaperStopLossEdge,
+        stopLossConsecutiveTicks: polymarketPaperStopLossConsecutiveTicks,
+        takeProfitUsd: polymarketPaperTakeProfitUsd,
+        takeProfitDelta: polymarketPaperTakeProfitDelta,
+        forceTrade: polymarketPaperForceTrade,
+        forceIntervalSec: polymarketPaperForceIntervalSec,
+        forceNotional: polymarketPaperForceNotional,
+        forceSide: polymarketPaperForceSide
+      }
+    }
   };
 }
 
@@ -1291,6 +1862,37 @@ function parseQuotingLowVolMode(value: string | undefined): "KEEP_QUOTING" {
   const normalized = String(value ?? "KEEP_QUOTING").trim().toUpperCase();
   if (normalized === "KEEP_QUOTING") return "KEEP_QUOTING";
   return "KEEP_QUOTING";
+}
+
+function parsePolymarketMode(value: string | undefined): PolymarketMode {
+  const normalized = String(value ?? "paper").trim().toLowerCase();
+  return normalized === "live" ? "live" : "paper";
+}
+
+function parsePolymarketNetwork(value: string | undefined): "polygon" | "amoy" {
+  const normalized = String(value ?? "polygon").trim().toLowerCase();
+  return normalized === "amoy" ? "amoy" : "polygon";
+}
+
+function parsePolymarketPaperForceSide(value: string | undefined): "YES" | "NO" | "AUTO" {
+  const normalized = String(value ?? "AUTO").trim().toUpperCase();
+  if (normalized === "YES") return "YES";
+  if (normalized === "NO") return "NO";
+  return "AUTO";
+}
+
+function parsePolymarketChainId(
+  value: string | undefined,
+  network: "polygon" | "amoy"
+): number {
+  if (!value) {
+    return network === "amoy" ? 80002 : 137;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error("POLYMARKET_CHAIN_ID must be a positive integer");
+  }
+  return Math.floor(parsed);
 }
 
 function warnDuplicateEnvKeys(envFilePath: string): void {

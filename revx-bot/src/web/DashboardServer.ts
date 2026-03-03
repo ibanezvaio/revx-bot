@@ -40,6 +40,7 @@ import { AdaptiveStatus, AnalysisSummary, AnalysisWindowKey } from "../performan
 import { renderEquityChartScript } from "../ui/components/EquityChart";
 import { renderDrawdownChartScript } from "../ui/components/DrawdownChart";
 import { renderUseEquitySeriesScript } from "../ui/hooks/useEquitySeries";
+import { PaperLedger, PaperTrade } from "../polymarket/paper/PaperLedger";
 
 type PnlWindowKey = "24h" | "12h" | "4h" | "1h" | "15m";
 
@@ -81,6 +82,11 @@ type DashboardEvent = {
   client_order_id: string;
   venue_order_id: string | null;
 };
+
+const DEFAULT_FAVICON_SVG = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0b1020"/><text x="16" y="21" text-anchor="middle" font-size="14" fill="#4fd1c5" font-family="Arial, sans-serif">R</text></svg>',
+  "utf8"
+);
 
 type OrderLifecycleState = "PENDING_LOCAL" | "OPEN_VENUE" | "TERMINAL";
 
@@ -186,6 +192,71 @@ export class DashboardServer {
     return Number(address.port) || 0;
   }
 
+  private getPolymarketLedgerPath(): string {
+    return join(process.cwd(), this.config.polymarket.paper.ledgerPath);
+  }
+
+  private getPolymarketDecisionLogPath(): string {
+    return join(process.cwd(), "logs/polymarket-decisions.jsonl");
+  }
+
+  private getLatestPolymarketTick(): {
+    ts: number | null;
+    marketId: string | null;
+    slug: string | null;
+    windowEnd: number | null;
+    countdownSec: number | null;
+    pUpModel: number | null;
+    yesBid: number | null;
+    yesAsk: number | null;
+    yesMid: number | null;
+    chosenSide: string | null;
+    chosenEdge: number | null;
+    netEdgeAfterCosts: number | null;
+    openTrades: number | null;
+    resolvedTrades: number | null;
+    tradingPaused: boolean;
+    pauseReason: string | null;
+  } | null {
+    const logPath = this.getPolymarketDecisionLogPath();
+    if (!existsSync(logPath)) return null;
+    const raw = readFileSync(logPath, "utf8");
+    const lines = raw.split(/\r?\n/);
+    for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
+      const line = lines[idx]?.trim();
+      if (!line) continue;
+      try {
+        const row = JSON.parse(line) as Record<string, unknown>;
+        const type = String(row.type || "");
+        if (type !== "tick") continue;
+        const windowEnd = toFiniteNumber(row.windowEnd);
+        const now = Date.now();
+        return {
+          ts: toFiniteNumber(row.ts),
+          marketId: toOptionalString(row.marketId),
+          slug: toOptionalString(row.selectedSlug) ?? toOptionalString(row.slug),
+          windowEnd,
+          countdownSec:
+            typeof windowEnd === "number" ? Math.max(0, Math.floor((windowEnd - now) / 1000)) : null,
+          pUpModel: toFiniteNumber(row.pUpModel) ?? toFiniteNumber(row.pUp),
+          yesBid: toFiniteNumber(row.yesBid),
+          yesAsk: toFiniteNumber(row.yesAsk),
+          yesMid: toFiniteNumber(row.yesMid),
+          chosenSide: toOptionalString(row.chosenSide),
+          chosenEdge: toFiniteNumber(row.chosenEdge),
+          netEdgeAfterCosts: toFiniteNumber(row.netEdgeAfterCosts),
+          openTrades: toFiniteNumber(row.openTrades),
+          resolvedTrades: toFiniteNumber(row.resolvedTrades),
+          tradingPaused: parseBoolean(row.tradingPaused) ?? false,
+          pauseReason: toOptionalString(row.pauseReason)
+        };
+      } catch {
+        // ignore malformed rows and continue scanning backward
+      }
+    }
+    return null;
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = (req.method ?? "GET").toUpperCase();
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -195,6 +266,65 @@ export class DashboardServer {
       const eventLimit = parseLimit(url.searchParams.get("limit"), this.config.maxApiEvents, 50, 10_000);
       const payload = this.buildStatus(windowKey, eventLimit);
       writeJson(res, 200, payload);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/polymarket/summary") {
+      const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
+      const summary = ledger.getSummary();
+      const tick = this.getLatestPolymarketTick();
+      writeJson(res, 200, {
+        ts: Date.now(),
+        totalTrades: summary.totalTrades,
+        openTrades: summary.openPositions,
+        resolvedTrades: summary.resolvedTrades,
+        pnlTotalUsd: summary.totalPnlUsd,
+        pnl24hUsd: summary.pnl24hUsd,
+        winRate: summary.winRate,
+        wins: summary.wins,
+        losses: summary.losses,
+        lastResolved: summary.lastResolved ?? null,
+        equityCurve: ledger.getEquitySeries(),
+        currentMarketId: tick?.marketId ?? null,
+        currentSlug: tick?.slug ?? null,
+        currentWindowEnd: tick?.windowEnd ?? null,
+        countdownSec: tick?.countdownSec ?? null,
+        pUpModel: tick?.pUpModel ?? null,
+        yesBid: tick?.yesBid ?? null,
+        yesAsk: tick?.yesAsk ?? null,
+        yesMid: tick?.yesMid ?? null,
+        chosenSide: tick?.chosenSide ?? null,
+        chosenEdge: tick?.chosenEdge ?? null,
+        netEdgeAfterCosts: tick?.netEdgeAfterCosts ?? null,
+        tradingPaused: tick?.tradingPaused ?? false,
+        pauseReason: tick?.pauseReason ?? null
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/polymarket/trades") {
+      const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
+      const limit = parseLimit(url.searchParams.get("limit"), 200, 1, 5_000);
+      const payload = buildPolymarketTradesPayload(ledger, limit);
+      writeJson(res, 200, {
+        ts: Date.now(),
+        count: payload.rows.length,
+        wins: payload.wins,
+        losses: payload.losses,
+        resolvedTrades: payload.resolvedTrades,
+        winRate: payload.winRate,
+        totalPnlUsd: payload.totalPnlUsd,
+        rows: payload.rows
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/polymarket/equity") {
+      const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
+      writeJson(res, 200, {
+        ts: Date.now(),
+        points: ledger.getEquitySeries()
+      });
       return;
     }
 
@@ -809,6 +939,14 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/favicon.ico") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.end(DEFAULT_FAVICON_SVG);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/dashboard.js") {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/javascript; charset=utf-8");
@@ -848,6 +986,16 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/polymarket.js") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.end(renderPolymarketDashboardJs());
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/intel") {
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -868,6 +1016,16 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/polymarket") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.end(renderPolymarketDashboardHtml(this.config.symbol));
+      return;
+    }
+
     if (method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       if (String(url.searchParams.get("view") || "").toLowerCase() === "intel") {
         res.statusCode = 200;
@@ -885,6 +1043,15 @@ export class DashboardServer {
         res.setHeader("Pragma", "no-cache");
         res.setHeader("Expires", "0");
         res.end(renderPerformanceHtml(this.config.symbol));
+        return;
+      }
+      if (String(url.searchParams.get("view") || "").toLowerCase() === "polymarket") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+        res.end(renderPolymarketDashboardHtml(this.config.symbol));
         return;
       }
       res.statusCode = 200;
@@ -6103,6 +6270,10 @@ function renderDashboardHtml(
           <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 3h18v18H3V3zm2 2v14h14V5H5zm2 10h3v2H7v-2zm0-4h5v2H7v-2zm0-4h10v2H7V7z"/></svg></span>
           <span class="nav-label">Intel</span>
         </a>
+        <a class="nav-btn nav-link-intel" href="/polymarket" title="Open Polymarket paper page">
+          <span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4V4zm2 11h12v3H6v-3zm0-4h12v2H6v-2zm0-5h12v2H6V6z"/></svg></span>
+          <span class="nav-label">Polymarket</span>
+        </a>
       </aside>
 
       <aside class="intel-sidebar" id="intelSidebar">
@@ -8618,6 +8789,471 @@ function renderPerformanceJs(): string {
   return js;
 }
 
+function renderPolymarketDashboardHtml(symbol: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>REVX Polymarket Paper</title>
+  <style>
+    :root {
+      --bg: #0a0f16;
+      --line: rgba(153, 181, 214, 0.18);
+      --text: #e5efff;
+      --muted: #8ba4c2;
+      --good: #2ce6a0;
+      --bad: #ff7a90;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--text);
+      background: radial-gradient(900px 520px at 10% -10%, rgba(89,183,255,0.18), transparent 60%), linear-gradient(180deg, #070b12 0%, #0d1622 100%);
+      min-height: 100vh;
+    }
+    .shell { width: min(1280px, 100%); margin: 0 auto; padding: 16px; }
+    .head { display:flex; justify-content:space-between; align-items:center; gap: 10px; margin-bottom: 12px; }
+    .title { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.03em; }
+    .muted { color: var(--muted); font-size: 0.85rem; }
+    .row { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .card, .panel {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(14, 22, 34, 0.92);
+    }
+    .card { padding: 10px; }
+    .k { color: var(--muted); font-size: 0.73rem; }
+    .v { margin-top: 4px; font-size: 1rem; font-weight: 700; }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .panel { padding: 12px; margin-bottom: 12px; }
+    .panel h3 { margin: 0 0 10px 0; font-size: 0.95rem; }
+    .kv-grid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .kv { border: 1px solid rgba(153, 181, 214, 0.14); border-radius: 8px; padding: 8px; background: rgba(9,15,24,0.6); }
+    .kv .k { font-size: 0.72rem; }
+    .kv .v { font-size: 0.9rem; margin-top: 3px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th, td { text-align: left; border-bottom: 1px solid rgba(153, 181, 214, 0.14); padding: 7px 6px; }
+    th { color: var(--muted); font-weight: 600; }
+    .chart-wrap { border: 1px solid var(--line); border-radius: 10px; background: rgba(9,15,24,0.8); padding: 8px; }
+    #eqSvg { width: 100%; height: 190px; display: block; }
+    .toolbar { display:flex; gap:8px; align-items:center; }
+    .split { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .btn {
+      border: 1px solid var(--line);
+      background: rgba(90,130,170,0.14);
+      color: var(--text);
+      text-decoration:none;
+      border-radius: 8px;
+      padding: 6px 9px;
+      font-size: 0.75rem;
+    }
+    .badge { padding: 2px 6px; border-radius: 999px; font-size: 0.68rem; font-weight: 700; }
+    .badge-win { color: #102019; background: rgba(44,230,160,0.85); }
+    .badge-loss { color: #2a1018; background: rgba(255,122,144,0.85); }
+    @media (max-width: 980px) {
+      .row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .split { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="head">
+      <div>
+        <div class="title">Polymarket Paper PnL</div>
+        <div class="muted">Symbol ${escapeHtmlText(symbol)} • persisted from JSONL ledger</div>
+      </div>
+      <div class="toolbar">
+        <a class="btn" href="/">Main Dashboard</a>
+        <button class="btn" id="refreshBtn" type="button">Refresh</button>
+      </div>
+    </div>
+
+    <section class="row">
+      <article class="card"><div class="k">Open Trades</div><div class="v" id="mOpen">-</div></article>
+      <article class="card"><div class="k">Resolved Trades</div><div class="v" id="mResolved">-</div></article>
+      <article class="card"><div class="k">Total Trades</div><div class="v" id="mTotalTrades">-</div></article>
+      <article class="card"><div class="k">Win Rate</div><div class="v" id="mWinRate">-</div></article>
+      <article class="card"><div class="k">Wins</div><div class="v good" id="mWins">-</div></article>
+      <article class="card"><div class="k">Losses</div><div class="v bad" id="mLosses">-</div></article>
+      <article class="card"><div class="k">Total PnL (USD)</div><div class="v" id="mTotalPnl">-</div></article>
+      <article class="card"><div class="k">PnL 24h (USD)</div><div class="v" id="m24hPnl">-</div></article>
+    </section>
+
+    <section class="panel">
+      <h3>Current Window / Model</h3>
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Slug</div><div class="v" id="pmSlug">-</div></div>
+        <div class="kv"><div class="k">Countdown</div><div class="v" id="pmCountdown">-</div></div>
+        <div class="kv"><div class="k">Model P(UP)</div><div class="v" id="pmPUp">-</div></div>
+        <div class="kv"><div class="k">YES Mid</div><div class="v" id="pmYesMid">-</div></div>
+        <div class="kv"><div class="k">YES Bid/Ask</div><div class="v" id="pmBbo">-</div></div>
+        <div class="kv"><div class="k">Chosen Side</div><div class="v" id="pmSide">-</div></div>
+        <div class="kv"><div class="k">Chosen Edge</div><div class="v" id="pmChosenEdge">-</div></div>
+        <div class="kv"><div class="k">Net Edge After Costs</div><div class="v" id="pmNetEdge">-</div></div>
+        <div class="kv"><div class="k">Trading State</div><div class="v" id="pmTradingState">-</div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>Equity Curve</h3>
+      <div class="chart-wrap">
+        <svg id="eqSvg" viewBox="0 0 1000 190" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="muted" id="eqMeta">-</div>
+    </section>
+
+    <section class="panel">
+      <h3>Open + Resolved Trades</h3>
+      <div class="muted" id="resolvedTotals">wins - | losses - | win rate - | total pnl -</div>
+      <div class="split">
+        <div style="overflow:auto;">
+          <div class="muted" style="margin-bottom:6px;">Open trades</div>
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th><th>Slug</th><th>Side</th><th>Entry</th><th>Notional</th><th>MTM PnL</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="openTradesBody"><tr><td colspan="7" class="muted">loading...</td></tr></tbody>
+          </table>
+        </div>
+        <div style="overflow:auto;">
+          <div class="muted" style="margin-bottom:6px;">Last 20 resolved trades</div>
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th><th>Slug</th><th>Side</th><th>Entry</th><th>Exit</th><th>Status</th><th>Result</th><th>PnL</th><th>Cum PnL</th>
+              </tr>
+            </thead>
+            <tbody id="resolvedTradesBody"><tr><td colspan="9" class="muted">loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script src="/polymarket.js" defer></script>
+</body>
+</html>`;
+}
+
+function renderPolymarketDashboardJs(): string {
+  return `(function () {
+    "use strict";
+    const el = (id) => document.getElementById(id);
+    const fmt2 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+    const fmtP = new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 1 });
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status + " " + url);
+      return await res.json();
+    }
+
+    function setText(id, value, cls) {
+      const node = el(id);
+      if (!node) return;
+      node.textContent = String(value);
+      if (cls) node.className = "v " + cls;
+    }
+
+    function money(v) {
+      const n = Number(v || 0);
+      return "$" + fmt2.format(n);
+    }
+
+    function edgeText(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "-";
+      return n.toFixed(4);
+    }
+
+    function secondsText(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "-";
+      const m = Math.floor(Math.max(0, n) / 60);
+      const s = Math.max(0, n) % 60;
+      return String(m) + "m " + String(s).padStart(2, "0") + "s";
+    }
+
+    function drawEquity(points) {
+      const svg = el("eqSvg");
+      const meta = el("eqMeta");
+      if (!svg || !meta) return;
+      if (!Array.isArray(points) || points.length === 0) {
+        svg.innerHTML = "";
+        meta.textContent = "No resolved trades yet.";
+        return;
+      }
+      const xs = points.map((p) => Number(p.ts || 0));
+      const ys = points.map((p) => Number(p.equityUsd || 0));
+      const minX = Math.min.apply(null, xs);
+      const maxX = Math.max.apply(null, xs);
+      const minY = Math.min.apply(null, ys);
+      const maxY = Math.max.apply(null, ys);
+      const xSpan = Math.max(1, maxX - minX);
+      const ySpan = Math.max(1e-9, maxY - minY);
+
+      const path = points.map((p, idx) => {
+        const x = ((Number(p.ts || 0) - minX) / xSpan) * 1000;
+        const y = 178 - ((Number(p.equityUsd || 0) - minY) / ySpan) * 160;
+        return (idx === 0 ? "M " : "L ") + x.toFixed(2) + " " + y.toFixed(2);
+      }).join(" ");
+
+      const final = Number(points[points.length - 1].equityUsd || 0);
+      const stroke = final >= 0 ? "#2ce6a0" : "#ff7a90";
+      svg.innerHTML =
+        '<line x1="0" y1="178" x2="1000" y2="178" stroke="rgba(153,181,214,0.2)" stroke-width="1"/>' +
+        '<text x="8" y="14" fill="#8ba4c2" font-size="11">$' + fmt2.format(maxY) + '</text>' +
+        '<text x="8" y="186" fill="#8ba4c2" font-size="11">$' + fmt2.format(minY) + '</text>' +
+        '<path d="' + path + '" fill="none" stroke="' + stroke + '" stroke-width="2.2"/>';
+      meta.textContent = "Points: " + points.length + " | Start " + money(ys[0]) + " | End " + money(final);
+    }
+
+    function renderRows(rows, bodyId, mode) {
+      const body = el(bodyId);
+      if (!body) return;
+      const source = Array.isArray(rows) ? rows : [];
+      const filtered = source.filter((row) => mode === "open" ? !row.resolvedAt : !!row.resolvedAt);
+      const limited = mode === "open" ? filtered.slice(0, 20) : filtered.slice(0, 20);
+      if (limited.length === 0) {
+        body.innerHTML = '<tr><td colspan="' + (mode === "open" ? "7" : "9") + '" class="muted">No rows.</td></tr>';
+        return;
+      }
+      body.innerHTML = limited.map((row) => {
+        const ts = new Date(Number(row.createdTs || 0));
+        const pnl = Number(row.pnlUsd || 0);
+        const pnlCls = pnl > 0 ? "good" : pnl < 0 ? "bad" : "";
+        const status = row.resolvedAt ? String(row.closeReason || "RESOLVED") : "OPEN";
+        const slug = String(row.marketSlug || row.marketId || "-");
+        if (mode === "open") {
+          return "<tr>" +
+            "<td>" + ts.toLocaleString() + "</td>" +
+            "<td>" + slug + "</td>" +
+            "<td>" + String(row.side || "-") + "</td>" +
+            "<td>" + fmt2.format(Number(row.entryPrice || 0)) + "</td>" +
+            "<td>" + money(Number(row.notionalUsd || 0)) + "</td>" +
+            '<td class="' + pnlCls + '">' + money(pnl) + "</td>" +
+            "<td>" + status + "</td>" +
+          "</tr>";
+        }
+        const exitPrice = Number(row.exitPrice);
+        const payoutUsd = Number(row.payoutUsd);
+        const exitText =
+          Number.isFinite(exitPrice)
+            ? fmt2.format(exitPrice)
+            : Number.isFinite(payoutUsd)
+              ? money(payoutUsd)
+              : "-";
+        const statusResolved = String(row.closeReason || "").trim().length > 0 ? "CLOSED" : "RESOLVED";
+        return "<tr>" +
+          "<td>" + ts.toLocaleString() + "</td>" +
+          "<td>" + slug + "</td>" +
+          "<td>" + String(row.side || "-") + "</td>" +
+          "<td>" + fmt2.format(Number(row.entryPrice || 0)) + "</td>" +
+          "<td>" + exitText + "</td>" +
+          "<td>" + statusResolved + "</td>" +
+          "<td>" +
+            (String(row.result || "") === "WIN"
+              ? '<span class="badge badge-win">WIN</span>'
+              : String(row.result || "") === "LOSS"
+                ? '<span class="badge badge-loss">LOSS</span>'
+                : "-") +
+          "</td>" +
+          '<td class="' + pnlCls + '">' + money(pnl) + "</td>" +
+          '<td class="' + (Number(row.cumulativePnlUsd || 0) >= 0 ? "good" : "bad") + '">' +
+            money(Number(row.cumulativePnlUsd || 0)) +
+          "</td>" +
+        "</tr>";
+      }).join("");
+    }
+
+    function renderCurrent(summary) {
+      setText("pmSlug", String(summary.currentSlug || "-"));
+      setText("pmCountdown", secondsText(summary.countdownSec));
+      setText("pmPUp", Number.isFinite(Number(summary.pUpModel)) ? fmtP.format(Number(summary.pUpModel)) : "-");
+      setText("pmYesMid", Number.isFinite(Number(summary.yesMid)) ? Number(summary.yesMid).toFixed(4) : "-");
+      const bid = Number(summary.yesBid);
+      const ask = Number(summary.yesAsk);
+      setText(
+        "pmBbo",
+        Number.isFinite(bid) && Number.isFinite(ask)
+          ? bid.toFixed(4) + " / " + ask.toFixed(4)
+          : "-"
+      );
+      setText("pmSide", String(summary.chosenSide || "-"));
+      setText("pmChosenEdge", edgeText(summary.chosenEdge), Number(summary.chosenEdge || 0) >= 0 ? "good" : "bad");
+      setText("pmNetEdge", edgeText(summary.netEdgeAfterCosts), Number(summary.netEdgeAfterCosts || 0) >= 0 ? "good" : "bad");
+      const paused = Boolean(summary.tradingPaused);
+      const pauseReason = String(summary.pauseReason || "");
+      setText(
+        "pmTradingState",
+        paused ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : "")) : "RUNNING",
+        paused ? "bad" : "good"
+      );
+    }
+
+    async function refresh() {
+      const [summaryResp, tradesResp, equityResp] = await Promise.all([
+        fetchJson("/api/polymarket/summary"),
+        fetchJson("/api/polymarket/trades?limit=200"),
+        fetchJson("/api/polymarket/equity")
+      ]);
+
+      const summary = summaryResp && typeof summaryResp === "object" ? summaryResp : {};
+      setText("mOpen", String(summary.openTrades || 0));
+      setText("mResolved", String(summary.resolvedTrades || 0));
+      setText("mTotalTrades", String(summary.totalTrades || 0));
+      setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
+      setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
+      setText("mWinRate", fmtP.format(Number(summary.winRate || 0)));
+      setText("mWins", String(summary.wins || 0), "good");
+      setText("mLosses", String(summary.losses || 0), "bad");
+
+      renderCurrent(summary);
+      const rows = Array.isArray(tradesResp.rows) ? tradesResp.rows : [];
+      renderRows(rows, "openTradesBody", "open");
+      renderRows(rows, "resolvedTradesBody", "resolved");
+      const totalsNode = el("resolvedTotals");
+      if (totalsNode) {
+        totalsNode.textContent =
+          "wins " + String(tradesResp.wins || 0) +
+          " | losses " + String(tradesResp.losses || 0) +
+          " | win rate " + fmtP.format(Number(tradesResp.winRate || 0)) +
+          " | total pnl " + money(Number(tradesResp.totalPnlUsd || 0));
+      }
+      drawEquity(Array.isArray(equityResp.points) ? equityResp.points : []);
+    }
+
+    const refreshBtn = el("refreshBtn");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", () => void refresh());
+    }
+    void refresh();
+    setInterval(() => {
+      void refresh();
+    }, 5000);
+  })();`;
+}
+
+function escapeHtmlText(value: string): string {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toOptionalString(value: unknown): string | null {
+  const text = String(value ?? "").trim();
+  return text.length > 0 ? text : null;
+}
+
+function buildPolymarketTradesPayload(
+  ledger: PaperLedger,
+  limit: number
+): {
+  rows: Array<Record<string, unknown>>;
+  wins: number;
+  losses: number;
+  resolvedTrades: number;
+  winRate: number;
+  totalPnlUsd: number;
+} {
+  const allChronological = ledger
+    .getAllTrades()
+    .slice()
+    .sort((a, b) => Number(a.createdTs) - Number(b.createdTs));
+  const byId = new Map<
+    string,
+    {
+      cumulativePnlUsd: number;
+      result: "WIN" | "LOSS" | null;
+      wins: number;
+      losses: number;
+      winRate: number;
+      pnlUsd: number;
+    }
+  >();
+  let wins = 0;
+  let losses = 0;
+  let resolvedTrades = 0;
+  let cumulativePnlUsd = 0;
+
+  for (const trade of allChronological) {
+    const isResolved = Boolean(trade.resolvedAt);
+    const pnlUsd = Number(trade.pnlUsd || 0);
+    let result: "WIN" | "LOSS" | null = null;
+    if (isResolved) {
+      resolvedTrades += 1;
+      cumulativePnlUsd += pnlUsd;
+      if (pnlUsd > 0) {
+        wins += 1;
+        result = "WIN";
+      } else {
+        losses += 1;
+        result = "LOSS";
+      }
+    }
+    byId.set(trade.id, {
+      cumulativePnlUsd,
+      result,
+      wins,
+      losses,
+      winRate: resolvedTrades > 0 ? wins / resolvedTrades : 0,
+      pnlUsd
+    });
+  }
+
+  const rows = ledger
+    .getRecentTrades(limit)
+    .map((trade): Record<string, unknown> => enrichPolymarketTradeRow(trade, byId.get(trade.id)))
+    .slice(0, Math.max(1, Math.floor(limit)));
+
+  return {
+    rows,
+    wins,
+    losses,
+    resolvedTrades,
+    winRate: resolvedTrades > 0 ? wins / resolvedTrades : 0,
+    totalPnlUsd: cumulativePnlUsd
+  };
+}
+
+function enrichPolymarketTradeRow(
+  trade: PaperTrade,
+  enriched:
+    | {
+        cumulativePnlUsd: number;
+        result: "WIN" | "LOSS" | null;
+        wins: number;
+        losses: number;
+        winRate: number;
+        pnlUsd: number;
+      }
+    | undefined
+): Record<string, unknown> {
+  return {
+    ...trade,
+    result: enriched?.result ?? null,
+    pnlUsd: Number(trade.pnlUsd ?? enriched?.pnlUsd ?? 0),
+    cumulativePnlUsd: Number(enriched?.cumulativePnlUsd ?? 0),
+    wins: Number(enriched?.wins ?? 0),
+    losses: Number(enriched?.losses ?? 0),
+    winRate: Number(enriched?.winRate ?? 0)
+  };
+}
+
 
 function renderDashboardJs(
   maxUiEventsDefault: number,
@@ -10166,7 +10802,7 @@ function renderDashboardJs(
           " | active " +
           ((marketPhase === "STABILIZING" || marketPhase === "RECOVERY") && reentryGapUsd > 0 ? "yes" : "no") +
           " | last seed " +
-          (n(analytics.reentryLastSeedTs, 0) > 0 ? relTime(n(analytics.reentryLastSeedTs, 0), now) : "n/a")
+          (n(analytics.reentryLastSeedTs, 0) > 0 ? relTimeFromTs(n(analytics.reentryLastSeedTs, 0)) : "n/a")
       );
       const regimeChip = el("regimeChip");
       if (regimeChip) {
@@ -12423,6 +13059,10 @@ function renderDashboardJs(
 
     createDebugOverlay();
 
+    if (window.__REVX_TEST_MODE__) {
+      window.__REVX_DASHBOARD_HOOKS__ = { render };
+      window.__REVX_TEST_READY__ = true;
+    } else {
     let store = null;
     try {
       console.log("[revx-ui] boot start", BUILD_ID);
@@ -12958,6 +13598,7 @@ function renderDashboardJs(
     } catch (e) {
       window.__REVX_BOOT_ERR__ = String((e && e.message) || e || "");
       console.error("[revx-ui] boot failed", e);
+    }
     }
 `;
   if (js.includes('+\n"') || js.includes('+"\n')) {

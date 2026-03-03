@@ -74,6 +74,19 @@ node dist/cli.js cancel-all      # cancel bot-tagged active orders
 node dist/cli.js cancel-all --all
 node dist/cli.js dry-run         # run one strategy cycle in dry-run mode
 node dist/cli.js simulate --minutes 5
+npm run polymarket               # start Polymarket BTC-5m module in paper mode
+node dist/cli.js polymarket ping --paper
+node dist/cli.js polymarket scan --btc5m --debug
+node dist/cli.js polymarket resolve-event --slug btc-updown-5m-1772556900
+node dist/cli.js polymarket book --token-id <tokenId> --live
+node dist/cli.js polymarket ping --live
+node dist/cli.js polymarket whoami --live
+node dist/cli.js polymarket derive-creds --live
+node dist/cli.js polymarket paper --btc5m --hours 12
+node dist/cli.js polymarket paper --btc5m --hours 0.2 --force-trade --force-interval-sec 60 --force-notional 1
+node dist/cli.js polymarket --btc5m --paper
+node dist/cli.js polymarket --btc5m --live --cancel-all-on-start
+npm test                         # Polymarket estimator/model/strategy/sizing tests
 npm run signal-smoke            # cross-venue fair-price signal smoke test
 npm run test:elite-signals      # fair-mid model + regime classifier tests
 npm run test:adverse-guard      # adverse-selection guard transition tests
@@ -92,6 +105,158 @@ node dist/cli.js tune --apply    # apply BASE_HALF_SPREAD_BPS suggestion to .env
 npm run test:cancel-idempotency  # simulate 409 cancel response and verify idempotent handling
 npm run test:adaptive-events     # adaptive clamp + side cap + event ring buffer checks
 npm run test:runtime-overrides   # set/read/expire/clear runtime overrides smoke test
+```
+
+## Polymarket BTC 5m Module
+
+This repo now includes a dedicated `src/polymarket/` engine for BTC 5-minute Up/Down windows.
+Use Node `>=20.10` for live CLOB client compatibility.
+
+Enable paper mode:
+
+```bash
+# .env
+POLYMARKET_ENABLED=true
+POLYMARKET_MODE=paper
+POLYMARKET_MAX_NOTIONAL_PER_WINDOW=3
+POLYMARKET_MAX_EXPOSURE=6
+POLYMARKET_NO_NEW_ORDERS_LAST_SEC=30
+POLYMARKET_BASE_URL=https://clob.polymarket.com
+POLYMARKET_NETWORK=polygon
+POLYMARKET_CHAIN_ID=137
+```
+
+Run it from CLI:
+
+```bash
+node dist/cli.js polymarket ping --paper
+node dist/cli.js polymarket scan --btc5m --debug
+node dist/cli.js polymarket resolve-event --slug btc-updown-5m-1772556900
+node dist/cli.js polymarket book --token-id <tokenId> --live
+node dist/cli.js polymarket --btc5m --paper
+node dist/cli.js polymarket whoami --live
+node dist/cli.js polymarket derive-creds --live
+node dist/cli.js polymarket derive-creds --live --print-secrets
+node dist/cli.js polymarket ping --live
+node dist/cli.js polymarket paper --btc5m --hours 12
+node dist/cli.js polymarket --btc5m --live --cancel-all-on-start
+```
+
+Required env vars for live mode:
+- `POLYMARKET_LIVE_CONFIRMED=true` (required guard for any live Polymarket mode)
+- `POLYMARKET_API_KEY` (or your mapped name via `POLYMARKET_API_KEY_ENV`)
+- `POLYMARKET_API_SECRET` (or legacy fallback `POLYMARKET_SECRET`)
+- `POLYMARKET_PASSPHRASE`
+- `POLYMARKET_PRIVATE_KEY`
+- `POLYMARKET_FUNDER`
+- `POLYMARKET_CHAIN_ID` (or `POLYMARKET_NETWORK`)
+- optional: `POLYMARKET_AUTO_DERIVE_API_KEY=true` to derive API creds from wallet key instead of supplying API key/secret/passphrase directly
+- seed discovery mode:
+  - `POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m-`
+  - `POLYMARKET_SEED_EVENT_SLUGS=btc-updown-5m-1772556900,...`
+
+Connectivity check:
+- `node dist/cli.js polymarket ping --paper` checks public CLOB/Gamma reachability.
+- `node dist/cli.js polymarket ping --live` additionally validates authenticated `getOpenOrders` access.
+
+Auth wiring notes:
+- `POLYMARKET_SIGNATURE_TYPE=0`: EOA signer is the funded account.
+- `POLYMARKET_SIGNATURE_TYPE=1` or `2`: Polymarket proxy/funder flow; set `POLYMARKET_FUNDER` to the funded proxy wallet used by your account.
+- `node dist/cli.js polymarket whoami --live` prints signer address, signature type, funder, host, chainId, and apiKey prefix (non-secret).
+- `node dist/cli.js polymarket derive-creds --live` derives/reuses API creds from the current signer context and stores a local cache in `.polymarket-creds.json`.
+- `.polymarket-creds.json` contains secret material; it is gitignored by default.
+- combined runtime (`npm run live`) runs RevX and Polymarket in one process when enabled:
+  - `POLYMARKET_ENABLED=true POLYMARKET_MODE=paper POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m- npm run live`
+  - `POLYMARKET_ENABLED=true POLYMARKET_MODE=live POLYMARKET_LIVE_CONFIRMED=true npm run live`
+
+Extreme-sniping profile (paper 1h, then live micro) with `npm run live` only:
+
+```bash
+# 1) Paper validation (1 hour)
+POLYMARKET_ENABLED=true \
+POLYMARKET_MODE=paper \
+POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m- \
+POLYMARKET_ENTRY_MAX_REMAINING_SEC=90 \
+POLYMARKET_ENTRY_MIN_REMAINING_SEC=20 \
+POLYMARKET_PROB_EXTREME=0.90 \
+POLYMARKET_EXTREME_HIGH_PRICE=0.97 \
+POLYMARKET_EXTREME_LOW_PRICE=0.10 \
+POLYMARKET_MIN_NET_EDGE=0.01 \
+POLYMARKET_MAX_NOTIONAL_PER_WINDOW=10 \
+npm run live
+
+# 2) Live micro sizing (same process entrypoint)
+POLYMARKET_ENABLED=true \
+POLYMARKET_MODE=live \
+POLYMARKET_LIVE_CONFIRMED=true \
+POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m- \
+POLYMARKET_MAX_NOTIONAL_PER_WINDOW=0.25 \
+POLYMARKET_MAX_DAILY_LOSS=2 \
+npm run live
+```
+
+Decision logs are written as JSONL to:
+- `logs/polymarket-decisions.jsonl`
+- `logs/polymarket-paper-trades.jsonl`
+
+Paper ledger (append-only JSONL):
+- `data/polymarket-paper-ledger.jsonl`
+
+Safety notes:
+- start with very small sizing
+- paper mode first
+- live mode safety defaults (when `POLYMARKET_MODE=live` and env override is not provided):
+  - `POLYMARKET_MAX_NOTIONAL_PER_WINDOW` capped to `0.25`
+  - `POLYMARKET_MAX_DAILY_LOSS` capped to `2`
+  - `POLYMARKET_CANCEL_ALL_ON_START=true`
+- kill-switch + cancel-all is automatic on severe risk breaches
+- `POLYMARKET_KILL_SWITCH=true` runs HOLD-only (no place/cancel mutations)
+- no new orders are allowed in the final `POLYMARKET_NO_NEW_ORDERS_LAST_SEC` seconds (default 30s)
+- live-mode stale oracle kill threshold: `POLYMARKET_STALE_KILL_AFTER_SEC` (default 60s)
+- HTTP call timeout per Polymarket request: `POLYMARKET_HTTP_TIMEOUT_MS`
+- paper mode includes non-zero `POLYMARKET_PAPER_SLIPPAGE_BPS` and `POLYMARKET_PAPER_FEE_BPS`
+- paper limits: `POLYMARKET_PAPER_MAX_NOTIONAL_PER_WINDOW`, `POLYMARKET_PAPER_MAX_TRADES_PER_HOUR`
+- paper entry lifecycle knobs:
+  - `POLYMARKET_PAPER_MIN_EDGE` (alias: `POLYMARKET_PAPER_MIN_EDGE_THRESHOLD`)
+  - `POLYMARKET_MIN_NET_EDGE`
+  - `POLYMARKET_PROB_EXTREME`
+  - `POLYMARKET_EXTREME_HIGH_PRICE`
+  - `POLYMARKET_EXTREME_LOW_PRICE`
+  - `POLYMARKET_ENTRY_MIN_ELAPSED_SEC`
+  - `POLYMARKET_ENTRY_MAX_ELAPSED_SEC`
+  - `POLYMARKET_ENTRY_MAX_REMAINING_SEC`
+  - `POLYMARKET_ENTRY_MIN_REMAINING_SEC`
+  - `POLYMARKET_RESOLVE_GRACE_MS`
+  - `POLYMARKET_MAX_SPREAD`
+- paper position-management knobs:
+  - `POLYMARKET_PAPER_STOP_LOSS_EDGE`
+  - `POLYMARKET_PAPER_STOP_LOSS_CONSECUTIVE_TICKS`
+  - `POLYMARKET_PAPER_TAKE_PROFIT_USD`
+  - `POLYMARKET_PAPER_TAKE_PROFIT_DELTA`
+- force-trade debug knobs:
+  - `POLYMARKET_PAPER_FORCE_TRADE`
+  - `POLYMARKET_PAPER_FORCE_INTERVAL_SEC`
+  - `POLYMARKET_PAPER_FORCE_NOTIONAL`
+  - `POLYMARKET_PAPER_FORCE_SIDE` (`YES` | `NO` | `AUTO`)
+- engine emits a high-signal tick log every ~30s even without trades
+- oracle routing priority:
+  - primary: internal `signalFairMid` from running RevX strategy loop (shared store metrics)
+  - secondary: Polymarket oracle estimator (`oracle_proxy`)
+- paper mode on stale oracle enters `ORACLE_STALE` state: new entries are blocked, open trades remain pending, and resolution retries continue (no hard halt)
+- live mode on stale oracle pauses new entries and keeps retrying/recovery in-loop (transient network errors do not trigger global kill-switch)
+
+Dashboard:
+- Main dashboard keeps existing behavior.
+- Polymarket paper panel: `http://127.0.0.1:8787/polymarket`
+- APIs:
+  - `/api/polymarket/summary`
+  - `/api/polymarket/trades?limit=200`
+  - `/api/polymarket/equity`
+
+Optional connectivity integration check (no live orders submitted):
+
+```bash
+POLYMARKET_INTEGRATION_TEST=true npm run test:polymarket-integration
 ```
 
 ## Runtime Overrides (No Redeploy)
