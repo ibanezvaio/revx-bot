@@ -91,6 +91,17 @@ export class OracleRouter {
     };
   }
 
+  getFastMidNow(nowTs = Date.now()): { price: number; ts: number; source: "internal_fair_mid" } | null {
+    const primary = this.readPrimaryFromStore(nowTs);
+    if (!primary) return null;
+    if (!(primary.price > 0) || !(primary.ts > 0)) return null;
+    return {
+      price: primary.price,
+      ts: primary.ts,
+      source: "internal_fair_mid"
+    };
+  }
+
   private readPrimaryFromStore(nowTs: number): Candidate | null {
     if (!this.options.store) return null;
 

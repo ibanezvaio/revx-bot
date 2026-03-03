@@ -52,6 +52,52 @@ type ExternalQuoteReader = {
   getLatest: () => Record<string, ExternalServiceQuote>;
 };
 
+type PolymarketRuntimeSnapshot = {
+  latestPolymarket: {
+    windowSlug: string;
+    tauSec: number | null;
+    priceToBeat: number | null;
+    fastMid: number | null;
+    yesMid: number | null;
+    impliedProbMid: number | null;
+  } | null;
+  latestModel: {
+    pBase: number | null;
+    pBoosted: number | null;
+    z: number | null;
+    d: number | null;
+    sigma: number | null;
+    tauSec: number | null;
+    polyUpdateAgeMs: number | null;
+    lagPolyP90Ms: number | null;
+    oracleAgeMs: number | null;
+    boostApplied: boolean;
+    boostReason: string | null;
+  } | null;
+  latestLag: {
+    samples: number;
+    lastFastMidTsMs: number | null;
+    lastOracleTsMs: number | null;
+    lastBookTsMs: number | null;
+    lastYesMid: number | null;
+    metrics: Record<string, { count: number; mean: number | null; p50: number | null; p90: number | null }>;
+  };
+  sniperWindow: {
+    minRemainingSec: number;
+    maxRemainingSec: number;
+  };
+  tradingPaused: boolean;
+  pauseReason: string | null;
+};
+
+type PolymarketRuntimeProvider = {
+  getDashboardSnapshot: () => PolymarketRuntimeSnapshot;
+  getLagSnapshot: (limit?: number) => {
+    stats: PolymarketRuntimeSnapshot["latestLag"];
+    recent: Array<Record<string, unknown>>;
+  };
+};
+
 const PNL_WINDOW_MS: Record<PnlWindowKey, number> = {
   "24h": 24 * 60 * 60 * 1000,
   "12h": 12 * 60 * 60 * 1000,
@@ -141,7 +187,8 @@ export class DashboardServer {
     private readonly newsEngine?: NewsEngine,
     private readonly signalsEngine?: SignalsEngine,
     private readonly intelEngine?: IntelEngine,
-    private readonly performanceEngine?: PerformanceEngine
+    private readonly performanceEngine?: PerformanceEngine,
+    private readonly polymarketRuntimeProvider?: PolymarketRuntimeProvider
   ) {
     this.dashboardJsLastGoodPath = join(this.config.runtimeBaseDir, ".dashboard.last-good.js");
     this.intelJsLastGoodPath = join(this.config.runtimeBaseDir, ".intel.last-good.js");
@@ -198,6 +245,25 @@ export class DashboardServer {
 
   private getPolymarketDecisionLogPath(): string {
     return join(process.cwd(), "logs/polymarket-decisions.jsonl");
+  }
+
+  private getPolymarketRuntimeSnapshot(): PolymarketRuntimeSnapshot | null {
+    try {
+      return this.polymarketRuntimeProvider?.getDashboardSnapshot() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getPolymarketLagSnapshot(limit = 50): {
+    stats: PolymarketRuntimeSnapshot["latestLag"];
+    recent: Array<Record<string, unknown>>;
+  } | null {
+    try {
+      return this.polymarketRuntimeProvider?.getLagSnapshot(limit) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private getLatestPolymarketTick(): {
@@ -273,6 +339,10 @@ export class DashboardServer {
       const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
       const summary = ledger.getSummary();
       const tick = this.getLatestPolymarketTick();
+      const runtime = this.getPolymarketRuntimeSnapshot();
+      const latestPolymarket = runtime?.latestPolymarket ?? null;
+      const latestModel = runtime?.latestModel ?? null;
+      const latestLag = runtime?.latestLag ?? null;
       writeJson(res, 200, {
         ts: Date.now(),
         totalTrades: summary.totalTrades,
@@ -296,8 +366,25 @@ export class DashboardServer {
         chosenSide: tick?.chosenSide ?? null,
         chosenEdge: tick?.chosenEdge ?? null,
         netEdgeAfterCosts: tick?.netEdgeAfterCosts ?? null,
-        tradingPaused: tick?.tradingPaused ?? false,
-        pauseReason: tick?.pauseReason ?? null
+        tradingPaused: runtime?.tradingPaused ?? tick?.tradingPaused ?? false,
+        pauseReason: runtime?.pauseReason ?? tick?.pauseReason ?? null,
+        latestPolymarket,
+        latestModel,
+        latestLag,
+        sniperWindow: runtime?.sniperWindow ?? {
+          minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
+          maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
+        }
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/polymarket/lag") {
+      const lagSnapshot = this.getPolymarketLagSnapshot(50);
+      writeJson(res, 200, {
+        ts: Date.now(),
+        stats: lagSnapshot?.stats ?? null,
+        recent: Array.isArray(lagSnapshot?.recent) ? lagSnapshot?.recent : []
       });
       return;
     }
@@ -8890,12 +8977,27 @@ function renderPolymarketDashboardHtml(symbol: string): string {
         <div class="kv"><div class="k">Slug</div><div class="v" id="pmSlug">-</div></div>
         <div class="kv"><div class="k">Countdown</div><div class="v" id="pmCountdown">-</div></div>
         <div class="kv"><div class="k">Model P(UP)</div><div class="v" id="pmPUp">-</div></div>
+        <div class="kv"><div class="k">P Base / Boosted</div><div class="v" id="pmPBaseBoost">-</div></div>
         <div class="kv"><div class="k">YES Mid</div><div class="v" id="pmYesMid">-</div></div>
         <div class="kv"><div class="k">YES Bid/Ask</div><div class="v" id="pmBbo">-</div></div>
         <div class="kv"><div class="k">Chosen Side</div><div class="v" id="pmSide">-</div></div>
         <div class="kv"><div class="k">Chosen Edge</div><div class="v" id="pmChosenEdge">-</div></div>
         <div class="kv"><div class="k">Net Edge After Costs</div><div class="v" id="pmNetEdge">-</div></div>
         <div class="kv"><div class="k">Trading State</div><div class="v" id="pmTradingState">-</div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>Lag + Lockedness</h3>
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Book Lag p50/p90</div><div class="v" id="pmLagBook">-</div></div>
+        <div class="kv"><div class="k">Oracle Age p50/p90</div><div class="v" id="pmLagOracle">-</div></div>
+        <div class="kv"><div class="k">Book Update Age p50/p90</div><div class="v" id="pmLagPolyAge">-</div></div>
+        <div class="kv"><div class="k">Z / D</div><div class="v" id="pmZD">-</div></div>
+        <div class="kv"><div class="k">Sigma</div><div class="v" id="pmSigma">-</div></div>
+        <div class="kv"><div class="k">Boost</div><div class="v" id="pmBoost">-</div></div>
+        <div class="kv"><div class="k">Lockedness</div><div class="v" id="pmLocked">-</div></div>
+        <div class="kv"><div class="k">Lag Updated</div><div class="v" id="pmLagUpdated">-</div></div>
       </div>
     </section>
 
@@ -8978,6 +9080,17 @@ function renderPolymarketDashboardJs(): string {
       const m = Math.floor(Math.max(0, n) / 60);
       const s = Math.max(0, n) % 60;
       return String(m) + "m " + String(s).padStart(2, "0") + "s";
+    }
+
+    function relTime(tsLike) {
+      const ts = Number(tsLike || 0);
+      if (!Number.isFinite(ts) || ts <= 0) return "-";
+      const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (sec < 60) return sec + "s ago";
+      const min = Math.floor(sec / 60);
+      if (min < 60) return min + "m ago";
+      const hr = Math.floor(min / 60);
+      return hr + "h ago";
     }
 
     function drawEquity(points) {
@@ -9073,10 +9186,47 @@ function renderPolymarketDashboardJs(): string {
     }
 
     function renderCurrent(summary) {
-      setText("pmSlug", String(summary.currentSlug || "-"));
-      setText("pmCountdown", secondsText(summary.countdownSec));
-      setText("pmPUp", Number.isFinite(Number(summary.pUpModel)) ? fmtP.format(Number(summary.pUpModel)) : "-");
-      setText("pmYesMid", Number.isFinite(Number(summary.yesMid)) ? Number(summary.yesMid).toFixed(4) : "-");
+      const latestPolymarket = summary.latestPolymarket && typeof summary.latestPolymarket === "object"
+        ? summary.latestPolymarket
+        : {};
+      const latestModel = summary.latestModel && typeof summary.latestModel === "object"
+        ? summary.latestModel
+        : {};
+      const latestLag = summary.latestLag && typeof summary.latestLag === "object"
+        ? summary.latestLag
+        : {};
+      const lagMetrics = latestLag.metrics && typeof latestLag.metrics === "object"
+        ? latestLag.metrics
+        : {};
+      const polyAgeMetric = lagMetrics.polyUpdateAgeMs || {};
+      const oracleAgeMetric = lagMetrics.oracleAgeMs || {};
+      const bookLagMetric = lagMetrics.bookMoveLagMs || {};
+      const sniperWindow = summary.sniperWindow && typeof summary.sniperWindow === "object"
+        ? summary.sniperWindow
+        : {};
+
+      setText("pmSlug", String(latestPolymarket.windowSlug || summary.currentSlug || "-"));
+      setText("pmCountdown", secondsText(latestPolymarket.tauSec || summary.countdownSec));
+      setText(
+        "pmPUp",
+        Number.isFinite(Number(summary.pUpModel))
+          ? fmtP.format(Number(summary.pUpModel))
+          : Number.isFinite(Number(latestModel.pBoosted))
+            ? fmtP.format(Number(latestModel.pBoosted))
+            : "-"
+      );
+      setText(
+        "pmPBaseBoost",
+        Number.isFinite(Number(latestModel.pBase)) && Number.isFinite(Number(latestModel.pBoosted))
+          ? Number(latestModel.pBase).toFixed(4) + " / " + Number(latestModel.pBoosted).toFixed(4)
+          : "-"
+      );
+      setText(
+        "pmYesMid",
+        Number.isFinite(Number(latestPolymarket.yesMid || summary.yesMid))
+          ? Number(latestPolymarket.yesMid || summary.yesMid).toFixed(4)
+          : "-"
+      );
       const bid = Number(summary.yesBid);
       const ask = Number(summary.yesAsk);
       setText(
@@ -9095,13 +9245,56 @@ function renderPolymarketDashboardJs(): string {
         paused ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : "")) : "RUNNING",
         paused ? "bad" : "good"
       );
+
+      const toMsPair = (metric) =>
+        Number.isFinite(Number(metric.p50)) && Number.isFinite(Number(metric.p90))
+          ? Number(metric.p50).toFixed(0) + " / " + Number(metric.p90).toFixed(0) + " ms"
+          : "-";
+      setText("pmLagBook", toMsPair(bookLagMetric));
+      setText("pmLagOracle", toMsPair(oracleAgeMetric));
+      setText("pmLagPolyAge", toMsPair(polyAgeMetric));
+      setText(
+        "pmZD",
+        Number.isFinite(Number(latestModel.z)) && Number.isFinite(Number(latestModel.d))
+          ? Number(latestModel.z).toFixed(3) + " / " + Number(latestModel.d).toFixed(2)
+          : "-"
+      );
+      setText(
+        "pmSigma",
+        Number.isFinite(Number(latestModel.sigma))
+          ? Number(latestModel.sigma).toFixed(4)
+          : "-"
+      );
+      setText(
+        "pmBoost",
+        String(latestModel.boostApplied ? "ON" : "OFF") + " (" + String(latestModel.boostReason || "-") + ")",
+        latestModel.boostApplied ? "good" : ""
+      );
+
+      const tau = Number(latestPolymarket.tauSec);
+      const minSniper = Number(sniperWindow.minRemainingSec);
+      const maxSniper = Number(sniperWindow.maxRemainingSec);
+      const pBoosted = Number(latestModel.pBoosted);
+      const inSniper =
+        Number.isFinite(tau) &&
+        Number.isFinite(minSniper) &&
+        Number.isFinite(maxSniper) &&
+        tau >= minSniper &&
+        tau <= maxSniper;
+      const isLocked =
+        Number.isFinite(pBoosted) &&
+        (pBoosted >= 0.99 || pBoosted <= 0.01) &&
+        inSniper;
+      setText("pmLocked", isLocked ? "LOCKED" : "NORMAL", isLocked ? "good" : "");
+      setText("pmLagUpdated", relTime(latestLag.lastBookTsMs));
     }
 
     async function refresh() {
-      const [summaryResp, tradesResp, equityResp] = await Promise.all([
+      const [summaryResp, tradesResp, equityResp, lagResp] = await Promise.all([
         fetchJson("/api/polymarket/summary"),
         fetchJson("/api/polymarket/trades?limit=200"),
-        fetchJson("/api/polymarket/equity")
+        fetchJson("/api/polymarket/equity"),
+        fetchJson("/api/polymarket/lag")
       ]);
 
       const summary = summaryResp && typeof summaryResp === "object" ? summaryResp : {};
@@ -9114,6 +9307,9 @@ function renderPolymarketDashboardJs(): string {
       setText("mWins", String(summary.wins || 0), "good");
       setText("mLosses", String(summary.losses || 0), "bad");
 
+      if ((!summary.latestLag || !summary.latestModel) && lagResp && typeof lagResp === "object") {
+        summary.latestLag = lagResp.stats || summary.latestLag || null;
+      }
       renderCurrent(summary);
       const rows = Array.isArray(tradesResp.rows) ? tradesResp.rows : [];
       renderRows(rows, "openTradesBody", "open");

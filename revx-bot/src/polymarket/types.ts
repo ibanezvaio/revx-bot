@@ -186,6 +186,15 @@ export type DecisionLogLine = {
   oracleEst: number;
   sigma: number;
   pUpModel: number;
+  pBase?: number;
+  pBoosted?: number;
+  z?: number;
+  d?: number;
+  sigmaCalibrated?: number;
+  polyUpdateAgeMs?: number;
+  lagPolyP90Ms?: number;
+  boostApplied?: boolean;
+  boostReason?: string;
   yesBid: number;
   yesAsk: number;
   yesMid: number;

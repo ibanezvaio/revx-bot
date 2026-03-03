@@ -8,6 +8,7 @@ import { sleep } from "../util/time";
 import { PolymarketClient } from "./PolymarketClient";
 import { PolymarketExecution } from "./Execution";
 import { MarketScanner } from "./MarketScanner";
+import { LagProfiler, LagProfilerStats, LagSample } from "./LagProfiler";
 import { OracleEstimator } from "./OracleEstimator";
 import { OracleRouter, OracleSnapshot, OracleState } from "./OracleRouter";
 import { ProbModel } from "./ProbModel";
@@ -47,6 +48,7 @@ export class PolymarketEngine {
   private readonly paperLedgerPath: string;
   private readonly dataDirPath: string;
   private readonly paperTradeLogPath: string;
+  private readonly lagProfiler: LagProfiler;
   private readonly oracleSamples: Array<{ ts: number; px: number; source: string }> = [];
   private readonly marketLagState = new Map<
     string,
@@ -54,6 +56,27 @@ export class PolymarketEngine {
   >();
   private readonly resolutionPendingLogByTradeId = new Map<string, number>();
   private readonly paperStopLossTicksByTradeId = new Map<string, number>();
+  private latestPolymarketSnapshot: {
+    windowSlug: string;
+    tauSec: number | null;
+    priceToBeat: number | null;
+    fastMid: number | null;
+    yesMid: number | null;
+    impliedProbMid: number | null;
+  } | null = null;
+  private latestModelSnapshot: {
+    pBase: number | null;
+    pBoosted: number | null;
+    z: number | null;
+    d: number | null;
+    sigma: number | null;
+    tauSec: number | null;
+    polyUpdateAgeMs: number | null;
+    lagPolyP90Ms: number | null;
+    oracleAgeMs: number | null;
+    boostApplied: boolean;
+    boostReason: string | null;
+  } | null = null;
   private oracleStaleSinceTs: number | null = null;
   private tradingPaused = false;
   private pauseReason = "";
@@ -100,6 +123,10 @@ export class PolymarketEngine {
     mkdirSync(this.dataDirPath, { recursive: true });
     this.logPath = path.join(this.logsDirPath, "polymarket-decisions.jsonl");
     this.paperTradeLogPath = path.join(this.logsDirPath, "polymarket-paper-trades.jsonl");
+    this.lagProfiler = new LagProfiler({
+      maxSamples: 2000,
+      logPath: path.join(this.logsDirPath, "polymarket-lag.jsonl")
+    });
     this.paperLedgerPath = path.resolve(process.cwd(), this.config.polymarket.paper.ledgerPath);
     mkdirSync(path.dirname(this.paperLedgerPath), { recursive: true });
     this.paperLedger = new PaperLedger(this.paperLedgerPath);
@@ -161,6 +188,56 @@ export class PolymarketEngine {
     }
     this.paperLedger.flush();
     this.logger.warn({ reason }, "Polymarket engine stopped");
+  }
+
+  getLagSnapshot(limit = 50): { stats: LagProfilerStats; recent: LagSample[] } {
+    return {
+      stats: this.lagProfiler.getStats(),
+      recent: this.lagProfiler.getRecent(limit)
+    };
+  }
+
+  getDashboardSnapshot(): {
+    latestPolymarket: {
+      windowSlug: string;
+      tauSec: number | null;
+      priceToBeat: number | null;
+      fastMid: number | null;
+      yesMid: number | null;
+      impliedProbMid: number | null;
+    } | null;
+    latestModel: {
+      pBase: number | null;
+      pBoosted: number | null;
+      z: number | null;
+      d: number | null;
+      sigma: number | null;
+      tauSec: number | null;
+      polyUpdateAgeMs: number | null;
+      lagPolyP90Ms: number | null;
+      oracleAgeMs: number | null;
+      boostApplied: boolean;
+      boostReason: string | null;
+    } | null;
+    latestLag: LagProfilerStats;
+    sniperWindow: {
+      minRemainingSec: number;
+      maxRemainingSec: number;
+    };
+    tradingPaused: boolean;
+    pauseReason: string | null;
+  } {
+    return {
+      latestPolymarket: this.latestPolymarketSnapshot ? { ...this.latestPolymarketSnapshot } : null,
+      latestModel: this.latestModelSnapshot ? { ...this.latestModelSnapshot } : null,
+      latestLag: this.lagProfiler.getStats(),
+      sniperWindow: {
+        minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
+        maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
+      },
+      tradingPaused: this.tradingPaused,
+      pauseReason: this.pauseReason || null
+    };
   }
 
   private async runLoop(): Promise<void> {
@@ -539,10 +616,19 @@ export class PolymarketEngine {
       acceptingOrders: selectedAcceptingOrders,
       enableOrderBook: selectedEnableOrderBook
     };
+    const fastMidSnapshot = this.oracleRouter.getFastMidNow(nowTs);
+    const fastMidNow =
+      fastMidSnapshot && fastMidSnapshot.price > 0
+        ? fastMidSnapshot.price
+        : oracleEst > 0
+          ? oracleEst
+          : 0;
+    const lagStatsSnapshot = this.lagProfiler.getStats();
+    const lagPolyP90Ms = lagStatsSnapshot.metrics.polyUpdateAgeMs.p90;
     const shortReturn = this.computeShortReturn(nowTs, 45);
     const realizedVolPricePerSqrtSec = this.computeRealizedVolPricePerSqrtSec(
       nowTs,
-      oracleEst,
+      fastMidNow > 0 ? fastMidNow : oracleEst,
       sigmaPricePerSqrtSec,
       300
     );
@@ -571,13 +657,24 @@ export class PolymarketEngine {
         ts: nowTs
       };
       const prob = this.probModel.computeAdaptive({
-        oracleEst,
+        oracleEst: fastMidNow > 0 ? fastMidNow : oracleEst,
         priceToBeat: market.priceToBeat,
         tauSec,
         cadenceSec: this.config.polymarket.marketQuery.cadenceMinutes * 60,
         shortReturn,
         realizedVolPricePerSqrtSec
       });
+      const polyUpdateAgeMs = implied.bookTs > 0 ? Math.max(0, nowTs - implied.bookTs) : 0;
+      const calibrated = this.probModel.computeExpiryProbCalibrated({
+        fastMid: fastMidNow > 0 ? fastMidNow : oracleEst,
+        priceToBeat: market.priceToBeat,
+        sigmaPricePerSqrtSec,
+        tauSec,
+        polyUpdateAgeMs,
+        lagPolyP90Ms,
+        oracleAgeMs: oracleAgeMs > 0 && Number.isFinite(oracleAgeMs) ? oracleAgeMs : 0
+      });
+      const pForExtreme = calibrated.pBoosted;
 
       const decision = this.strategy.decide({
         pUpModel: prob.pUpModel,
@@ -616,8 +713,8 @@ export class PolymarketEngine {
       const probExtreme = this.config.polymarket.paper.probExtreme;
       const hasExtremeModel =
         chosenSide === "YES"
-          ? prob.pUpModel >= probExtreme
-          : prob.pUpModel <= 1 - probExtreme;
+          ? pForExtreme >= probExtreme
+          : pForExtreme <= 1 - probExtreme;
       const inSnipingWindow =
         remainingSec <= this.config.polymarket.paper.entryMaxRemainingSec &&
         remainingSec >= this.config.polymarket.paper.entryMinRemainingSec;
@@ -632,6 +729,44 @@ export class PolymarketEngine {
             ? "BUY_YES"
             : "BUY_NO"
           : "HOLD";
+
+      this.lagProfiler.record({
+        tsMs: nowTs,
+        windowSlug: market.eventSlug || market.slug || market.marketId,
+        tauSec,
+        priceToBeat: market.priceToBeat,
+        fastMid: fastMidNow > 0 ? fastMidNow : null,
+        oraclePrice: oracleEst > 0 ? oracleEst : null,
+        oracleUpdatedAtMs: oracleTs ?? null,
+        yesBid: implied.yesBid,
+        yesAsk: implied.yesAsk,
+        yesMid: implied.yesMid,
+        impliedProbMid: implied.yesMid,
+        pModel: prob.pUpModel,
+        absProbGap: Math.abs(prob.pUpModel - implied.yesMid)
+      });
+
+      this.latestPolymarketSnapshot = {
+        windowSlug: market.eventSlug || market.slug || market.marketId,
+        tauSec,
+        priceToBeat: market.priceToBeat,
+        fastMid: fastMidNow > 0 ? fastMidNow : null,
+        yesMid: implied.yesMid,
+        impliedProbMid: implied.yesMid
+      };
+      this.latestModelSnapshot = {
+        pBase: calibrated.pBase,
+        pBoosted: calibrated.pBoosted,
+        z: calibrated.z,
+        d: calibrated.d,
+        sigma: calibrated.sigma,
+        tauSec: calibrated.tauSec,
+        polyUpdateAgeMs: calibrated.polyUpdateAgeMs,
+        lagPolyP90Ms: calibrated.lagPolyP90Ms,
+        oracleAgeMs: calibrated.oracleAgeMs,
+        boostApplied: calibrated.boostApplied,
+        boostReason: calibrated.boostReason
+      };
 
       if (paperMode) {
         await this.managePaperOpenPositions({
@@ -826,6 +961,10 @@ export class PolymarketEngine {
               yesAsk: decision.yesAsk,
               noAsk,
               edge: netEdgeAfterCosts,
+              pBase: calibrated.pBase,
+              pBoosted: calibrated.pBoosted,
+              boostApplied: calibrated.boostApplied,
+              boostReason: calibrated.boostReason,
               requestedNotionalUsd: size.notionalUsd,
               ts: nowTs
             });
@@ -874,6 +1013,15 @@ export class PolymarketEngine {
         yesAsk: decision.yesAsk,
         yesMid: decision.yesMid,
         pUpModel: prob.pUpModel,
+        pBase: calibrated.pBase,
+        pBoosted: calibrated.pBoosted,
+        z: calibrated.z,
+        d: calibrated.d,
+        sigmaCalibrated: calibrated.sigma,
+        polyUpdateAgeMs: calibrated.polyUpdateAgeMs,
+        lagPolyP90Ms: calibrated.lagPolyP90Ms,
+        boostApplied: calibrated.boostApplied,
+        boostReason: calibrated.boostReason,
         edge: signedEdge,
         edgeYes,
         edgeNo,
@@ -910,6 +1058,15 @@ export class PolymarketEngine {
         oracleEst,
         sigma: sigmaPricePerSqrtSec,
         pUpModel: prob.pUpModel,
+        pBase: calibrated.pBase,
+        pBoosted: calibrated.pBoosted,
+        z: calibrated.z,
+        d: calibrated.d,
+        sigmaCalibrated: calibrated.sigma,
+        polyUpdateAgeMs: calibrated.polyUpdateAgeMs,
+        lagPolyP90Ms: calibrated.lagPolyP90Ms,
+        boostApplied: calibrated.boostApplied,
+        boostReason: calibrated.boostReason,
         yesBid: decision.yesBid,
         yesAsk: decision.yesAsk,
         yesMid: decision.yesMid,
@@ -979,6 +1136,10 @@ export class PolymarketEngine {
     yesAsk: number;
     noAsk?: number;
     edge: number;
+    pBase?: number;
+    pBoosted?: number;
+    boostApplied?: boolean;
+    boostReason?: string;
     requestedNotionalUsd: number;
     ts: number;
     forced?: boolean;
@@ -1054,6 +1215,10 @@ export class PolymarketEngine {
       notionalUsd: trade.notionalUsd,
       feesUsd: trade.feesUsd,
       edge: params.edge,
+      pBase: params.pBase ?? null,
+      pBoosted: params.pBoosted ?? null,
+      boostApplied: Boolean(params.boostApplied),
+      boostReason: params.boostReason || null,
       cumulativePnlUsd: openSummary.totalPnlUsd,
       wins: openSummary.wins,
       losses: openSummary.losses,
@@ -1599,6 +1764,7 @@ export class PolymarketEngine {
     spread: number;
     topBidSize: number;
     topAskSize: number;
+    bookTs: number;
   }> {
     try {
       const orderBook = await this.client.getYesOrderBook(market.marketId, market.yesTokenId);
@@ -1609,7 +1775,8 @@ export class PolymarketEngine {
           yesMid: clamp(orderBook.yesMid, 0, 1),
           spread: Math.max(0, orderBook.yesAsk - orderBook.yesBid),
           topBidSize: Math.max(0, Number(orderBook.bids?.[0]?.size || 0)),
-          topAskSize: Math.max(0, Number(orderBook.asks?.[0]?.size || 0))
+          topAskSize: Math.max(0, Number(orderBook.asks?.[0]?.size || 0)),
+          bookTs: Number(orderBook.ts || Date.now())
         };
       }
     } catch (error) {
@@ -1642,7 +1809,8 @@ export class PolymarketEngine {
       yesMid: (yesBid + yesAsk) / 2,
       spread: Math.max(0, yesAsk - yesBid),
       topBidSize: 0,
-      topAskSize: 0
+      topAskSize: 0,
+      bookTs: Date.now()
     };
   }
 
@@ -1740,6 +1908,15 @@ export class PolymarketEngine {
         yesMid: line.yesMid ?? null,
         pUp: line.pUpModel,
         pUpModel: line.pUpModel,
+        pBase: line.pBase ?? null,
+        pBoosted: line.pBoosted ?? null,
+        z: line.z ?? null,
+        d: line.d ?? null,
+        sigmaCalibrated: line.sigmaCalibrated ?? null,
+        polyUpdateAgeMs: line.polyUpdateAgeMs ?? null,
+        lagPolyP90Ms: line.lagPolyP90Ms ?? null,
+        boostApplied: line.boostApplied ?? false,
+        boostReason: line.boostReason ?? null,
         edge: line.edge,
         edgeYes: line.edgeYes ?? null,
         edgeNo: line.edgeNo ?? null,
@@ -1985,6 +2162,15 @@ type TickLogLine = {
   yesAsk: number | null;
   yesMid?: number | null;
   pUpModel: number | null;
+  pBase?: number | null;
+  pBoosted?: number | null;
+  z?: number | null;
+  d?: number | null;
+  sigmaCalibrated?: number | null;
+  polyUpdateAgeMs?: number | null;
+  lagPolyP90Ms?: number | null;
+  boostApplied?: boolean;
+  boostReason?: string | null;
   edge: number | null;
   edgeYes?: number | null;
   edgeNo?: number | null;

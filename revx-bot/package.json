@@ -39,6 +39,8 @@
     "analysis-smoke": "npm run build && node dist/scripts/analysis_smoke_test.js",
     "test:polymarket-oracle": "npm run build && node dist/scripts/testPolymarketOracleEstimator.js",
     "test:polymarket-prob": "npm run build && node dist/scripts/testPolymarketProbModel.js",
+    "test:polymarket-prob-calibrated": "npm run build && node dist/polymarket/__tests__/ProbModelCalibrated.test.js",
+    "test:polymarket-lagprofiler": "npm run build && node dist/polymarket/__tests__/LagProfiler.test.js",
     "test:polymarket-strategy": "npm run build && node dist/scripts/testPolymarketStrategy.js",
     "test:polymarket-sizing": "npm run build && node dist/scripts/testPolymarketSizing.js",
     "test:polymarket-auth": "npm run build && node dist/scripts/testPolymarketAuthSigning.js",
@@ -51,7 +53,7 @@
     "test:polymarket-paper-lifecycle": "npm run build && node dist/scripts/testPolymarketPaperWindowLifecycle.js",
     "test:polymarket-oracle-stale": "npm run build && node dist/scripts/testPolymarketOracleStaleHandling.js",
     "test:polymarket-integration": "npm run build && node dist/scripts/testPolymarketIntegration.js",
-    "test": "npm run build && node dist/scripts/testPolymarketOracleEstimator.js && node dist/scripts/testPolymarketProbModel.js && node dist/scripts/testPolymarketStrategy.js && node dist/scripts/testPolymarketSizing.js && node dist/scripts/testPolymarketAuthSigning.js && node dist/scripts/testPolymarketRequestBuilding.js && node dist/scripts/testPolymarketRetry.js && node dist/scripts/testPolymarketEnvMapping.js && node dist/scripts/testPolymarketClobClientFactory.js && node dist/scripts/testPolymarketPaperPnl.js && node dist/scripts/testPolymarketPaperLedger.js && node dist/scripts/testPolymarketPaperWindowLifecycle.js && node dist/scripts/testPolymarketOracleStaleHandling.js"
+    "test": "npm run build && node dist/scripts/testPolymarketOracleEstimator.js && node dist/scripts/testPolymarketProbModel.js && node dist/polymarket/__tests__/ProbModelCalibrated.test.js && node dist/scripts/testPolymarketStrategy.js && node dist/scripts/testPolymarketSizing.js && node dist/polymarket/__tests__/LagProfiler.test.js && node dist/scripts/testPolymarketAuthSigning.js && node dist/scripts/testPolymarketRequestBuilding.js && node dist/scripts/testPolymarketRetry.js && node dist/scripts/testPolymarketEnvMapping.js && node dist/scripts/testPolymarketClobClientFactory.js && node dist/scripts/testPolymarketPaperPnl.js && node dist/scripts/testPolymarketPaperLedger.js && node dist/scripts/testPolymarketPaperWindowLifecycle.js && node dist/scripts/testPolymarketOracleStaleHandling.js"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.5.0",

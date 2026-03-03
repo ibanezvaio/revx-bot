@@ -50,11 +50,19 @@ async function main(): Promise<void> {
   const performanceEngine = config.performanceEnabled
     ? new PerformanceEngine(config, logger, store, marketData)
     : undefined;
+  const pmLogger =
+    config.polymarket.enabled
+      ? logger.child({ module: "polymarket" })
+      : null;
+  const polymarketEngine =
+    config.polymarket.enabled
+      ? new PolymarketEngine(config, pmLogger ?? logger, { store })
+      : undefined;
   const execution = new Execution(config, logger, client, store, config.dryRun);
   const reconciler = new Reconciler(config, logger, client, store, marketData, performanceEngine);
   const dashboard = new DashboardServer(config, logger, store, execution.getRunId(), {
     cancelAllBotOrders: async () => execution.cancelAllBotOrders(config.symbol)
-  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine);
+  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine, polymarketEngine);
   const strategy = new MakerStrategy(
     config,
     logger,
@@ -70,15 +78,6 @@ async function main(): Promise<void> {
     signalsEngine,
     intelEngine
   );
-  const pmLogger =
-    config.polymarket.enabled
-      ? logger.child({ module: "polymarket" })
-      : null;
-  const polymarketEngine =
-    config.polymarket.enabled
-      ? new PolymarketEngine(config, pmLogger ?? logger, { store })
-      : undefined;
-
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;

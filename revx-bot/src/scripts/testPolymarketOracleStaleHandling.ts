@@ -206,7 +206,12 @@ async function run(): Promise<void> {
       const row = snapshots[Math.min(snapshotIdx, snapshots.length - 1)];
       snapshotIdx += 1;
       return row;
-    }
+    },
+    getFastMidNow: () => ({
+      price: 100.8,
+      ts: Date.now(),
+      source: "internal_fair_mid"
+    })
   };
 
   await engineAny.runOnce(t0);

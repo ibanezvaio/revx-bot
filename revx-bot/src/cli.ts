@@ -1,6 +1,7 @@
 import "dotenv/config";
-import { readFileSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { loadConfig } from "./config";
 import { Execution } from "./exec/Execution";
 import { buildLogger } from "./logger";
@@ -147,15 +148,24 @@ async function run(): Promise<void> {
       const isScan = subcommand === "scan";
       const isBook = subcommand === "book";
       const isResolveEvent = subcommand === "resolve-event";
+      const isLagSummary = subcommand === "lag-summary";
       const btc5m = args.includes("--btc5m");
-      if (!isPing && !isWhoAmI && !isDeriveCreds && !isPaperRun && !isScan && !isBook && !isResolveEvent && !btc5m) {
-        throw new Error("polymarket command requires one of: ping | whoami | derive-creds | scan --btc5m | resolve-event --slug <slug> | book --token-id <id> | paper --btc5m | --btc5m");
+      if (!isPing && !isWhoAmI && !isDeriveCreds && !isPaperRun && !isScan && !isBook && !isResolveEvent && !isLagSummary && !btc5m) {
+        throw new Error("polymarket command requires one of: ping | whoami | derive-creds | lag-summary [--minutes N] | scan --btc5m | resolve-event --slug <slug> | book --token-id <id> | paper --btc5m | --btc5m");
       }
       if (isPaperRun && !btc5m) {
         throw new Error("polymarket paper requires --btc5m");
       }
       if (isScan && !btc5m) {
         throw new Error("polymarket scan requires --btc5m");
+      }
+
+      if (isLagSummary) {
+        const minutes = clamp(parseArgNumber(args, "--minutes", 60), 1, 24 * 60);
+        const summary = await summarizeLagJsonl(minutes);
+        // eslint-disable-next-line no-console
+        console.log(JSON.stringify(summary, null, 2));
+        return;
       }
 
       const mode = isPaperRun
@@ -731,7 +741,7 @@ async function run(): Promise<void> {
     console.error(
       "Unknown command: " +
         command +
-        ". Use: status | balances [--raw] | cancel-all [--all] | dry-run | simulate [--minutes N] | tune [--apply] | polymarket ping [--paper|--live] | polymarket whoami [--paper|--live] | polymarket derive-creds [--paper|--live] [--print-secrets] [--fresh] | polymarket scan --btc5m [--debug] | polymarket resolve-event --slug <slug> | polymarket book --token-id <id> [--paper|--live] | polymarket paper --btc5m [--hours N] [--force-trade] [--force-interval-sec N] [--force-notional X] | polymarket --btc5m [--paper|--live] [--cancel-all-on-start]"
+        ". Use: status | balances [--raw] | cancel-all [--all] | dry-run | simulate [--minutes N] | tune [--apply] | polymarket ping [--paper|--live] | polymarket whoami [--paper|--live] | polymarket derive-creds [--paper|--live] [--print-secrets] [--fresh] | polymarket lag-summary [--minutes N] | polymarket scan --btc5m [--debug] | polymarket resolve-event --slug <slug> | polymarket book --token-id <id> [--paper|--live] | polymarket paper --btc5m [--hours N] [--force-trade] [--force-interval-sec N] [--force-notional X] | polymarket --btc5m [--paper|--live] [--cancel-all-on-start]"
     );
     process.exitCode = 1;
   } finally {
@@ -739,6 +749,94 @@ async function run(): Promise<void> {
       store.close();
     }
   }
+}
+
+async function summarizeLagJsonl(minutes: number): Promise<Record<string, unknown>> {
+  const logPath = join(process.cwd(), "logs/polymarket-lag.jsonl");
+  if (!existsSync(logPath)) {
+    return {
+      ok: false,
+      reason: "lag log missing",
+      path: logPath,
+      minutes
+    };
+  }
+
+  const sinceTs = Date.now() - Math.max(1, minutes) * 60 * 1000;
+  const metrics: Record<string, number[]> = {
+    polyUpdateAgeMs: [],
+    oracleAgeMs: [],
+    absOracleFast: [],
+    absProbGap: [],
+    bookMoveLagMs: []
+  };
+  let scanned = 0;
+  let kept = 0;
+
+  const rl = createInterface({
+    input: createReadStream(logPath, { encoding: "utf8" }),
+    crlfDelay: Infinity
+  });
+
+  for await (const line of rl) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    scanned += 1;
+    let row: Record<string, unknown> | null = null;
+    try {
+      row = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      row = null;
+    }
+    if (!row) continue;
+    const tsMs = Number(row.tsMs ?? row.ts ?? 0);
+    if (!Number.isFinite(tsMs) || tsMs < sinceTs) {
+      continue;
+    }
+    kept += 1;
+    for (const key of Object.keys(metrics)) {
+      const value = Number(row[key] ?? Number.NaN);
+      if (Number.isFinite(value)) {
+        metrics[key].push(value);
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    path: logPath,
+    minutes,
+    scanned,
+    kept,
+    stats: Object.fromEntries(
+      Object.entries(metrics).map(([key, values]) => [key, summarizeNumbers(values)])
+    )
+  };
+}
+
+function summarizeNumbers(values: number[]): Record<string, number | null> {
+  if (values.length === 0) {
+    return { count: 0, mean: null, p50: null, p90: null };
+  }
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return {
+    count: values.length,
+    mean,
+    p50: percentile(sorted, 0.5),
+    p90: percentile(sorted, 0.9)
+  };
+}
+
+function percentile(sortedValues: number[], q: number): number | null {
+  if (sortedValues.length === 0) return null;
+  const qq = Math.max(0, Math.min(1, q));
+  const rank = (sortedValues.length - 1) * qq;
+  const low = Math.floor(rank);
+  const high = Math.ceil(rank);
+  if (low === high) return sortedValues[low];
+  const w = rank - low;
+  return sortedValues[low] * (1 - w) + sortedValues[high] * w;
 }
 
 function parseBotTag(tag: string): { side: string; level: number; tag: string } {

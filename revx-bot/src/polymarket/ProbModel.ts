@@ -80,6 +80,91 @@ export class ProbModel {
       tauEffSec
     };
   }
+
+  computeExpiryProbCalibrated(input: {
+    fastMid: number;
+    priceToBeat: number;
+    sigmaPricePerSqrtSec: number;
+    tauSec: number;
+    polyUpdateAgeMs?: number | null;
+    lagPolyP90Ms?: number | null;
+    oracleAgeMs?: number | null;
+  }): {
+    pBase: number;
+    pBoosted: number;
+    z: number;
+    d: number;
+    sigma: number;
+    tauSec: number;
+    polyUpdateAgeMs: number;
+    lagPolyP90Ms: number;
+    oracleAgeMs: number;
+    boostApplied: boolean;
+    boostReason: string;
+  } {
+    const tauSec = Math.max(0, Number.isFinite(input.tauSec) ? input.tauSec : 0);
+    const tauEffSec = Math.max(1e-6, tauSec);
+    const eps = 1e-9;
+    const fastMid = Number.isFinite(input.fastMid) ? input.fastMid : 0;
+    const priceToBeat = Number.isFinite(input.priceToBeat) ? input.priceToBeat : 0;
+    const d = fastMid - priceToBeat;
+    const sigmaFloor = Math.max(
+      this.config.polymarket.vol.minSigmaBps / 10_000 * Math.max(1, Math.abs(fastMid)),
+      1e-9
+    );
+    const sigmaPricePerSqrtSec = Math.max(
+      sigmaFloor,
+      Number.isFinite(input.sigmaPricePerSqrtSec) ? input.sigmaPricePerSqrtSec : sigmaFloor
+    );
+    const sigma = Math.max(eps, sigmaPricePerSqrtSec * Math.sqrt(tauEffSec));
+    const z = clamp(d / sigma, -50, 50);
+    const pBase = clamp(normalCdf(z), 0.0005, 0.9995);
+
+    const polyUpdateAgeMs = Math.max(0, Number(input.polyUpdateAgeMs ?? 0));
+    const lagPolyP90Ms = Math.max(1, Number(input.lagPolyP90Ms ?? 1000));
+    const oracleAgeMs = Math.max(0, Number(input.oracleAgeMs ?? 0));
+
+    const hasLateWindow = tauSec <= 120;
+    const hasExtremeZ = Math.abs(z) >= 2.2;
+    const laggedBook = polyUpdateAgeMs >= lagPolyP90Ms || polyUpdateAgeMs >= 500;
+    const shouldBoost = hasLateWindow && hasExtremeZ && laggedBook;
+
+    let pBoosted = pBase;
+    let boostApplied = false;
+    let boostReason = "NO_BOOST";
+    if (shouldBoost) {
+      const boostMag = Math.min(0.03, 0.03 * Math.min(1, polyUpdateAgeMs / lagPolyP90Ms));
+      pBoosted = z > 0 ? Math.min(0.9995, pBase + boostMag) : Math.max(0.0005, pBase - boostMag);
+      boostApplied = true;
+      boostReason = z > 0 ? "LOCKEDNESS_UP" : "LOCKEDNESS_DOWN";
+    } else if (!hasLateWindow) {
+      boostReason = "TAU_TOO_LARGE";
+    } else if (!hasExtremeZ) {
+      boostReason = "Z_NOT_EXTREME";
+    } else if (!laggedBook) {
+      boostReason = "BOOK_NOT_LAGGED";
+    }
+
+    if (!Number.isFinite(pBoosted)) {
+      pBoosted = pBase;
+      boostApplied = false;
+      boostReason = "NUMERIC_GUARD";
+    }
+
+    return {
+      pBase,
+      pBoosted,
+      z,
+      d,
+      sigma,
+      tauSec,
+      polyUpdateAgeMs,
+      lagPolyP90Ms,
+      oracleAgeMs,
+      boostApplied,
+      boostReason
+    };
+  }
 }
 
 function normalCdf(z: number): number {

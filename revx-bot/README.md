@@ -137,6 +137,7 @@ node dist/cli.js polymarket --btc5m --paper
 node dist/cli.js polymarket whoami --live
 node dist/cli.js polymarket derive-creds --live
 node dist/cli.js polymarket derive-creds --live --print-secrets
+node dist/cli.js polymarket lag-summary --minutes 60
 node dist/cli.js polymarket ping --live
 node dist/cli.js polymarket paper --btc5m --hours 12
 node dist/cli.js polymarket --btc5m --live --cancel-all-on-start
@@ -198,6 +199,7 @@ npm run live
 Decision logs are written as JSONL to:
 - `logs/polymarket-decisions.jsonl`
 - `logs/polymarket-paper-trades.jsonl`
+- `logs/polymarket-lag.jsonl` (calibration instrumentation / lag profiling)
 
 Paper ledger (append-only JSONL):
 - `data/polymarket-paper-ledger.jsonl`
