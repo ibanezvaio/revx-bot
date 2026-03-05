@@ -1,8 +1,9 @@
 import { BotConfig } from "../config";
+import { randomUUID } from "node:crypto";
 import { Logger } from "../logger";
 import { MarketData } from "../md/MarketData";
 import { FifoPnlEstimator } from "../metrics/PnL";
-import { RevXClient, RevXDegradedError, RevXHttpError, RevXOrder } from "../revx/RevXClient";
+import { RevXClient, RevXDegradedError, RevXFill, RevXHttpError, RevXOrder } from "../revx/RevXClient";
 import { ParsedBalancesPayload, findAsset, parseBalancesPayload } from "./balanceParsing";
 import { FillRecord, OrderRecord, ReconcilerState, Side, Store } from "../store/Store";
 import { BalanceState } from "./BalanceState";
@@ -30,10 +31,19 @@ export class Reconciler {
   private runningScheduledReconcile = false;
   private runningStatusPoll = false;
   private runningBalanceRefresh = false;
+  private runningReconcileOnce = false;
+  private runningReconcileOnceStartedTs = 0;
+  private runningReconcileOnceId = "";
   private firstBalanceAttemptPromise: Promise<void> | null = null;
   private pendingWatchdogStartedTs = 0;
   private readonly orderStatusMisses = new Map<string, number>();
   private readonly pnlEstimator = new FifoPnlEstimator();
+  private lastBalanceTotals: { usdTotal: number; btcTotal: number; ts: number } | null = null;
+  private inferredFillSeq = 0;
+  private fillsReconcileDisabledUsingBalanceDeltaLogged = false;
+  private fillsReconcileSkipWarned = false;
+  private readonly debugRecon =
+    process.env.DEBUG_RECON === "1" || process.env.DEBUG === "1";
 
   constructor(
     private readonly config: BotConfig,
@@ -49,6 +59,21 @@ export class Reconciler {
     const intervalMs = Math.max(1, this.config.reconcileSeconds) * 1000;
     const statusPollMs = Math.min(2_000, Math.max(1_000, Math.floor(this.config.refreshSeconds * 1000)));
     this.clearPendingLocalOrdersAtStartup();
+    void this.client
+      .initializeTradesEndpointCapability()
+      .then(() => {
+        const mode = this.client.getFillsReconcileMode();
+        this.logger.info(
+          {
+            fillsEndpoint: mode.fillsEndpoint ?? "NONE",
+            fillsReconcile: mode.fillsReconcile
+          },
+          "RevX reconcile mode"
+        );
+      })
+      .catch((error) => {
+        this.logger.warn({ error }, "Failed to initialize RevX trades endpoint capability");
+      });
     this.firstBalanceAttemptPromise = this.refreshBalances("startup");
     this.timer = setInterval(() => {
       void this.runScheduledReconcile().catch((error) => {
@@ -91,18 +116,62 @@ export class Reconciler {
     await BalanceState.waitForFirstFetchAttempt();
   }
 
-  async refreshBalancesNow(trigger: "manual" | "insufficient_balance" = "manual"): Promise<void> {
+  async refreshBalancesNow(
+    trigger: "manual" | "insufficient_balance" = "manual",
+    traceId?: string
+  ): Promise<void> {
     if (this.runningBalanceRefresh) return;
     this.runningBalanceRefresh = true;
     try {
-      await this.refreshBalances(trigger);
+      await this.refreshBalances(trigger, traceId);
     } finally {
       this.runningBalanceRefresh = false;
     }
   }
 
   async reconcileOnce(): Promise<void> {
-    await this.refreshBalancesNow("manual");
+    const requestedReconcileId = randomUUID().slice(0, 8);
+    if (this.runningReconcileOnce) {
+      const ageMs =
+        this.runningReconcileOnceStartedTs > 0
+          ? Math.max(0, Date.now() - this.runningReconcileOnceStartedTs)
+          : 0;
+      if (this.debugRecon) {
+        this.logger.debug(
+          {
+            reconcileId: requestedReconcileId,
+            inFlightReconcileId: this.runningReconcileOnceId || undefined,
+            ageMs
+          },
+          "reconcile_inflight_skip"
+        );
+      }
+      return;
+    }
+    this.runningReconcileOnce = true;
+    this.runningReconcileOnceStartedTs = Date.now();
+    this.runningReconcileOnceId = requestedReconcileId;
+    try {
+    const reconcileId = requestedReconcileId;
+    const traceId = reconcileId;
+    const reconcileStartedMs = Date.now();
+    const logStage = (stageName: string, stageStartedMs: number, details: Record<string, unknown> = {}): void => {
+      if (!this.debugRecon) return;
+      const durationMs = Math.max(0, Date.now() - stageStartedMs);
+      this.logger.info(
+        {
+          reconcileId,
+          stageName,
+          durationMs,
+          ...details
+        },
+        "Reconcile stage timing"
+      );
+    };
+
+    const refreshBalancesStartedMs = Date.now();
+    await this.refreshBalancesNow("manual", traceId);
+    logStage("refreshBalancesNow", refreshBalancesStartedMs, { trigger: "manual", traceId });
     const now = Date.now();
     const pendingStaleMs = 5_000;
 
@@ -127,8 +196,14 @@ export class Reconciler {
     const venueActiveNormalized: NormalizedVenueActiveOrder[] = [];
     let venueFetchOk = true;
     let activeOrders: RevXOrder[] = [];
+    const getActiveOrdersStartedMs = Date.now();
     try {
-      activeOrders = await this.client.getActiveOrders(this.config.symbol);
+      activeOrders = await this.client.getActiveOrders(this.config.symbol, { traceId });
+      logStage("getActiveOrders", getActiveOrdersStartedMs, {
+        symbol: this.config.symbol,
+        openOrdersCount: activeOrders.length,
+        venueFetchOk: true
+      });
     } catch (error) {
       if (error instanceof RevXDegradedError) {
         venueFetchOk = false;
@@ -136,7 +211,8 @@ export class Reconciler {
           { endpoint: error.endpoint, openUntilMs: error.openUntilMs },
           "RevX degraded; using locally known active orders"
         );
-        for (const fallback of this.store.getActiveOrders(this.config.symbol)) {
+        const fallbackActiveOrders = this.store.getActiveOrders(this.config.symbol);
+        for (const fallback of fallbackActiveOrders) {
           if (fallback.venue_order_id) {
             activeVenueOrderIds.add(fallback.venue_order_id);
             venueOpenKeys.add(orderVenueKey(fallback.venue_order_id));
@@ -159,7 +235,21 @@ export class Reconciler {
             });
           }
         }
+        logStage("getActiveOrders", getActiveOrdersStartedMs, {
+          symbol: this.config.symbol,
+          openOrdersCount: 0,
+          fallbackActiveOrdersCount: fallbackActiveOrders.length,
+          venueFetchOk: false,
+          degraded: true
+        });
       } else {
+        logStage("getActiveOrders", getActiveOrdersStartedMs, {
+          symbol: this.config.symbol,
+          openOrdersCount: 0,
+          venueFetchOk: false,
+          errored: true,
+          errorType: error instanceof Error ? error.name : typeof error
+        });
         throw error;
       }
     }
@@ -227,26 +317,102 @@ export class Reconciler {
     });
 
     const recentBotOrders = this.store.getRecentBotOrders(300);
+    const nonTerminalPrioritizedStatuses = new Set([
+      "OPEN",
+      "NEW",
+      "PARTIALLY_FILLED",
+      "PARTIAL_FILLED",
+      "PENDING",
+      "PENDING_NEW",
+      "UNKNOWN"
+    ]);
+    const terminalStatuses = new Set([
+      "FILLED",
+      "CANCELLED",
+      "CANCELED",
+      "REJECTED",
+      "FAILED",
+      "INACTIVE",
+      "INACTIVE_DUPLICATE",
+      "EXPIRED"
+    ]);
+    const updatedWithinWindowMs = 6 * 60 * 60 * 1000;
+    const updatedCutoffTs = now - updatedWithinWindowMs;
+    const maxOrdersPerReconcile = 30;
+    const candidateOrders = recentBotOrders
+      .filter((order) => String(order.venue_order_id || "").trim().length > 0)
+      .filter((order) => {
+        const normalizedStatus = normalizeOrderStatus(order.status || "UNKNOWN");
+        const updatedAtTs = Number.isFinite(Number(order.updated_at)) ? Number(order.updated_at) : 0;
+        if (nonTerminalPrioritizedStatuses.has(normalizedStatus)) return true;
+        return updatedAtTs >= updatedCutoffTs && !terminalStatuses.has(normalizedStatus);
+      })
+      .sort((a, b) => {
+        const aStatus = normalizeOrderStatus(a.status || "UNKNOWN");
+        const bStatus = normalizeOrderStatus(b.status || "UNKNOWN");
+        const aPriority = nonTerminalPrioritizedStatuses.has(aStatus) ? 0 : 1;
+        const bPriority = nonTerminalPrioritizedStatuses.has(bStatus) ? 0 : 1;
+        if (aPriority !== bPriority) return aPriority - bPriority;
+        return Number(b.updated_at || 0) - Number(a.updated_at || 0);
+      });
+    const seenCandidateVenueIds = new Set<string>();
+    const reconcileOrders: OrderRecord[] = [];
+    for (const order of candidateOrders) {
+      const venueOrderId = String(order.venue_order_id || "").trim();
+      if (!venueOrderId || seenCandidateVenueIds.has(venueOrderId)) continue;
+      seenCandidateVenueIds.add(venueOrderId);
+      reconcileOrders.push(order);
+      if (reconcileOrders.length >= maxOrdersPerReconcile) break;
+    }
+    logStage("orderCandidateSelection", reconcileStartedMs, {
+      recentBotOrdersCount: recentBotOrders.length,
+      candidateOrdersCount: candidateOrders.length,
+      selectedOrdersCount: reconcileOrders.length,
+      maxOrdersPerReconcile,
+      updatedWithinHours: 6
+    });
     const seenVenue = new Set<string>();
     const newFills: Array<{ fill: FillRecord; side: Side | null }> = [];
     let skipOrderDetailFetch = false;
+    let orderByIdLookupsAttempted = 0;
+    let orderByIdLookupsCompleted = 0;
+    let fillsLookupsAttempted = 0;
+    let cumulativeFetchedFills = 0;
+    let getOrderFillsErrorCount = 0;
+    const maxGetOrderFillsErrors = 5;
+    let stoppedByGetOrderFillsErrorLimit = false;
+    let fillsSkippedOrders = 0;
+    let fillsSkipEndpointMissing = false;
+    let fillsSkipDisabled = false;
 
-    for (const order of recentBotOrders) {
-      if (!order.venue_order_id || seenVenue.has(order.venue_order_id)) continue;
-      seenVenue.add(order.venue_order_id);
+    for (let orderIndex = 0; orderIndex < reconcileOrders.length; orderIndex += 1) {
+      const order = reconcileOrders[orderIndex];
+      const venueOrderId = String(order.venue_order_id || "").trim();
+      if (!venueOrderId) continue;
+      seenVenue.add(venueOrderId);
 
-      if (!skipOrderDetailFetch && !activeVenueOrderIds.has(order.venue_order_id)) {
+      if (!skipOrderDetailFetch && !activeVenueOrderIds.has(venueOrderId)) {
+        orderByIdLookupsAttempted += 1;
+        const getOrderByIdStartedMs = Date.now();
         try {
-          const orderById = (await this.client.getOrderById(order.venue_order_id)) as Record<
+          const orderById = (await this.client.getOrderById(venueOrderId, { traceId })) as Record<
             string,
             unknown
           >;
+          orderByIdLookupsCompleted += 1;
+          logStage("getOrderById", getOrderByIdStartedMs, {
+            orderIndex: orderIndex + 1,
+            totalOrders: reconcileOrders.length,
+            venueOrderId,
+            cumulativeLookups: orderByIdLookupsCompleted,
+            cumulativeUniqueVenueOrders: seenVenue.size
+          });
           const status = normalizeOrderStatus(
             pickString(orderById, ["state", "status"]) || order.status
           );
           this.store.upsertOrder({
             client_order_id: order.client_order_id,
-            venue_order_id: order.venue_order_id,
+            venue_order_id: venueOrderId,
             bot_tag: order.bot_tag ?? null,
             symbol: order.symbol,
             side: order.side,
@@ -260,20 +426,60 @@ export class Reconciler {
         } catch (error) {
           if (error instanceof RevXDegradedError) {
             skipOrderDetailFetch = true;
+            logStage("getOrderById", getOrderByIdStartedMs, {
+              orderIndex: orderIndex + 1,
+              totalOrders: reconcileOrders.length,
+              venueOrderId,
+              cumulativeLookups: orderByIdLookupsCompleted,
+              cumulativeUniqueVenueOrders: seenVenue.size,
+              degraded: true
+            });
             this.logger.warn(
               { endpoint: error.endpoint, openUntilMs: error.openUntilMs },
               "RevX degraded; skipping order-by-id lookups this cycle"
             );
           } else {
-            this.logger.debug({ error, venueOrderId: order.venue_order_id }, "getOrderById failed");
+            logStage("getOrderById", getOrderByIdStartedMs, {
+              orderIndex: orderIndex + 1,
+              totalOrders: reconcileOrders.length,
+              venueOrderId,
+              cumulativeLookups: orderByIdLookupsCompleted,
+              cumulativeUniqueVenueOrders: seenVenue.size,
+              errored: true,
+              errorType: error instanceof Error ? error.name : typeof error
+            });
+            this.logger.debug({ error, venueOrderId }, "getOrderById failed");
           }
         }
       }
 
+      fillsLookupsAttempted += 1;
+      const getOrderFillsStartedMs = Date.now();
       try {
-        const fills = await this.client.getOrderFills(order.venue_order_id);
+        const fillsResult = await this.client.getOrderFills(venueOrderId, { traceId });
+        const fillsMetadata = fillsResult as RevXFill[] & {
+          endpointMissing404?: boolean;
+          disableFillsReconcile?: boolean;
+        };
+        if (fillsMetadata.endpointMissing404 || fillsMetadata.disableFillsReconcile) {
+          fillsSkippedOrders += 1;
+          fillsSkipEndpointMissing = fillsSkipEndpointMissing || fillsMetadata.endpointMissing404 === true;
+          fillsSkipDisabled = fillsSkipDisabled || fillsMetadata.disableFillsReconcile === true;
+          logStage("getOrderFills", getOrderFillsStartedMs, {
+            orderIndex: orderIndex + 1,
+            totalOrders: reconcileOrders.length,
+            venueOrderId,
+            skipped: true,
+            endpointMissing404: fillsMetadata.endpointMissing404 === true,
+            disableFillsReconcile: fillsMetadata.disableFillsReconcile === true
+          });
+          continue;
+        }
+        const fills = fillsResult;
+        cumulativeFetchedFills += fills.length;
+        let insertedFillsForOrder = 0;
         for (const rawFill of fills) {
-          const parsedFill = parseFill(rawFill as Record<string, unknown>, order.venue_order_id, now);
+          const parsedFill = parseFill(rawFill as Record<string, unknown>, venueOrderId, now);
           if (!parsedFill) continue;
 
           const midAtFill = this.resolveMidAtFill(order.symbol);
@@ -328,15 +534,148 @@ export class Reconciler {
               reason: `trade ${fill.trade_id}`,
               bot_tag: order.bot_tag ?? "-"
             });
+            this.logger.info(
+              {
+                event: "FILL",
+                source: "venue",
+                symbol: order.symbol,
+                side: order.side,
+                venueOrderId: fill.venue_order_id,
+                clientOrderId: order.client_order_id,
+                tradeId: fill.trade_id,
+                price: fill.price,
+                qty: fill.qty,
+                ts: fill.ts,
+                traceId
+              },
+              `REVX_FILL side=${order.side} symbol=${order.symbol} price=${fill.price.toFixed(2)} size=${fill.qty.toFixed(8)} venueOrderId=${fill.venue_order_id} clientOrderId=${order.client_order_id}`
+            );
+            this.logger.info(
+              {
+                event: "ORDER",
+                action: "FILLED",
+                source: "venue",
+                symbol: order.symbol,
+                side: order.side,
+                price: fill.price,
+                qty: fill.qty,
+                venueOrderId: fill.venue_order_id,
+                clientOrderId: order.client_order_id,
+                tradeId: fill.trade_id,
+                ts: fill.ts,
+                traceId
+              },
+              `REVX_ORDER action=FILLED side=${order.side} symbol=${order.symbol} price=${fill.price.toFixed(2)} size=${fill.qty.toFixed(8)} venueOrderId=${fill.venue_order_id} clientOrderId=${order.client_order_id}`
+            );
+            insertedFillsForOrder += 1;
           }
         }
+        logStage("getOrderFills", getOrderFillsStartedMs, {
+          orderIndex: orderIndex + 1,
+          totalOrders: reconcileOrders.length,
+          venueOrderId,
+          fillsCount: fills.length,
+          insertedFills: insertedFillsForOrder,
+          cumulativeFetchedFills,
+          cumulativeInsertedFills: newFills.length,
+          cumulativeUniqueVenueOrders: seenVenue.size
+        });
       } catch (error) {
-        this.logger.debug({ error, venueOrderId: order.venue_order_id }, "getOrderFills failed");
+        let errorStatus: number | undefined;
+        let errorCode: string | undefined;
+        let errorMessage = error instanceof Error ? error.message : String(error);
+        if (error instanceof RevXHttpError) {
+          errorStatus = error.status;
+          if (error.responseBody && typeof error.responseBody === "object") {
+            const responseBody = error.responseBody as Record<string, unknown>;
+            const codeCandidate =
+              responseBody.code ?? responseBody.error_code ?? responseBody.errorCode ?? responseBody.type;
+            if (codeCandidate !== undefined && codeCandidate !== null) {
+              errorCode = String(codeCandidate);
+            }
+            const messageCandidate = responseBody.message ?? responseBody.error ?? responseBody.detail;
+            if (typeof messageCandidate === "string" && messageCandidate.trim().length > 0) {
+              errorMessage = messageCandidate.trim();
+            }
+          }
+        }
+        const endpointMissing404 =
+          (errorStatus === 404 || errorStatus === 410) &&
+          isEndpointMissingErrorMessage(errorMessage);
+        getOrderFillsErrorCount += 1;
+        logStage("getOrderFills", getOrderFillsStartedMs, {
+          orderIndex: orderIndex + 1,
+          totalOrders: reconcileOrders.length,
+          venueOrderId,
+          cumulativeFetchedFills,
+          cumulativeInsertedFills: newFills.length,
+          cumulativeUniqueVenueOrders: seenVenue.size,
+          errored: true,
+          errorType: error instanceof Error ? error.name : typeof error,
+          errorStatus,
+          errorCode,
+          errorMessage,
+          errorCount: getOrderFillsErrorCount,
+          endpointMissing404
+        });
+        this.logger.warn(
+          {
+            reconcileId,
+            venueOrderId,
+            status: errorStatus,
+            code: errorCode,
+            message: errorMessage,
+            errorCount: getOrderFillsErrorCount,
+            endpointMissing404
+          },
+          "getOrderFills failed"
+        );
+        if (endpointMissing404) {
+          this.logger.warn(
+            { reconcileId, venueOrderId, status: errorStatus, message: errorMessage },
+            "Skipping terminal mark for endpoint-missing getOrderFills 404"
+          );
+        } else if (errorStatus === 404 || errorStatus === 410) {
+          this.markOrderTerminal(order, "FAILED", now);
+          this.orderStatusMisses.delete(venueOrderId);
+          this.logger.info(
+            { reconcileId, venueOrderId, status: errorStatus },
+            "Order marked terminal after getOrderFills 404/410"
+          );
+        }
+        if (getOrderFillsErrorCount >= maxGetOrderFillsErrors) {
+          stoppedByGetOrderFillsErrorLimit = true;
+          this.logger.warn(
+            {
+              reconcileId,
+              errorCount: getOrderFillsErrorCount,
+              maxErrors: maxGetOrderFillsErrors,
+              processedOrders: orderIndex + 1,
+              totalOrders: reconcileOrders.length
+            },
+            "Stopping reconcile order loop after getOrderFills error limit"
+          );
+          break;
+        }
       }
     }
 
     for (const entry of newFills) {
       this.pnlEstimator.apply(entry);
+    }
+    if (fillsSkippedOrders > 0) {
+      const payload = {
+        reconcileId,
+        skippedOrders: fillsSkippedOrders,
+        endpointMissing404: fillsSkipEndpointMissing,
+        disableFillsReconcile: fillsSkipDisabled
+      };
+      if (!this.fillsReconcileSkipWarned) {
+        this.fillsReconcileSkipWarned = true;
+        this.logger.warn(payload, "Fills reconciliation skipped for this cycle");
+      } else {
+        this.logger.debug(payload, "Fills reconciliation skipped for this cycle");
+      }
     }
 
     const latestBalances = this.store.getLatestBalances();
@@ -442,6 +781,27 @@ export class Reconciler {
       pendingPruned: reconcileStats.pendingPruned,
       dupesRemoved: reconcileStats.dupesRemoved
     });
+    logStage("reconcileOnce_total", reconcileStartedMs, {
+      openOrdersCount: activeOrders.length,
+      recentBotOrdersCount: recentBotOrders.length,
+      selectedOrdersCount: reconcileOrders.length,
+      uniqueVenueOrdersConsidered: seenVenue.size,
+      orderByIdLookupsAttempted,
+      orderByIdLookupsCompleted,
+      fillsLookupsAttempted,
+      fillsSkippedOrders,
+      fillsSkipEndpointMissing,
+      fillsSkipDisabled,
+      getOrderFillsErrorCount,
+      stoppedByGetOrderFillsErrorLimit,
+      cumulativeFetchedFills,
+      newFillsCount: newFills.length
+    });
+    } finally {
+      this.runningReconcileOnce = false;
+      this.runningReconcileOnceStartedTs = 0;
+      this.runningReconcileOnceId = "";
+    }
   }
 
   private async runScheduledReconcile(): Promise<void> {
@@ -571,11 +931,12 @@ export class Reconciler {
   }
 
   private async refreshBalances(
-    trigger: "startup" | "reconcile" | "manual" | "insufficient_balance"
+    trigger: "startup" | "reconcile" | "manual" | "insufficient_balance",
+    traceId?: string
   ): Promise<void> {
     const fetchTs = Date.now();
     try {
-      const balancesRaw = await this.client.getBalances();
+      const balancesRaw = await this.client.getBalances({ traceId });
       const parsedBalances: ParsedBalancesPayload = parseBalancesPayload(balancesRaw, fetchTs);
       BalanceState.markFetchSuccess({
         normalizedBalances: parsedBalances.snapshots,
@@ -613,6 +974,136 @@ export class Reconciler {
       const btc = findAsset(parsedBalances.snapshots, ["BTC", "XBT"]);
       const usdTotal = usd?.total ?? 0;
       const btcTotal = btc?.total ?? 0;
+      const fillsMode = this.client.getFillsReconcileMode();
+      if (fillsMode.disableFillsReconcile && !this.fillsReconcileDisabledUsingBalanceDeltaLogged) {
+        this.fillsReconcileDisabledUsingBalanceDeltaLogged = true;
+        this.logger.warn(
+          {
+            fillsEndpoint: fillsMode.fillsEndpoint ?? "NONE",
+            fillsReconcile: fillsMode.fillsReconcile
+          },
+          "fills_reconcile_disabled_using_balance_delta"
+        );
+      }
+      if (fillsMode.disableFillsReconcile && this.lastBalanceTotals) {
+        const deltaUsd = usdTotal - this.lastBalanceTotals.usdTotal;
+        const deltaBtc = btcTotal - this.lastBalanceTotals.btcTotal;
+        const usdEpsilon = 0.25;
+        const btcEpsilon = 0.000001;
+        if (Math.abs(deltaUsd) > usdEpsilon && Math.abs(deltaBtc) > btcEpsilon) {
+          const side: Side = deltaBtc > 0 ? "BUY" : "SELL";
+          const sizeBtc = Math.abs(deltaBtc);
+          const inferredPrice = Math.abs(deltaUsd / deltaBtc);
+          if (Number.isFinite(inferredPrice) && inferredPrice > 0) {
+            this.inferredFillSeq += 1;
+            const inferredClientOrderId = `inferred:${fetchTs}:${this.inferredFillSeq}`;
+            const inferredVenueOrderId = "inferred-balance-delta";
+            const inferredFill: FillRecord = {
+              venue_order_id: inferredVenueOrderId,
+              trade_id: `inferred:${fetchTs}:${this.inferredFillSeq}`,
+              qty: sizeBtc,
+              price: inferredPrice,
+              fee: 0,
+              mid_at_fill: inferredPrice,
+              edge_bps: null,
+              ts: fetchTs
+            };
+            const inserted = this.store.upsertFill(inferredFill);
+            if (inserted) {
+              this.store.recordBotEvent({
+                event_id: `${inferredFill.venue_order_id}:${inferredFill.trade_id}`,
+                ts: fetchTs,
+                type: "FILLED",
+                side,
+                price: inferredPrice,
+                quote_size_usd: Math.abs(deltaUsd),
+                venue_order_id: null,
+                client_order_id: inferredClientOrderId,
+                reason: "INFERRED_BALANCE_DELTA",
+                bot_tag: "INFERRED_FILL",
+                details_json: JSON.stringify({
+                  source: "inferred",
+                  symbol: this.config.symbol,
+                  side,
+                  sizeBTC: sizeBtc,
+                  deltaUSD: deltaUsd,
+                  deltaBTC: deltaBtc
+                })
+              });
+              this.performanceEngine?.recordFill({
+                ts: fetchTs,
+                symbol: this.config.symbol,
+                side,
+                price: inferredPrice,
+                baseQty: sizeBtc,
+                feeUsd: 0,
+                venueOrderId: inferredVenueOrderId,
+                clientOrderId: inferredClientOrderId,
+                revxMidAtFill: inferredPrice,
+                posture: "INFERRED",
+                source: "inferred",
+                sourceJson: JSON.stringify({
+                  source: "inferred",
+                  symbol: this.config.symbol,
+                  side,
+                  sizeBTC: sizeBtc,
+                  deltaUSD: deltaUsd,
+                  deltaBTC: deltaBtc,
+                  venueOrderId: inferredVenueOrderId,
+                  clientOrderId: inferredClientOrderId
+                })
+              });
+              this.logger.info(
+                {
+                  ts: fetchTs,
+                  symbol: this.config.symbol,
+                  side,
+                  sizeBTC: Number(sizeBtc.toFixed(8)),
+                  price: Number(inferredPrice.toFixed(2)),
+                  deltaUSD: Number(deltaUsd.toFixed(2)),
+                  deltaBTC: Number(deltaBtc.toFixed(8)),
+                  venueOrderId: inferredVenueOrderId,
+                  clientOrderId: inferredClientOrderId,
+                  source: "inferred"
+                },
+                "inferred_fill_detected"
+              );
+              this.logger.info(
+                {
+                  event: "FILL",
+                  source: "inferred",
+                  symbol: this.config.symbol,
+                  side,
+                  venueOrderId: inferredVenueOrderId,
+                  clientOrderId: inferredClientOrderId,
+                  tradeId: inferredFill.trade_id,
+                  price: inferredPrice,
+                  qty: sizeBtc,
+                  ts: fetchTs
+                },
+                `REVX_FILL side=${side} symbol=${this.config.symbol} price=${inferredPrice.toFixed(2)} size=${sizeBtc.toFixed(8)} venueOrderId=${inferredVenueOrderId} clientOrderId=${inferredClientOrderId}`
+              );
+              this.logger.info(
+                {
+                  event: "ORDER",
+                  action: "FILLED",
+                  source: "inferred",
+                  symbol: this.config.symbol,
+                  side,
+                  venueOrderId: inferredVenueOrderId,
+                  clientOrderId: inferredClientOrderId,
+                  tradeId: inferredFill.trade_id,
+                  price: inferredPrice,
+                  qty: sizeBtc,
+                  ts: fetchTs
+                },
+                `REVX_ORDER action=FILLED side=${side} symbol=${this.config.symbol} price=${inferredPrice.toFixed(2)} size=${sizeBtc.toFixed(8)} venueOrderId=${inferredVenueOrderId} clientOrderId=${inferredClientOrderId}`
+              );
+            }
+          }
+        }
+      }
+      this.lastBalanceTotals = { usdTotal, btcTotal, ts: fetchTs };
       this.logger.info(
         {
           trigger,
@@ -940,4 +1431,9 @@ function pickTimestamp(obj: Record<string, unknown>, keys: string[], fallback: n
     }
   }
   return fallback;
+}
+
+function isEndpointMissingErrorMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("endpoint get") && normalized.includes("not found");
 }

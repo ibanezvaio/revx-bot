@@ -45,6 +45,7 @@ export type BtcWindowMarket = {
   tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
   negRisk?: boolean;
   acceptingOrders: boolean;
+  active?: boolean;
   enableOrderBook?: boolean;
   closed?: boolean;
   eventSlug?: string;
@@ -208,6 +209,7 @@ export type DecisionLogLine = {
   netEdgeAfterCosts?: number;
   threshold: number;
   action: string;
+  holdReason?: string;
   size: number;
   mode: PolymarketConfig["mode"];
   openTrades?: number;

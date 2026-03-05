@@ -99,6 +99,7 @@ npm run test:signals-scorer     # in-process signals scorer tests
 npm run test:signals-aggregate  # in-process signals aggregate/state tests
 npm run test:signals-guard      # in-process signals guard tests
 npm run test:performance-analysis # FIFO/edge/tox performance analytics tests
+npm run test:inferred-trades-endpoint # inferred-fill -> /api/analysis/fills integration check
 npm run analysis-smoke           # sample fills/snapshots performance summary smoke script
 node dist/cli.js tune            # print spread tuning suggestion from last hour
 node dist/cli.js tune --apply    # apply BASE_HALF_SPREAD_BPS suggestion to .env
@@ -254,6 +255,8 @@ Dashboard:
   - `/api/polymarket/summary`
   - `/api/polymarket/trades?limit=200`
   - `/api/polymarket/equity`
+  - `/api/status/truth` (canonical in-memory REVX + POLY truth state)
+  - `/api/status/health` (venue-call timestamps + recent HTTP/guard errors)
 
 Optional connectivity integration check (no live orders submitted):
 
@@ -276,6 +279,8 @@ The dashboard now supports runtime overrides (per symbol) with validation and ha
   - `POST /api/overrides/reset-defaults` (same as clear)
 - Status:
   - `/api/status` includes `overrides` and `effectiveConfig`
+  - `/api/status/truth` exposes the canonical TRUTH payload used by runtime logging
+  - `/api/status/health` exposes last successful REVX/POLY venue calls and key timestamps
 - Audit trail:
   - override changes are emitted as `OVERRIDE` events in recent events
 
@@ -306,8 +311,17 @@ Runtime path verification:
 - `curl -s http://127.0.0.1:8787/api/debug/signals | jq .`
 - `curl -s "http://127.0.0.1:8787/api/analysis/summary?window=1h" | jq .`
 - `curl -s "http://127.0.0.1:8787/api/analysis/fills?window=24h&limit=50" | jq .`
+- `curl -s "http://127.0.0.1:8787/api/analysis/fills?window=24h&limit=50&includeInferred=true&symbol=BTC-USD" | jq .`
 - `curl -s "http://127.0.0.1:8787/api/analysis/equity_curve?window=24h" | jq .`
 - `curl -s http://127.0.0.1:8787/api/adaptive/status | jq .`
+- `curl -s "http://127.0.0.1:8787/api/debug/trades?window=24h&limit=50&symbol=BTC-USD&includeInferred=true" | jq .`
+
+### How trades appear in UI when fills endpoints are missing
+
+If RevX fills endpoints are unavailable (404), the reconciler infers fills from balance deltas and records them with `source="inferred"`.
+Those inferred fills are persisted into the same performance storage read by `/api/analysis/fills`, so the Performance page trades/fills table still populates.
+
+Use `includeInferred=false` to hide inferred fills temporarily while debugging endpoint behavior.
 
 Operational reference:
 - `RUNBOOK.md` (state interpretation + troubleshooting flow)
@@ -321,6 +335,22 @@ Core:
 - `REVX_PRIVATE_KEY_BASE64` or `REVX_PRIVATE_KEY_PATH`
 - `REVX_BASE_URL` (default `https://revx.revolut.com`)
 - `SYMBOL` (default `BTC-USD`)
+
+Logging + observability:
+- `LOG_LEVEL=debug|info|warn|error`
+- `LOG_MODULES=revx,polymarket,recon,web` (optional module filter)
+- `TRUTH_INTERVAL_MS=10000` (canonical TRUTH log interval; transitions emit immediately)
+- `DEBUG=1` (show all logs on stdout; default non-event logs stay in `logs/verbose.log`)
+- `DEBUG_RECON=1` (show reconcile stage timing logs on stdout)
+- `DEBUG_POLY=1` (show verbose polymarket diagnostics on stdout)
+- `DEBUG_HTTP=true` (structured per-request HTTP logs + `/api/debug/http-errors`)
+- `STRICT_SANITY_CHECK=true` (fail startup if Polymarket sanity probes fail)
+- `DISABLE_FILLS_RECONCILE=true` (force disable RevX fills reconciliation)
+
+Polymarket base URLs (hard-separated from RevX):
+- `POLY_GAMMA_BASE_URL` (preferred, alias: `POLYMARKET_GAMMA_BASE_URL`)
+- `POLY_DATA_BASE_URL` (preferred, alias: `POLYMARKET_DATA_BASE_URL`)
+- `POLY_CLOB_BASE_URL` (preferred, alias: `POLYMARKET_CLOB_BASE_URL`)
 
 Capital envelope:
 - `CASH_RESERVE_USD=40` (recommended for small accounts)

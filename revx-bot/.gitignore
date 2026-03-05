@@ -23,3 +23,5 @@ data/
 # Runtime logs
 logs/
 *.jsonl
+# Polymarket runtime logs
+logs/

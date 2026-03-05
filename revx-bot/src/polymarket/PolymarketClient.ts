@@ -2,6 +2,12 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fetch } from "undici";
 import { BotConfig } from "../config";
+import {
+  assertServiceBaseUrl,
+  beginHttpRequestTrace,
+  HttpService
+} from "../http/endpointGuard";
+import { registerVenueServiceHosts } from "../http/venueGuard";
 import { Logger } from "../logger";
 import {
   createPolymarketClobClient,
@@ -93,9 +99,18 @@ export type PolymarketWhoAmI = {
   apiCredsSource: CredsSource | "none";
 };
 
+export type PolymarketIngestionTelemetry = {
+  lastFetchAttemptTs: number;
+  lastFetchOkTs: number;
+  lastFetchErr: string | null;
+  lastHttpStatus: number;
+};
+
 export class PolymarketClient {
   private readonly gammaBaseUrl: string;
+  private readonly dataBaseUrl: string;
   private readonly clobBaseUrl: string;
+  private readonly bridgeBaseUrl: string;
   private readonly credsCachePath: string;
   private readonly requestScheduler: RequestScheduler;
   private readonly tickSizeCache = new Map<string, TickSize>();
@@ -105,6 +120,12 @@ export class PolymarketClient {
   private readonly circuitFailureThreshold = 5;
   private readonly circuitBaseOpenMs = 10_000;
   private readonly circuitMaxOpenMs = 60_000;
+  private ingestionTelemetry: PolymarketIngestionTelemetry = {
+    lastFetchAttemptTs: 0,
+    lastFetchOkTs: 0,
+    lastFetchErr: null,
+    lastHttpStatus: 0
+  };
 
   private clobModule: any | null = null;
   private publicClient: any | null = null;
@@ -113,7 +134,21 @@ export class PolymarketClient {
 
   constructor(private readonly config: BotConfig, private readonly logger: Logger) {
     this.gammaBaseUrl = config.polymarket.baseUrls.gamma.replace(/\/+$/, "");
+    this.dataBaseUrl = config.polymarket.baseUrls.data.replace(/\/+$/, "");
     this.clobBaseUrl = config.polymarket.baseUrls.clob.replace(/\/+$/, "");
+    this.bridgeBaseUrl = config.polymarket.baseUrls.bridge.replace(/\/+$/, "");
+    registerVenueServiceHosts("POLY_GAMMA", [this.gammaBaseUrl, "https://gamma-api.polymarket.com"]);
+    registerVenueServiceHosts("POLY_DATA", [this.dataBaseUrl, "https://data-api.polymarket.com"]);
+    registerVenueServiceHosts("POLY_CLOB", [
+      this.clobBaseUrl,
+      this.bridgeBaseUrl,
+      "https://clob.polymarket.com",
+      "https://bridge.polymarket.com"
+    ]);
+    assertServiceBaseUrl("POLY_GAMMA", this.gammaBaseUrl);
+    assertServiceBaseUrl("POLY_DATA", this.dataBaseUrl);
+    assertServiceBaseUrl("POLY_CLOB", this.clobBaseUrl);
+    assertServiceBaseUrl("POLY_CLOB", this.bridgeBaseUrl);
     this.credsCachePath = path.resolve(process.cwd(), ".polymarket-creds.json");
     this.requestScheduler = new RequestScheduler(
       Math.max(10, Math.floor(60_000 / Math.max(1, config.polymarket.http.requestsPerMinute)))
@@ -169,6 +204,34 @@ export class PolymarketClient {
     };
   }
 
+  async runStartupSanityCheck(strict: boolean): Promise<{
+    gamma: { ok: boolean; status: number | null; path: string; error?: string };
+    clob: { ok: boolean; status: number | null; path: string; error?: string };
+  }> {
+    const gamma = await this.probePublicEndpoint("POLY_GAMMA", this.gammaBaseUrl, ["/time", "/"]);
+    const clob = await this.probePublicEndpoint("POLY_CLOB", this.clobBaseUrl, ["/ok", "/"]);
+    const payload = {
+      strict,
+      baseUrls: {
+        gamma: this.gammaBaseUrl,
+        data: this.dataBaseUrl,
+        clob: this.clobBaseUrl,
+        bridge: this.bridgeBaseUrl
+      },
+      results: { gamma, clob }
+    };
+    if (!gamma.ok || !clob.ok) {
+      if (strict) {
+        this.logger.error(payload, "Polymarket startup sanity check failed (strict)");
+        throw new Error("Polymarket startup sanity check failed");
+      }
+      this.logger.warn(payload, "Polymarket startup sanity check failed (non-blocking)");
+    } else {
+      this.logger.info(payload, "Polymarket startup sanity check passed");
+    }
+    return { gamma, clob };
+  }
+
   async whoAmI(): Promise<PolymarketWhoAmI> {
     const signerCtx = await this.requireSignerContext();
     let apiKeyPrefix = "";
@@ -202,6 +265,22 @@ export class PolymarketClient {
       hasApiCreds: apiKeyPrefix.length > 0 && apiKeyPrefix !== "<derive-on-demand>",
       apiCredsSource: source
     };
+  }
+
+  getIngestionTelemetry(): PolymarketIngestionTelemetry {
+    return {
+      lastFetchAttemptTs: this.ingestionTelemetry.lastFetchAttemptTs,
+      lastFetchOkTs: this.ingestionTelemetry.lastFetchOkTs,
+      lastFetchErr: this.ingestionTelemetry.lastFetchErr,
+      lastHttpStatus: this.ingestionTelemetry.lastHttpStatus
+    };
+  }
+
+  recordFetchDisabled(reason: string): void {
+    const normalizedReason = String(reason || "").trim() || "config_disabled";
+    this.markIngestionAttempt();
+    this.ingestionTelemetry.lastFetchErr = `FETCH_DISABLED:${truncate(normalizedReason, 240)}`;
+    this.ingestionTelemetry.lastHttpStatus = 0;
   }
 
   async deriveCreds(options?: {
@@ -259,9 +338,15 @@ export class PolymarketClient {
 
   async listMarkets(limit: number): Promise<RawPolymarketMarket[]> {
     const query = this.config.polymarket.marketQuery;
+    const searchTokens = Array.isArray(query.search)
+      ? query.search
+      : String((query.search as unknown) || "").split(",");
+    const search = searchTokens
+      .map((row) => String(row || "").trim())
+      .find((row) => row.length > 0);
     const page = await this.listMarketsPage({
       limit,
-      search: query.search,
+      search,
       active: true,
       closed: false,
       archived: false
@@ -272,6 +357,8 @@ export class PolymarketClient {
   async listEventsPage(input: {
     limit: number;
     slug?: string;
+    search?: string;
+    query?: string;
     cursor?: string;
     offset?: number;
     page?: number;
@@ -283,6 +370,12 @@ export class PolymarketClient {
     });
     if (input.slug && input.slug.trim().length > 0) {
       params.set("slug", input.slug.trim());
+    }
+    if (input.search && input.search.trim().length > 0) {
+      params.set("search", input.search.trim());
+    }
+    if (input.query && input.query.trim().length > 0) {
+      params.set("query", input.query.trim());
     }
     if (typeof input.active === "boolean") {
       params.set("active", String(input.active));
@@ -363,6 +456,7 @@ export class PolymarketClient {
   async listMarketsPage(input: {
     limit: number;
     search?: string;
+    query?: string;
     cursor?: string;
     offset?: number;
     page?: number;
@@ -385,6 +479,9 @@ export class PolymarketClient {
     if (input.search && input.search.trim().length > 0) {
       params.set("search", input.search.trim());
     }
+    if (input.query && input.query.trim().length > 0) {
+      params.set("query", input.query.trim());
+    }
     if (input.cursor && input.cursor.trim().length > 0) {
       const cursor = input.cursor.trim();
       // Gamma has used different cursor key names across versions.
@@ -406,6 +503,9 @@ export class PolymarketClient {
     maxScan: number;
     pageSize: number;
     search?: string;
+    active?: boolean;
+    closed?: boolean;
+    archived?: boolean;
     onPage?: (rows: RawPolymarketMarket[], state: { pages: number; fetchedTotal: number }) => boolean | Promise<boolean>;
   }): Promise<PaginatedMarketScanResult> {
     const maxScan = Math.max(1, Math.floor(input.maxScan));
@@ -424,6 +524,9 @@ export class PolymarketClient {
       const page = await this.listMarketsPage({
         limit,
         search: input.search,
+        active: input.active,
+        closed: input.closed,
+        archived: input.archived,
         cursor,
         offset: offsetMode ? offset : undefined,
         page: offsetMode ? pages + 1 : undefined
@@ -481,7 +584,10 @@ export class PolymarketClient {
       while (limit <= maxScan) {
         const page = await this.listMarketsPage({
           limit,
-          search: input.search
+          search: input.search,
+          active: input.active,
+          closed: input.closed,
+          archived: input.archived
         });
         pages += 1;
         const addedRows: RawPolymarketMarket[] = [];
@@ -553,20 +659,29 @@ export class PolymarketClient {
 
   async getTokenOrderBook(tokenId: string): Promise<TokenOrderBook> {
     validateTokenId(tokenId);
+    try {
+      const payload = await this.requestJson(
+        "GET",
+        this.clobBaseUrl,
+        `/book?token_id=${encodeURIComponent(tokenId)}`
+      );
+      const parsed = this.parseOrderBookPayload(payload, tokenId);
+      if (parsed.bids.length > 0 || parsed.asks.length > 0) {
+        return parsed;
+      }
+    } catch (error) {
+      this.logger.debug(
+        {
+          tokenId,
+          error: serializeError(error)
+        },
+        "Polymarket CLOB /book fetch failed; falling back to SDK"
+      );
+    }
+
     const client = await this.getPublicClient();
     const book = await this.runClobCall("getOrderBook", async () => client.getOrderBook(tokenId));
-    const obj = book && typeof book === "object" ? (book as Record<string, unknown>) : {};
-
-    const bids = this.parseLevels(obj.bids, "bids");
-    const asks = this.parseLevels(obj.asks, "asks");
-    return {
-      tokenId,
-      bestBid: bids.length > 0 ? bids[0].price : 0,
-      bestAsk: asks.length > 0 ? asks[0].price : 1,
-      bids,
-      asks,
-      ts: Date.now()
-    };
+    return this.parseOrderBookPayload(book, tokenId);
   }
 
   async placeMarketableBuyYes(params: {
@@ -700,6 +815,16 @@ export class PolymarketClient {
 
   private async runClobCall<T>(label: string, fn: () => Promise<T>): Promise<T> {
     this.throwIfCircuitOpen(label);
+    this.markIngestionAttempt();
+    const trace = beginHttpRequestTrace({
+      logger: this.logger,
+      service: "POLY_CLOB",
+      baseUrl: this.clobBaseUrl,
+      method: "SDK",
+      path: `/${label}`,
+      debugHttp: this.config.debugHttp,
+      module: "polymarket"
+    });
     try {
       const result = await withRetry(
         () =>
@@ -730,9 +855,13 @@ export class PolymarketClient {
         }
       );
       this.markNetworkSuccess();
+      this.markIngestionSuccess(200);
+      trace.done(200, null);
       return result;
     } catch (error) {
       this.markNetworkFailure(label, error);
+      this.markIngestionFailure(error, extractStatus(error) ?? 0);
+      trace.fail(error, extractStatus(error), null);
       this.logger.error({ label, error: serializeError(error) }, "Polymarket CLOB call failed after retries");
       throw error;
     }
@@ -942,6 +1071,91 @@ export class PolymarketClient {
       .sort((a, b) => (side === "bids" ? b.price - a.price : a.price - b.price));
   }
 
+  private parseOrderBookPayload(payload: unknown, tokenId: string): TokenOrderBook {
+    const root = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+    const obj =
+      root.book && typeof root.book === "object"
+        ? (root.book as Record<string, unknown>)
+        : root.data && typeof root.data === "object"
+          ? (root.data as Record<string, unknown>)
+          : root;
+    const bids = this.parseLevels(obj.bids, "bids");
+    const asks = this.parseLevels(obj.asks, "asks");
+    return {
+      tokenId,
+      bestBid: bids.length > 0 ? bids[0].price : 0,
+      bestAsk: asks.length > 0 ? asks[0].price : 1,
+      bids,
+      asks,
+      ts: Date.now()
+    };
+  }
+
+  private serviceForBaseUrl(baseUrl: string): HttpService {
+    const normalized = baseUrl.replace(/\/+$/, "");
+    if (normalized === this.gammaBaseUrl) return "POLY_GAMMA";
+    if (normalized === this.dataBaseUrl) return "POLY_DATA";
+    return "POLY_CLOB";
+  }
+
+  private async probePublicEndpoint(
+    service: HttpService,
+    baseUrl: string,
+    pathCandidates: string[]
+  ): Promise<{ ok: boolean; status: number | null; path: string; error?: string }> {
+    for (const path of pathCandidates) {
+      const requestPath = path.startsWith("/") ? path : `/${path}`;
+      const url = `${baseUrl}${requestPath}`;
+      this.markIngestionAttempt();
+      const trace = beginHttpRequestTrace({
+        logger: this.logger,
+        service,
+        baseUrl,
+        method: "GET",
+        path: requestPath,
+        debugHttp: this.config.debugHttp,
+        module: "polymarket"
+      });
+      try {
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(() => {
+          controller.abort();
+        }, Math.max(500, this.config.polymarket.http.timeoutMs));
+        try {
+          const response = await fetch(url, {
+            method: "GET",
+            signal: controller.signal
+          });
+          trace.done(response.status, response.headers);
+          if (response.status >= 200 && response.status < 400) {
+            this.markIngestionSuccess(response.status);
+          } else {
+            this.markIngestionFailure(new Error(`HTTP ${response.status}`), response.status);
+          }
+          if (response.status >= 200 && response.status < 400) {
+            return { ok: true, status: response.status, path: requestPath };
+          }
+          if (response.status >= 300 && response.status < 500) {
+            continue;
+          }
+          return { ok: false, status: response.status, path: requestPath };
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
+      } catch (error) {
+        this.markIngestionFailure(error);
+        trace.fail(error);
+        continue;
+      }
+    }
+    return {
+      ok: false,
+      status: null,
+      path: pathCandidates[0] || "/",
+      error: "No reachable endpoint"
+    };
+  }
+
   private async requestJson(
     method: HttpMethod,
     baseUrl: string,
@@ -949,7 +1163,9 @@ export class PolymarketClient {
     body?: unknown
   ): Promise<unknown> {
     const url = `${baseUrl}${path}`;
+    const service = this.serviceForBaseUrl(baseUrl);
     this.throwIfCircuitOpen(`${method} ${path}`);
+    this.markIngestionAttempt();
 
     try {
       const result = await withRetry(
@@ -967,13 +1183,27 @@ export class PolymarketClient {
             const timeoutHandle = setTimeout(() => {
               controller.abort();
             }, this.config.polymarket.http.timeoutMs);
+            const trace = beginHttpRequestTrace({
+              logger: this.logger,
+              service,
+              baseUrl,
+              method,
+              path,
+              debugHttp: this.config.debugHttp,
+              module: "polymarket"
+            });
             try {
-              return await fetch(url, {
+              const response = await fetch(url, {
                 method,
                 headers,
                 body: body === undefined ? undefined : JSON.stringify(body),
                 signal: controller.signal
               });
+              trace.done(response.status, response.headers);
+              return response;
+            } catch (error) {
+              trace.fail(error);
+              throw error;
             } finally {
               clearTimeout(timeoutHandle);
             }
@@ -981,9 +1211,11 @@ export class PolymarketClient {
 
           const raw = await response.text();
           if (!response.ok) {
+            this.markIngestionFailure(new Error(`HTTP ${response.status}`), response.status);
             throw makeHttpError(method, url, response.status, raw);
           }
 
+          this.markIngestionSuccess(response.status);
           if (!raw) return {};
           return JSON.parse(raw) as unknown;
         },
@@ -1011,6 +1243,7 @@ export class PolymarketClient {
       return result;
     } catch (error) {
       this.markNetworkFailure(`${method} ${path}`, error);
+      this.markIngestionFailure(error);
       this.logger.error(
         {
           method,
@@ -1061,6 +1294,36 @@ export class PolymarketClient {
       },
       "Polymarket network circuit breaker open"
     );
+  }
+
+  private markIngestionAttempt(): void {
+    this.ingestionTelemetry.lastFetchAttemptTs = Date.now();
+  }
+
+  private markIngestionSuccess(status: number): void {
+    this.ingestionTelemetry.lastFetchOkTs = Date.now();
+    this.ingestionTelemetry.lastFetchErr = null;
+    this.ingestionTelemetry.lastHttpStatus = Number.isFinite(Number(status))
+      ? Math.max(0, Math.floor(Number(status)))
+      : 0;
+  }
+
+  private markIngestionFailure(error: unknown, status?: number): void {
+    const details = serializeError(error);
+    const message = String(details.message || "").trim();
+    this.ingestionTelemetry.lastFetchErr = message.length > 0 ? truncate(message, 300) : "unknown_error";
+    if (Number.isFinite(Number(status))) {
+      this.ingestionTelemetry.lastHttpStatus = Math.max(0, Math.floor(Number(status)));
+      return;
+    }
+    if (error && typeof error === "object" && "status" in error) {
+      const fromError = Number((error as { status?: unknown }).status);
+      if (Number.isFinite(fromError)) {
+        this.ingestionTelemetry.lastHttpStatus = Math.max(0, Math.floor(fromError));
+        return;
+      }
+    }
+    this.ingestionTelemetry.lastHttpStatus = 0;
   }
 }
 

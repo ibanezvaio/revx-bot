@@ -28,6 +28,7 @@ type RecordFillInput = {
   clientOrderId: string;
   revxMidAtFill: number;
   posture?: string;
+  source?: "venue" | "inferred";
   sourceJson?: string;
 };
 
@@ -118,7 +119,7 @@ export class PerformanceEngine {
         Number.isFinite(input.revxMidAtFill) && input.revxMidAtFill > 0
           ? input.revxMidAtFill
           : price,
-      source_json: String(input.sourceJson || "{}")
+      source_json: this.normalizeSourceJson(input.source, input.sourceJson)
     };
     this.storage.recordFill(persisted);
   }
@@ -149,12 +150,19 @@ export class PerformanceEngine {
     return result.summary;
   }
 
-  getFills(window: AnalysisWindowKey, limit: number): FillAnalysisRow[] {
+  getFills(
+    window: AnalysisWindowKey,
+    limit: number,
+    options?: { symbol?: string; includeInferred?: boolean }
+  ): FillAnalysisRow[] {
     const now = Date.now();
+    const symbol = String(options?.symbol || this.config.symbol).toUpperCase();
+    const includeInferred = options?.includeInferred !== false;
     const windowMs = window === "1h" ? 60 * 60 * 1000 : window === "24h" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
-    const fills = this.storage.getFillsSince(this.config.symbol, now - windowMs - 6 * 60 * 60 * 1000);
-    const mids = this.storage.getMidSnapshotsSince(this.config.symbol, now - windowMs - 10 * 60 * 1000);
-    const latestMid = this.resolveLatestMid();
+    const fillsRaw = this.storage.getFillsSince(symbol, now - windowMs - 6 * 60 * 60 * 1000);
+    const fills = includeInferred ? fillsRaw : fillsRaw.filter((row) => this.resolveFillSource(row) !== "inferred");
+    const mids = this.storage.getMidSnapshotsSince(symbol, now - windowMs - 10 * 60 * 1000);
+    const latestMid = this.resolveLatestMid(symbol);
     const result = analyzeFillsWindow({
       fills,
       mids,
@@ -163,6 +171,48 @@ export class PerformanceEngine {
       window
     });
     return result.rows.sort((a, b) => b.ts - a.ts).slice(0, Math.max(1, Math.floor(limit || 100)));
+  }
+
+  getFillsDebug(params: {
+    window: AnalysisWindowKey;
+    limit: number;
+    symbol?: string;
+    includeInferred?: boolean;
+  }): {
+    uiEndpoint: string;
+    storeBackend: "sqlite" | "json" | "memory";
+    storeQueryPath: string;
+    totalTradesInStore: number;
+    tradesReturnedToUI: number;
+    lastTradeTs: number | null;
+    last5TradesPreview: FillAnalysisRow[];
+  } {
+    const symbol = String(params.symbol || this.config.symbol).toUpperCase();
+    const includeInferred = params.includeInferred !== false;
+    const allTrades = this.storage.getFillsSince(symbol, 0);
+    const visibleTrades = includeInferred
+      ? allTrades
+      : allTrades.filter((row) => this.resolveFillSource(row) !== "inferred");
+    const rows = this.getFills(params.window, params.limit, {
+      symbol,
+      includeInferred
+    });
+    const health = this.storage.getHealth();
+    const storeBackend: "sqlite" | "json" | "memory" =
+      health.mode === "sqlite" ? "sqlite" : health.mode === "jsonl" ? "json" : "memory";
+    const lastTradeTs =
+      visibleTrades.length > 0
+        ? visibleTrades.reduce((maxTs, row) => Math.max(maxTs, Number(row.ts) || 0), 0)
+        : null;
+    return {
+      uiEndpoint: "/api/analysis/fills",
+      storeBackend,
+      storeQueryPath: `performance:${health.mode}`,
+      totalTradesInStore: visibleTrades.length,
+      tradesReturnedToUI: rows.length,
+      lastTradeTs,
+      last5TradesPreview: rows.slice(0, 5)
+    };
   }
 
   getEquityCurve(window: AnalysisWindowKey): EquityPoint[] {
@@ -244,14 +294,52 @@ export class PerformanceEngine {
     }
   }
 
-  private resolveLatestMid(): number {
-    const latest = this.storage.getLatestMid(this.config.symbol);
+  private resolveLatestMid(symbol = this.config.symbol): number {
+    const latest = this.storage.getLatestMid(symbol);
     if (latest && Number.isFinite(latest.revx_mid) && latest.revx_mid > 0) return latest.revx_mid;
-    return this.store.getRecentTickerSnapshots(this.config.symbol, 1)[0]?.mid ?? 0;
+    return this.store.getRecentTickerSnapshots(symbol, 1)[0]?.mid ?? 0;
+  }
+
+  private resolveFillSource(fill: PersistedFillRow): string {
+    const normalized = String(fill.source_json || "").trim();
+    if (!normalized) return "venue";
+    try {
+      const parsed = JSON.parse(normalized) as Record<string, unknown>;
+      const sourceRaw = parsed.source;
+      if (typeof sourceRaw === "string" && sourceRaw.trim().length > 0) {
+        return sourceRaw.trim().toLowerCase();
+      }
+      return "venue";
+    } catch {
+      return "venue";
+    }
+  }
+
+  private normalizeSourceJson(source: "venue" | "inferred" | undefined, input: string | undefined): string {
+    const parsed = tryParseJsonObject(input);
+    const payload: Record<string, unknown> = {
+      ...parsed,
+      source: source || (typeof parsed.source === "string" && parsed.source.length > 0 ? parsed.source : "venue")
+    };
+    return JSON.stringify(payload);
   }
 }
 
 function safePositive(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return value > 0 ? value : 0;
+}
+
+function tryParseJsonObject(value: string | undefined): Record<string, unknown> {
+  const normalized = String(value || "").trim();
+  if (!normalized) return {};
+  try {
+    const parsed = JSON.parse(normalized);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // ignore parse failure; store opaque payload below
+  }
+  return { raw: normalized };
 }

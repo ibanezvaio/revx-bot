@@ -145,6 +145,17 @@ export class Execution {
         let venueOrderId = pickString(raw, ["venue_order_id", "venueOrderId", "order_id", "orderId", "id"]);
         let status = normalizeOrderStatus(pickString(raw, ["state", "status", "order_status"]) || "NEW");
         if (!venueOrderId) {
+          if (noAckRetriesUsed === 0) {
+            this.logger.warn(
+              {
+                clientOrderId,
+                symbol: params.symbol,
+                side: params.side,
+                responseBody: raw
+              },
+              "Order submit response missing venueOrderId"
+            );
+          }
           const ack = await this.awaitVenueAck(params.symbol, clientOrderId, VENUE_ACK_TIMEOUT_MS);
           if (ack?.venueOrderId) {
             venueOrderId = ack.venueOrderId;
@@ -213,6 +224,20 @@ export class Execution {
             botTag: params.botTag
           },
           "Placed post-only maker order"
+        );
+        this.logger.info(
+          {
+            event: "ORDER",
+            action: "PLACED",
+            symbol: params.symbol,
+            side: params.side,
+            price: workingPrice,
+            quoteSizeUsd: quoteSize,
+            clientOrderId,
+            venueOrderId,
+            botTag: params.botTag
+          },
+          `REVX_ORDER action=PLACED side=${params.side} symbol=${params.symbol} price=${workingPrice.toFixed(2)} size=${quoteSize.toFixed(2)} venueOrderId=${String(venueOrderId || "-")} clientOrderId=${clientOrderId}`
         );
         this.recordBotEvent({
           type: "PLACED",
@@ -533,6 +558,17 @@ export class Execution {
           botTag: existing?.bot_tag ?? null
         });
         this.logger.info({ venueOrderId }, "Cancelled order");
+        this.logger.info(
+          {
+            event: "ORDER",
+            action: "CANCELLED",
+            symbol: existing?.symbol ?? this.config.symbol,
+            side: existing?.side ?? "-",
+            venueOrderId,
+            clientOrderId: existing?.client_order_id ?? null
+          },
+          `REVX_ORDER action=CANCELLED side=${String(existing?.side ?? "-")} symbol=${String(existing?.symbol ?? this.config.symbol)} price=${Number(existing?.price ?? 0).toFixed(2)} size=${Number(existing?.quote_size ?? 0).toFixed(2)} venueOrderId=${venueOrderId} clientOrderId=${String(existing?.client_order_id ?? "-")}`
+        );
         return;
       } catch (error) {
         if (error instanceof RevXHttpError) {
@@ -552,6 +588,17 @@ export class Execution {
             this.logger.info(
               { venueOrderId, status: error.status },
               "Order not found; treated as cancelled"
+            );
+            this.logger.info(
+              {
+                event: "ORDER",
+                action: "CANCELLED",
+                symbol: existing?.symbol ?? this.config.symbol,
+                side: existing?.side ?? "-",
+                venueOrderId,
+                clientOrderId: existing?.client_order_id ?? null
+              },
+              `REVX_ORDER action=CANCELLED side=${String(existing?.side ?? "-")} symbol=${String(existing?.symbol ?? this.config.symbol)} price=${Number(existing?.price ?? 0).toFixed(2)} size=${Number(existing?.quote_size ?? 0).toFixed(2)} venueOrderId=${venueOrderId} clientOrderId=${String(existing?.client_order_id ?? "-")}`
             );
             return;
           }
@@ -573,6 +620,17 @@ export class Execution {
             this.logger.info(
               { venueOrderId, status: error.status, responseMessage },
               "Order already inactive; treated as cancelled"
+            );
+            this.logger.info(
+              {
+                event: "ORDER",
+                action: "CANCELLED",
+                symbol: existing?.symbol ?? this.config.symbol,
+                side: existing?.side ?? "-",
+                venueOrderId,
+                clientOrderId: existing?.client_order_id ?? null
+              },
+              `REVX_ORDER action=CANCELLED side=${String(existing?.side ?? "-")} symbol=${String(existing?.symbol ?? this.config.symbol)} price=${Number(existing?.price ?? 0).toFixed(2)} size=${Number(existing?.quote_size ?? 0).toFixed(2)} venueOrderId=${venueOrderId} clientOrderId=${String(existing?.client_order_id ?? "-")}`
             );
             return;
           }

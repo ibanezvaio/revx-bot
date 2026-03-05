@@ -16,16 +16,45 @@ import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
 import { DashboardServer } from "./web/DashboardServer";
 import { PolymarketEngine } from "./polymarket/PolymarketEngine";
+import { getTradingTruthReporter } from "./logging/truth";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = buildLogger(config);
+  const truthLogger = logger.child({ module: "truth" });
+  getTradingTruthReporter(config, truthLogger);
+  const revxLogger = logger.child({ module: "revx" });
+  const reconLogger = logger.child({ module: "recon" });
+  const webLogger = logger.child({ module: "web" });
+  const pmLogger =
+    config.polymarket.enabled
+      ? logger.child({ module: "polymarket" })
+      : null;
   logger.info(
     {
       cwd: process.cwd(),
       runtimeBaseDir: config.runtimeBaseDir
     },
     "Resolved runtime paths"
+  );
+  const argvEntry = String(process.argv[1] || "");
+  const runningFromDist =
+    argvEntry.includes("/dist/") ||
+    argvEntry.includes("\\dist\\") ||
+    /[\\/]+dist[\\/]+/.test(argvEntry);
+  logger.info(
+    {
+      runningFromDist,
+      argvEntry,
+      entryFilename: __filename,
+      gitCommit:
+        process.env.GIT_COMMIT ||
+        process.env.GITHUB_SHA ||
+        process.env.COMMIT_SHA ||
+        null,
+      polyStatusEmitter: "src/polymarket/PolymarketEngine.ts#emitPolyStatusLine"
+    },
+    "Build provenance"
   );
 
   logEffectiveConfig(logger, config);
@@ -38,34 +67,30 @@ async function main(): Promise<void> {
   const store = createStore(config, logger);
   store.init();
 
-  const client = new RevXClient(config, logger);
-  const marketData = new MarketData(client, logger);
-  const externalQuoteService = new ExternalQuoteService(config, logger);
-  const risk = new RiskManager(config, logger);
+  const client = new RevXClient(config, revxLogger);
+  const marketData = new MarketData(client, revxLogger);
+  const externalQuoteService = new ExternalQuoteService(config, revxLogger);
+  const risk = new RiskManager(config, revxLogger);
   const signalEngine = new SignalEngine(config);
   const crossVenueSignalEngine = new CrossVenueSignalEngine(config, logger);
   const newsEngine = new NewsEngine(config, logger, store);
   const signalsEngine = new SignalsEngine(config, logger, store);
   const intelEngine = new IntelEngine(config, logger, newsEngine, signalsEngine);
   const performanceEngine = config.performanceEnabled
-    ? new PerformanceEngine(config, logger, store, marketData)
+    ? new PerformanceEngine(config, revxLogger, store, marketData)
     : undefined;
-  const pmLogger =
-    config.polymarket.enabled
-      ? logger.child({ module: "polymarket" })
-      : null;
   const polymarketEngine =
     config.polymarket.enabled
       ? new PolymarketEngine(config, pmLogger ?? logger, { store })
       : undefined;
-  const execution = new Execution(config, logger, client, store, config.dryRun);
-  const reconciler = new Reconciler(config, logger, client, store, marketData, performanceEngine);
-  const dashboard = new DashboardServer(config, logger, store, execution.getRunId(), {
+  const execution = new Execution(config, revxLogger, client, store, config.dryRun);
+  const reconciler = new Reconciler(config, reconLogger, client, store, marketData, performanceEngine);
+  const dashboard = new DashboardServer(config, webLogger, store, execution.getRunId(), {
     cancelAllBotOrders: async () => execution.cancelAllBotOrders(config.symbol)
   }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine, polymarketEngine);
   const strategy = new MakerStrategy(
     config,
-    logger,
+    revxLogger,
     client,
     store,
     marketData,
@@ -119,6 +144,7 @@ async function main(): Promise<void> {
         {
           enabled: config.polymarket.enabled,
           mode: config.polymarket.mode,
+          fetchEnabled: config.polymarket.fetchEnabled,
           liveConfirmed: config.polymarket.liveConfirmed,
           killSwitch: config.polymarket.killSwitch,
           seedSeriesPrefix: config.polymarket.marketQuery.seedSeriesPrefix || null,
@@ -147,7 +173,10 @@ async function main(): Promise<void> {
     reconciler.start();
     await strategy.start();
   } finally {
-    await polymarketEngine?.stop("FINALIZER");
+    if (!shuttingDown) {
+      logger.error("Main loop exited without SIGINT/SIGTERM; stopping Polymarket with UNEXPECTED_EXIT");
+    }
+    await polymarketEngine?.stop(shuttingDown ? "SHUTDOWN" : "UNEXPECTED_EXIT");
     externalQuoteService.stop();
     newsEngine.stop();
     signalsEngine.stop();
@@ -176,9 +205,17 @@ function logEffectiveConfig(
         revxBaseUrl: config.revxBaseUrl,
         dryRun: config.dryRun,
         mockMode: config.mockMode,
+        debugHttp: config.debugHttp,
+        logLevel: config.logLevel,
+        logVerbosity: config.logVerbosity,
+        logModules: config.logModules,
+        truthIntervalMs: config.truthIntervalMs,
+        strictSanityCheck: config.strictSanityCheck,
+        disableFillsReconcile: config.disableFillsReconcile,
         storeBackend: config.storeBackend,
         refreshSeconds: config.refreshSeconds,
         reconcileSeconds: config.reconcileSeconds,
+        reconcileTimeoutMs: config.reconcileTimeoutMs,
         levels: config.levels,
         levelQuoteSizeUsd: config.levelQuoteSizeUsd,
         enableTopOfBook: config.enableTopOfBook,
@@ -226,6 +263,7 @@ function logEffectiveConfig(
         toxicDriftBps: config.toxicDriftBps,
         makerFeeBps: config.makerFeeBps,
         takerFeeBps: config.takerFeeBps,
+        minMakerEdgeBps: config.minMakerEdgeBps,
         minRealizedEdgeBps: config.minRealizedEdgeBps,
         minTakerEdgeBps: config.minTakerEdgeBps,
         enableAdverseSelectionLoop: config.enableAdverseSelectionLoop,
@@ -250,6 +288,7 @@ function logEffectiveConfig(
         adverseMaxSpreadMult: config.adverseMaxSpreadMult,
         edgeSafetyBps: config.edgeSafetyBps,
         hotVolBps: config.hotVolBps,
+        forceBaselineWhenOverCap: config.forceBaselineWhenOverCap,
         venueWeights: config.venueWeights,
         seedEnabled: config.seedEnabled,
         enableTakerSeed: config.enableTakerSeed,
@@ -291,6 +330,7 @@ function logEffectiveConfig(
         polymarket: {
           enabled: config.polymarket.enabled,
           mode: config.polymarket.mode,
+          fetchEnabled: config.polymarket.fetchEnabled,
           liveConfirmed: config.polymarket.liveConfirmed,
           killSwitch: config.polymarket.killSwitch,
           loopMs: config.polymarket.loopMs,

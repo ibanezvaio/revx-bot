@@ -4,7 +4,10 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { BotConfig } from "../config";
+import { getRecentHttpErrors } from "../http/endpointGuard";
+import { getVenueGuardHealthSnapshot } from "../http/venueGuard";
 import { Logger } from "../logger";
+import { getTradingTruthSnapshot } from "../logging/truth";
 import { RuntimeOverridesInput } from "../overrides/runtimeOverrides";
 import { VenueQuote as ExternalServiceQuote } from "../quotes/ExternalQuoteService";
 import {
@@ -54,6 +57,7 @@ type ExternalQuoteReader = {
 
 type PolymarketRuntimeSnapshot = {
   latestPolymarket: {
+    ts: number;
     windowSlug: string;
     tauSec: number | null;
     priceToBeat: number | null;
@@ -62,6 +66,7 @@ type PolymarketRuntimeSnapshot = {
     impliedProbMid: number | null;
   } | null;
   latestModel: {
+    ts: number;
     pBase: number | null;
     pBoosted: number | null;
     z: number | null;
@@ -88,6 +93,49 @@ type PolymarketRuntimeSnapshot = {
   };
   tradingPaused: boolean;
   pauseReason: string | null;
+  mode: "paper" | "live";
+  polyMoney: boolean;
+  lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
+  holdReason: string | null;
+  selection: {
+    finalCandidatesCount: number | null;
+    discoveredCandidatesCount: number | null;
+    windowsCount: number | null;
+    selectedSlug: string | null;
+    selectedMarketId: string | null;
+    windowEndTs: number | null;
+    remainingSec: number | null;
+  };
+  dataHealth: {
+    oracleSource: string | null;
+    oracleState: string | null;
+    latestPolymarketTs: number | null;
+    latestModelTs: number | null;
+    lastFetchAttemptTs: number;
+    lastFetchOkTs: number;
+    lastFetchErr: string | null;
+    lastHttpStatus: number;
+    lastBookTsMs: number;
+    lastYesBid: number | null;
+    lastYesAsk: number | null;
+    lastYesMid: number | null;
+    lastModelTs: number;
+  };
+  state: {
+    holdDetailReason: string | null;
+    dominantReject: string | null;
+    rejectCountsByStage: Record<string, Record<string, number>>;
+    sampleRejected: Array<Record<string, unknown>>;
+  };
+  lastTrade: {
+    id: string | null;
+    slug: string | null;
+    ts: number | null;
+  };
+  polyEngineRunning: boolean;
+  lastUpdateTs: number;
+  lastUpdateAgeSec: number | null;
+  status: "STARTING" | "RUNNING" | "STALE";
 };
 
 type PolymarketRuntimeProvider = {
@@ -281,6 +329,13 @@ export class DashboardServer {
     netEdgeAfterCosts: number | null;
     openTrades: number | null;
     resolvedTrades: number | null;
+    lastAction: string | null;
+    holdReason: string | null;
+    holdDetailReason: string | null;
+    dominantReject: string | null;
+    finalCandidatesCount: number | null;
+    discoveredCandidatesCount: number | null;
+    windowsCount: number | null;
     tradingPaused: boolean;
     pauseReason: string | null;
   } | null {
@@ -297,8 +352,10 @@ export class DashboardServer {
         if (type !== "tick") continue;
         const windowEnd = toFiniteNumber(row.windowEnd);
         const now = Date.now();
+        const actionRaw = toOptionalString(row.lastAction) ?? toOptionalString(row.action);
+        const tickTs = toTimestampMs(row.ts);
         return {
-          ts: toFiniteNumber(row.ts),
+          ts: tickTs,
           marketId: toOptionalString(row.marketId),
           slug: toOptionalString(row.selectedSlug) ?? toOptionalString(row.slug),
           windowEnd,
@@ -313,6 +370,20 @@ export class DashboardServer {
           netEdgeAfterCosts: toFiniteNumber(row.netEdgeAfterCosts),
           openTrades: toFiniteNumber(row.openTrades),
           resolvedTrades: toFiniteNumber(row.resolvedTrades),
+          lastAction: actionRaw,
+          holdReason:
+            toOptionalString(row.holdReason) ??
+            deriveHoldReasonFromAction(actionRaw),
+          holdDetailReason: toOptionalString(row.holdDetailReason),
+          dominantReject: toOptionalString(row.dominantReject),
+          finalCandidatesCount: toFiniteNumber(row.finalCandidatesCount),
+          discoveredCandidatesCount:
+            toFiniteNumber(row.discoveredCandidates) ??
+            toFiniteNumber(row.marketsSeen) ??
+            toFiniteNumber(row.afterSearchCount),
+          windowsCount:
+            toFiniteNumber(row.afterWindowCount) ??
+            toFiniteNumber(row.activeWindows),
           tradingPaused: parseBoolean(row.tradingPaused) ?? false,
           pauseReason: toOptionalString(row.pauseReason)
         };
@@ -335,6 +406,16 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/status/truth") {
+      writeJson(res, 200, this.buildTruthStatus());
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/status/health") {
+      writeJson(res, 200, this.buildHealthStatus());
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/polymarket/summary") {
       const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
       const summary = ledger.getSummary();
@@ -343,8 +424,49 @@ export class DashboardServer {
       const latestPolymarket = runtime?.latestPolymarket ?? null;
       const latestModel = runtime?.latestModel ?? null;
       const latestLag = runtime?.latestLag ?? null;
+      const summarySelection = runtime?.selection ?? {
+        finalCandidatesCount: tick?.finalCandidatesCount ?? null,
+        selectedSlug: tick?.slug ?? null,
+        selectedMarketId: tick?.marketId ?? null,
+        windowEndTs: tick?.windowEnd ?? null
+      };
+      const summaryDataHealth = runtime?.dataHealth ?? {
+        oracleSource: null,
+        oracleState: null,
+        latestPolymarketTs: latestPolymarket?.ts ?? null,
+        latestModelTs: latestModel?.ts ?? null,
+        lastFetchAttemptTs: 0,
+        lastFetchOkTs: 0,
+        lastFetchErr: null,
+        lastHttpStatus: 0,
+        lastBookTsMs: 0,
+        lastYesBid: null,
+        lastYesAsk: null,
+        lastYesMid: null,
+        lastModelTs: 0
+      };
+      const statusBanner = this.buildPolymarketStatusBanner(runtime, tick);
+      const lastTickTs = toFiniteNumber(tick?.ts);
+      const lastTickAgeSec = lastTickTs ? Math.max(0, Math.floor((Date.now() - lastTickTs) / 1000)) : null;
+      const summaryRemainingSec =
+        toFiniteNumber(runtime?.selection?.remainingSec) ??
+        toFiniteNumber(tick?.countdownSec) ??
+        null;
       writeJson(res, 200, {
         ts: Date.now(),
+        polyEngineRunning: runtime?.polyEngineRunning ?? false,
+        mode: runtime?.mode ?? this.config.polymarket.mode,
+        polyMoney:
+          runtime?.polyMoney ??
+          (this.config.polymarket.mode !== "paper" &&
+            !this.config.polymarket.killSwitch &&
+            this.config.polymarket.liveConfirmed),
+        lastAction: runtime?.lastAction ?? tick?.lastAction ?? "HOLD",
+        holdReason: runtime?.holdReason ?? tick?.holdReason ?? null,
+        holdDetailReason: runtime?.state?.holdDetailReason ?? tick?.holdDetailReason ?? null,
+        dominantReject: runtime?.state?.dominantReject ?? tick?.dominantReject ?? null,
+        lastTickTs,
+        lastTickAgeSec,
         totalTrades: summary.totalTrades,
         openTrades: summary.openPositions,
         resolvedTrades: summary.resolvedTrades,
@@ -358,7 +480,7 @@ export class DashboardServer {
         currentMarketId: tick?.marketId ?? null,
         currentSlug: tick?.slug ?? null,
         currentWindowEnd: tick?.windowEnd ?? null,
-        countdownSec: tick?.countdownSec ?? null,
+        countdownSec: summaryRemainingSec,
         pUpModel: tick?.pUpModel ?? null,
         yesBid: tick?.yesBid ?? null,
         yesAsk: tick?.yesAsk ?? null,
@@ -371,6 +493,33 @@ export class DashboardServer {
         latestPolymarket,
         latestModel,
         latestLag,
+        finalCandidatesCount: summarySelection.finalCandidatesCount ?? null,
+        candidatesCount:
+          toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+          toFiniteNumber(tick?.discoveredCandidatesCount) ??
+          null,
+        windowsCount:
+          toFiniteNumber(runtime?.selection?.windowsCount) ??
+          toFiniteNumber(tick?.windowsCount) ??
+          null,
+        selectedSlug: summarySelection.selectedSlug ?? tick?.slug ?? null,
+        selectedMarketId: summarySelection.selectedMarketId ?? tick?.marketId ?? null,
+        windowEndTs: summarySelection.windowEndTs ?? tick?.windowEnd ?? null,
+        remainingSec: summaryRemainingSec,
+        minWindowSec: toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
+        maxWindowSec: toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ?? this.config.polymarket.paper.entryMaxRemainingSec,
+        lastUpdateTs: toFiniteNumber(runtime?.lastUpdateTs) ?? 0,
+        lastUpdateAgeSec:
+          toFiniteNumber(runtime?.lastUpdateAgeSec) ??
+          ((toFiniteNumber(runtime?.lastUpdateTs) ?? 0) > 0
+            ? Math.max(0, Math.floor((Date.now() - (toFiniteNumber(runtime?.lastUpdateTs) ?? 0)) / 1000))
+            : null),
+        status: runtime?.status ?? "STARTING",
+        dataHealth: summaryDataHealth,
+        statusBanner,
+        rejectCountsByStage: runtime?.state?.rejectCountsByStage ?? null,
+        sampleRejected: runtime?.state?.sampleRejected ?? [],
+        lastTrade: runtime?.lastTrade ?? null,
         sniperWindow: runtime?.sniperWindow ?? {
           minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
           maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
@@ -379,12 +528,20 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/polymarket/health") {
+      writeJson(res, 200, this.buildPolymarketHealthStatus());
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/polymarket/lag") {
       const lagSnapshot = this.getPolymarketLagSnapshot(50);
+      const runtime = this.getPolymarketRuntimeSnapshot();
+      const tick = this.getLatestPolymarketTick();
       writeJson(res, 200, {
         ts: Date.now(),
         stats: lagSnapshot?.stats ?? null,
-        recent: Array.isArray(lagSnapshot?.recent) ? lagSnapshot?.recent : []
+        recent: Array.isArray(lagSnapshot?.recent) ? lagSnapshot?.recent : [],
+        statusBanner: this.buildPolymarketStatusBanner(runtime, tick)
       });
       return;
     }
@@ -393,6 +550,8 @@ export class DashboardServer {
       const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
       const limit = parseLimit(url.searchParams.get("limit"), 200, 1, 5_000);
       const payload = buildPolymarketTradesPayload(ledger, limit);
+      const runtime = this.getPolymarketRuntimeSnapshot();
+      const tick = this.getLatestPolymarketTick();
       writeJson(res, 200, {
         ts: Date.now(),
         count: payload.rows.length,
@@ -401,6 +560,7 @@ export class DashboardServer {
         resolvedTrades: payload.resolvedTrades,
         winRate: payload.winRate,
         totalPnlUsd: payload.totalPnlUsd,
+        statusBanner: this.buildPolymarketStatusBanner(runtime, tick),
         rows: payload.rows
       });
       return;
@@ -428,8 +588,96 @@ export class DashboardServer {
     if (method === "GET" && url.pathname === "/api/analysis/fills") {
       const window = parseAnalysisWindow(url.searchParams.get("window"));
       const limit = parseLimit(url.searchParams.get("limit"), 50, 1, 1_000);
-      const rows = this.performanceEngine ? this.performanceEngine.getFills(window, limit) : [];
-      writeJson(res, 200, { ts: Date.now(), window, count: rows.length, rows });
+      const symbol = normalizeTradeSymbol(url.searchParams.get("symbol"), this.config.symbol);
+      const includeInferred = parseIncludeInferred(url.searchParams.get("includeInferred"));
+      const rows = this.performanceEngine
+        ? this.performanceEngine.getFills(window, limit, { symbol, includeInferred })
+        : [];
+      const debugMeta = this.performanceEngine
+        ? this.performanceEngine.getFillsDebug({ window, limit, symbol, includeInferred })
+        : {
+            storeQueryPath: "performance:unavailable",
+            totalTradesInStore: 0,
+            tradesReturnedToUI: 0
+          };
+      this.logger.info(
+        {
+          endpoint: "/api/analysis/fills",
+          window,
+          symbol,
+          includeInferred,
+          limit,
+          count: rows.length,
+          storeQueryPath: debugMeta.storeQueryPath,
+          totalTradesInStore: debugMeta.totalTradesInStore
+        },
+        "Trades endpoint response"
+      );
+      writeJson(res, 200, {
+        ts: Date.now(),
+        window,
+        symbol,
+        includeInferred,
+        count: rows.length,
+        rows
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/debug/trades") {
+      const window = parseAnalysisWindow(url.searchParams.get("window"));
+      const limit = parseLimit(url.searchParams.get("limit"), 50, 1, 1_000);
+      const symbol = normalizeTradeSymbol(url.searchParams.get("symbol"), this.config.symbol);
+      const includeInferred = parseIncludeInferred(url.searchParams.get("includeInferred"));
+      if (this.performanceEngine) {
+        const debug = this.performanceEngine.getFillsDebug({
+          window,
+          limit,
+          symbol,
+          includeInferred
+        });
+        this.logger.info(
+          {
+            endpoint: "/api/debug/trades",
+            window,
+            symbol,
+            includeInferred,
+            ...debug
+          },
+          "Trades debug endpoint response"
+        );
+        writeJson(res, 200, {
+          ts: Date.now(),
+          ...debug
+        });
+        return;
+      }
+
+      const fallbackRows = this.store.getRecentFills(limit);
+      const allRows = this.store.getRecentFills(5_000);
+      const storeBackend: "sqlite" | "json" | "memory" =
+        this.config.storeBackend === "sqlite" ? "sqlite" : this.config.storeBackend === "json" ? "json" : "memory";
+      const payload = {
+        ts: Date.now(),
+        uiEndpoint: "/api/analysis/fills",
+        storeBackend,
+        storeQueryPath: "store:getRecentFills",
+        totalTradesInStore: allRows.length,
+        tradesReturnedToUI: fallbackRows.length,
+        lastTradeTs: fallbackRows[0]?.ts ?? null,
+        last5TradesPreview: fallbackRows.slice(0, 5)
+      };
+      this.logger.info(
+        {
+          endpoint: "/api/debug/trades",
+          window,
+          symbol,
+          includeInferred,
+          ...payload
+        },
+        "Trades debug endpoint response"
+      );
+      writeJson(res, 200, payload);
       return;
     }
 
@@ -792,6 +1040,17 @@ export class DashboardServer {
         ts: Date.now(),
         cwd: process.cwd(),
         runtimeBaseDir: this.config.runtimeBaseDir
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/debug/http-errors") {
+      const limit = parseLimit(url.searchParams.get("limit"), 200, 1, 200);
+      const rows = getRecentHttpErrors(limit);
+      writeJson(res, 200, {
+        ts: Date.now(),
+        count: rows.length,
+        rows
       });
       return;
     }
@@ -2361,6 +2620,386 @@ export class DashboardServer {
         pnlUsd: pnlNow,
         minPnlUsd: pnlMin,
         maxPnlUsd: pnlMax
+      }
+    };
+  }
+
+  private buildTruthStatus(): Record<string, unknown> {
+    const ts = Date.now();
+    const truth = getTradingTruthSnapshot(this.config, this.logger);
+    const runtime = this.getPolymarketRuntimeSnapshot();
+    const tick = this.getLatestPolymarketTick();
+
+    const selection = {
+      finalCandidatesCount:
+        toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
+        toFiniteNumber(truth.poly.selection.finalCandidatesCount) ??
+        toFiniteNumber(tick?.finalCandidatesCount),
+      discoveredCandidatesCount:
+        toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+        toFiniteNumber(truth.poly.selection.discoveredCandidatesCount) ??
+        toFiniteNumber(tick?.discoveredCandidatesCount),
+      windowsCount:
+        toFiniteNumber(runtime?.selection?.windowsCount) ??
+        toFiniteNumber(truth.poly.selection.windowsCount) ??
+        toFiniteNumber(tick?.windowsCount),
+      selectedSlug:
+        toOptionalString(runtime?.selection?.selectedSlug) ??
+        toOptionalString(truth.poly.selection.selectedSlug) ??
+        toOptionalString(tick?.slug),
+      selectedMarketId:
+        toOptionalString(runtime?.selection?.selectedMarketId) ??
+        toOptionalString(truth.poly.selection.selectedMarketId) ??
+        toOptionalString(tick?.marketId),
+      windowEndTs:
+        toFiniteNumber(runtime?.selection?.windowEndTs) ??
+        toFiniteNumber(truth.poly.selection.windowEndTs) ??
+        toFiniteNumber(tick?.windowEnd),
+      remainingSec:
+        toFiniteNumber(runtime?.selection?.remainingSec) ??
+        toFiniteNumber(truth.poly.selection.remainingSec) ??
+        toFiniteNumber(tick?.countdownSec)
+    };
+
+    const dataHealth = {
+      oracleSource:
+        toOptionalString(runtime?.dataHealth?.oracleSource) ??
+        toOptionalString(truth.poly.dataHealth.oracleSource),
+      oracleState:
+        toOptionalString(runtime?.dataHealth?.oracleState) ??
+        toOptionalString(truth.poly.dataHealth.oracleState),
+      latestPolymarketTs:
+        toFiniteNumber(runtime?.dataHealth?.latestPolymarketTs) ??
+        toFiniteNumber(truth.poly.dataHealth.latestPolymarketTs) ??
+        toFiniteNumber(runtime?.latestPolymarket?.ts),
+      latestModelTs:
+        toFiniteNumber(runtime?.dataHealth?.latestModelTs) ??
+        toFiniteNumber(truth.poly.dataHealth.latestModelTs) ??
+        toFiniteNumber(runtime?.latestModel?.ts),
+      lastFetchAttemptTs:
+        toFiniteNumber(runtime?.dataHealth?.lastFetchAttemptTs) ??
+        toFiniteNumber(truth.poly.dataHealth.lastFetchAttemptTs) ??
+        0,
+      lastFetchOkTs:
+        toFiniteNumber(runtime?.dataHealth?.lastFetchOkTs) ??
+        toFiniteNumber(truth.poly.dataHealth.lastFetchOkTs) ??
+        0,
+      lastFetchErr:
+        toOptionalString(runtime?.dataHealth?.lastFetchErr) ??
+        toOptionalString(truth.poly.dataHealth.lastFetchErr),
+      lastHttpStatus:
+        toFiniteNumber(runtime?.dataHealth?.lastHttpStatus) ??
+        toFiniteNumber(truth.poly.dataHealth.lastHttpStatus) ??
+        0,
+      lastBookTsMs: toFiniteNumber(runtime?.dataHealth?.lastBookTsMs) ?? 0,
+      lastYesBid: toFiniteNumber(runtime?.dataHealth?.lastYesBid),
+      lastYesAsk: toFiniteNumber(runtime?.dataHealth?.lastYesAsk),
+      lastYesMid: toFiniteNumber(runtime?.dataHealth?.lastYesMid),
+      lastModelTs:
+        toFiniteNumber(runtime?.dataHealth?.lastModelTs) ??
+        toFiniteNumber(runtime?.dataHealth?.latestModelTs) ??
+        0
+    };
+
+    const polyLastTrade = {
+      id:
+        toOptionalString(runtime?.lastTrade?.id) ??
+        toOptionalString(truth.poly.lastTrade?.id),
+      slug:
+        toOptionalString(runtime?.lastTrade?.slug) ??
+        toOptionalString(truth.poly.lastTrade?.slug),
+      ts:
+        toFiniteNumber(runtime?.lastTrade?.ts) ??
+        toFiniteNumber(truth.poly.lastTrade?.ts)
+    };
+
+    return {
+      ts,
+      revx: {
+        mode: truth.revx.mode,
+        symbol: truth.revx.symbol,
+        buyOpen: truth.revx.buyOpen,
+        sellOpen: truth.revx.sellOpen,
+        lastOrderAction: truth.revx.lastOrderAction,
+        lastVenueOrderId: truth.revx.lastVenueOrderId,
+        balances: {
+          usd: toFiniteNumber(truth.revx.balances.usd),
+          btc: toFiniteNumber(truth.revx.balances.btc)
+        },
+        deltas: {
+          usd: toFiniteNumber(truth.revx.deltas.usd),
+          btc: toFiniteNumber(truth.revx.deltas.btc)
+        },
+        lastFill: truth.revx.lastFill
+          ? {
+              ts: toFiniteNumber(truth.revx.lastFill.ts),
+              side: truth.revx.lastFill.side,
+              inferredSide: truth.revx.lastFill.inferredSide ?? null,
+              price: toFiniteNumber(truth.revx.lastFill.price),
+              size: toFiniteNumber(truth.revx.lastFill.size)
+            }
+          : null,
+        blocked: truth.revx.blocked
+          ? {
+              reason: truth.revx.blocked.reason,
+              btcNotional: toFiniteNumber(truth.revx.blocked.btcNotional),
+              maxBtcNotional: toFiniteNumber(truth.revx.blocked.maxBtcNotional)
+            }
+          : null
+      },
+      poly: {
+        status: runtime?.status ?? truth.poly.status,
+        lastUpdateTs:
+          toFiniteNumber(runtime?.lastUpdateTs) ??
+          toFiniteNumber(truth.poly.lastUpdateTs) ??
+          0,
+        lastUpdateAgeSec:
+          toFiniteNumber(runtime?.lastUpdateAgeSec) ??
+          toFiniteNumber(truth.poly.lastUpdateAgeSec) ??
+          null,
+        mode: runtime?.mode === "live" ? "LIVE" : runtime?.mode === "paper" ? "PAPER" : truth.poly.mode,
+        lastAction:
+          runtime?.lastAction ??
+          truth.poly.lastAction ??
+          (toOptionalString(tick?.lastAction) as "OPEN" | "CLOSE" | "RESOLVE" | "HOLD" | null) ??
+          "HOLD",
+        holdReason:
+          toOptionalString(runtime?.holdReason) ??
+          toOptionalString(truth.poly.holdReason) ??
+          toOptionalString(tick?.holdReason),
+        holdDetailReason:
+          toOptionalString(runtime?.state?.holdDetailReason) ??
+          toOptionalString(tick?.holdDetailReason) ??
+          toOptionalString(runtime?.state?.dominantReject) ??
+          toOptionalString(tick?.dominantReject),
+        openTrades: truth.poly.openTrades,
+        resolvedTrades: truth.poly.resolvedTrades,
+        pnlTotalUsd: truth.poly.pnlTotalUsd,
+        lastTrade: polyLastTrade,
+        selection,
+        dataHealth,
+        polyEngineRunning: runtime?.polyEngineRunning ?? truth.poly.polyEngineRunning ?? false,
+        fetchOk:
+          truth.poly.fetchOk ??
+          ((toFiniteNumber(dataHealth.lastHttpStatus) ?? 0) === 200 &&
+            (toFiniteNumber(dataHealth.lastFetchOkTs) ?? 0) > 0)
+      },
+      flags: truth.flags
+    };
+  }
+
+  private buildHealthStatus(): Record<string, unknown> {
+    const ts = Date.now();
+    const venueGuard = getVenueGuardHealthSnapshot();
+    const runtime = this.getPolymarketRuntimeSnapshot();
+    const tick = this.getLatestPolymarketTick();
+    const lastHttpError = getRecentHttpErrors(1)[0] ?? null;
+    const lastOrderPlacedTs =
+      this.store
+        .getRecentBotEvents(500)
+        .filter((row) => String(row.type || "").toUpperCase() === "PLACED")
+        .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))[0]?.ts ?? null;
+    const parseErrorLike = lastHttpError && /json|parse|invalid/i.test(String(lastHttpError.message || ""));
+
+    return {
+      ts,
+      ok: true,
+      lastSuccessful: {
+        revxVenueCallTs: venueGuard.lastSuccessByService.REVX,
+        polyGammaCallTs: venueGuard.lastSuccessByService.POLY_GAMMA,
+        polyDataCallTs: venueGuard.lastSuccessByService.POLY_DATA,
+        polyClobCallTs: venueGuard.lastSuccessByService.POLY_CLOB
+      },
+      lastOrderPlacedTs: toFiniteNumber(lastOrderPlacedTs),
+      polyEngineRunning: runtime?.polyEngineRunning ?? false,
+      polyIngestion: {
+        lastFetchAttemptTs: toFiniteNumber(runtime?.dataHealth?.lastFetchAttemptTs) ?? 0,
+        lastFetchOkTs: toFiniteNumber(runtime?.dataHealth?.lastFetchOkTs) ?? 0,
+        lastFetchErr: toOptionalString(runtime?.dataHealth?.lastFetchErr),
+        lastHttpStatus: toFiniteNumber(runtime?.dataHealth?.lastHttpStatus) ?? 0,
+        latestPolymarketTs: toFiniteNumber(runtime?.dataHealth?.latestPolymarketTs) ?? null,
+        lastBookTsMs: toFiniteNumber(runtime?.dataHealth?.lastBookTsMs) ?? 0,
+        lastModelTs: toFiniteNumber(runtime?.dataHealth?.lastModelTs) ?? 0
+      },
+      polySelection: {
+        candidatesCount:
+          toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+          toFiniteNumber(tick?.discoveredCandidatesCount) ??
+          null,
+        windowsCount:
+          toFiniteNumber(runtime?.selection?.windowsCount) ??
+          toFiniteNumber(tick?.windowsCount) ??
+          null,
+        finalCandidatesCount:
+          toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
+          toFiniteNumber(tick?.finalCandidatesCount) ??
+          null,
+        selectedSlug:
+          toOptionalString(runtime?.selection?.selectedSlug) ??
+          toOptionalString(tick?.slug),
+        remainingSec:
+          toFiniteNumber(runtime?.selection?.remainingSec) ??
+          toFiniteNumber(tick?.countdownSec) ??
+          null,
+        minWindowSec:
+          toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
+        maxWindowSec:
+          toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ?? this.config.polymarket.paper.entryMaxRemainingSec
+      },
+      statusBanner: this.buildPolymarketStatusBanner(runtime, tick),
+      lastParseError: parseErrorLike
+        ? {
+            ts: lastHttpError?.ts ?? null,
+            service: lastHttpError?.service ?? null,
+            path: lastHttpError?.path ?? null,
+            message: lastHttpError?.message ?? null
+          }
+        : null,
+      lastGuardError: venueGuard.lastGuardError,
+      lastHttpError
+    };
+  }
+
+  private buildPolymarketHealthStatus(): Record<string, unknown> {
+    const ts = Date.now();
+    const runtime = this.getPolymarketRuntimeSnapshot();
+    const tick = this.getLatestPolymarketTick();
+    const dataHealth = runtime?.dataHealth ?? null;
+    const lastFetchAttemptTs = toFiniteNumber(dataHealth?.lastFetchAttemptTs) ?? 0;
+    const lastFetchOkTs = toFiniteNumber(dataHealth?.lastFetchOkTs) ?? 0;
+    const lastFetchErr = toOptionalString(dataHealth?.lastFetchErr);
+    const lastHttpStatus = toFiniteNumber(dataHealth?.lastHttpStatus) ?? 0;
+    const latestPolymarketTs = toFiniteNumber(dataHealth?.latestPolymarketTs);
+    const latestModelTs = toFiniteNumber(dataHealth?.latestModelTs);
+    return {
+      ts,
+      mode: runtime?.mode ?? this.config.polymarket.mode,
+      polyEngineRunning: lastFetchAttemptTs > 0,
+      candidatesCount:
+        toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+        toFiniteNumber(tick?.discoveredCandidatesCount) ??
+        null,
+      windowsCount:
+        toFiniteNumber(runtime?.selection?.windowsCount) ??
+        toFiniteNumber(tick?.windowsCount) ??
+        null,
+      acceptedSampleCount:
+        toFiniteNumber(
+          (tick as unknown as { acceptedSampleCount?: number | null })?.acceptedSampleCount
+        ) ?? 0,
+      finalCandidatesCount:
+        toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
+        toFiniteNumber(tick?.finalCandidatesCount) ??
+        null,
+      selectedSlug:
+        toOptionalString(runtime?.selection?.selectedSlug) ??
+        toOptionalString(tick?.slug),
+      selectedMarketId:
+        toOptionalString(runtime?.selection?.selectedMarketId) ??
+        toOptionalString(tick?.marketId),
+      remainingSec:
+        toFiniteNumber(runtime?.selection?.remainingSec) ??
+        toFiniteNumber(tick?.countdownSec) ??
+        null,
+      minWindowSec:
+        toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
+      maxWindowSec:
+        toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ?? this.config.polymarket.paper.entryMaxRemainingSec,
+      minRemainingSec:
+        toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
+      maxRemainingSec:
+        toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ?? this.config.polymarket.paper.entryMaxRemainingSec,
+      lastUpdateTs: toFiniteNumber(runtime?.lastUpdateTs) ?? 0,
+      lastUpdateAgeSec:
+        toFiniteNumber(runtime?.lastUpdateAgeSec) ??
+        ((toFiniteNumber(runtime?.lastUpdateTs) ?? 0) > 0
+          ? Math.max(0, Math.floor((Date.now() - (toFiniteNumber(runtime?.lastUpdateTs) ?? 0)) / 1000))
+          : null),
+      status: runtime?.status ?? "STARTING",
+      lastFetchAttemptTs,
+      lastFetchOkTs,
+      lastFetchErr,
+      lastHttpStatus,
+      latestPolymarketTs: latestPolymarketTs ?? null,
+      latestModelTs: latestModelTs ?? null,
+      lastBookTsMs: toFiniteNumber(dataHealth?.lastBookTsMs) ?? 0,
+      lastYesBid: toFiniteNumber(dataHealth?.lastYesBid),
+      lastYesAsk: toFiniteNumber(dataHealth?.lastYesAsk),
+      lastYesMid: toFiniteNumber(dataHealth?.lastYesMid),
+      lastModelTs: toFiniteNumber(dataHealth?.lastModelTs) ?? 0,
+      dominantReject: toOptionalString(runtime?.state?.dominantReject) ?? tick?.dominantReject ?? null,
+      holdDetailReason: toOptionalString(runtime?.state?.holdDetailReason) ?? tick?.holdDetailReason ?? null,
+      rejectCountsByStage:
+        runtime?.state?.rejectCountsByStage ??
+        ((tick as unknown as { rejectCountsByStage?: Record<string, Record<string, number>> })?.rejectCountsByStage ?? null),
+      sampleRejected:
+        (Array.isArray(runtime?.state?.sampleRejected)
+          ? runtime?.state?.sampleRejected
+          : Array.isArray(
+                (tick as unknown as { sampleRejected?: Array<Record<string, unknown>> })?.sampleRejected
+              )
+            ? (tick as unknown as { sampleRejected?: Array<Record<string, unknown>> })?.sampleRejected || []
+            : []
+        ).slice(0, 5),
+      oracleSource: toOptionalString(dataHealth?.oracleSource),
+      oracleState: toOptionalString(dataHealth?.oracleState),
+      statusBanner: this.buildPolymarketStatusBanner(runtime, tick)
+    };
+  }
+
+  private buildPolymarketStatusBanner(
+    runtime: PolymarketRuntimeSnapshot | null,
+    tick: ReturnType<DashboardServer["getLatestPolymarketTick"]>
+  ): Record<string, unknown> {
+    const now = Date.now();
+    const state = runtime?.dataHealth ?? null;
+    const latestFetchOkTs = toFiniteNumber(state?.lastFetchOkTs) ?? 0;
+    const latestBookTsMs = toFiniteNumber(state?.lastBookTsMs) ?? 0;
+    const latestModelTs = toFiniteNumber(state?.lastModelTs) ?? toFiniteNumber(state?.latestModelTs) ?? 0;
+    const finalCandidatesCount =
+      toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
+      toFiniteNumber(tick?.finalCandidatesCount) ??
+      0;
+    const selectedSlug =
+      toOptionalString(runtime?.selection?.selectedSlug) ??
+      toOptionalString(tick?.slug) ??
+      null;
+    const selectedMarketId =
+      toOptionalString(runtime?.selection?.selectedMarketId) ??
+      toOptionalString(tick?.marketId) ??
+      null;
+
+    const fetchOk = latestFetchOkTs > 0;
+    const bookOk = latestBookTsMs > 0 && Number.isFinite(Number(state?.lastYesMid));
+    const modelOk = latestModelTs > 0;
+    const selectionOk = finalCandidatesCount > 0 && Boolean(selectedSlug || selectedMarketId);
+
+    return {
+      FETCH_OK: {
+        ok: fetchOk,
+        ts: fetchOk ? latestFetchOkTs : null,
+        ageMs: fetchOk ? Math.max(0, now - latestFetchOkTs) : null,
+        lastHttpStatus: toFiniteNumber(state?.lastHttpStatus) ?? 0,
+        err: toOptionalString(state?.lastFetchErr)
+      },
+      BOOK_OK: {
+        ok: bookOk,
+        ts: bookOk ? latestBookTsMs : null,
+        ageMs: bookOk ? Math.max(0, now - latestBookTsMs) : null,
+        yesBid: toFiniteNumber(state?.lastYesBid),
+        yesAsk: toFiniteNumber(state?.lastYesAsk),
+        yesMid: toFiniteNumber(state?.lastYesMid)
+      },
+      MODEL_OK: {
+        ok: modelOk,
+        ts: modelOk ? latestModelTs : null,
+        ageMs: modelOk ? Math.max(0, now - latestModelTs) : null
+      },
+      SELECTION_OK: {
+        ok: selectionOk,
+        finalCandidatesCount,
+        selectedSlug,
+        selectedMarketId
       }
     };
   }
@@ -4086,6 +4725,18 @@ function asOptionalString(value: unknown): string | undefined {
 function normalizeSymbolParam(raw: string | null | undefined, fallback: string): string {
   const value = raw ?? fallback;
   return value.trim().toUpperCase().replace("/", "-");
+}
+
+function normalizeTradeSymbol(raw: string | null | undefined, fallback: string): string {
+  return normalizeSymbolParam(raw, fallback);
+}
+
+function parseIncludeInferred(raw: string | null): boolean {
+  if (raw === null || raw.trim().length === 0) return true;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "false" || normalized === "0" || normalized === "no") return false;
+  if (normalized === "true" || normalized === "1" || normalized === "yes") return true;
+  return true;
 }
 
 function coerceOverridesPatch(input: Record<string, unknown>): Partial<RuntimeOverridesInput> {
@@ -8940,6 +9591,41 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     .badge { padding: 2px 6px; border-radius: 999px; font-size: 0.68rem; font-weight: 700; }
     .badge-win { color: #102019; background: rgba(44,230,160,0.85); }
     .badge-loss { color: #2a1018; background: rgba(255,122,144,0.85); }
+    .debug-strip {
+      margin: 8px 0;
+      padding: 8px;
+      border: 1px dashed rgba(153, 181, 214, 0.28);
+      border-radius: 8px;
+      background: rgba(9,15,24,0.62);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.72rem;
+    }
+    .empty-state {
+      margin: 8px 0 10px 0;
+      padding: 8px;
+      border: 1px solid rgba(255, 122, 144, 0.3);
+      border-radius: 8px;
+      background: rgba(37, 14, 20, 0.42);
+      color: #ffd7e0;
+      font-size: 0.78rem;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .empty-state code {
+      color: #ffe6ec;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 4px;
+      padding: 0 4px;
+    }
+    .empty-state.soft {
+      border: 1px solid rgba(153, 181, 214, 0.2);
+      background: rgba(9,15,24,0.45);
+      color: var(--muted);
+    }
     @media (max-width: 980px) {
       .row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -8959,6 +9645,7 @@ function renderPolymarketDashboardHtml(symbol: string): string {
         <button class="btn" id="refreshBtn" type="button">Refresh</button>
       </div>
     </div>
+    <div id="pmModeBanner" class="empty-state soft">POLY PAPER (no real money)</div>
 
     <section class="row">
       <article class="card"><div class="k">Open Trades</div><div class="v" id="mOpen">-</div></article>
@@ -8969,6 +9656,11 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       <article class="card"><div class="k">Losses</div><div class="v bad" id="mLosses">-</div></article>
       <article class="card"><div class="k">Total PnL (USD)</div><div class="v" id="mTotalPnl">-</div></article>
       <article class="card"><div class="k">PnL 24h (USD)</div><div class="v" id="m24hPnl">-</div></article>
+      <article class="card"><div class="k">Mode</div><div class="v" id="mMode">-</div></article>
+      <article class="card"><div class="k">Last Action</div><div class="v" id="mLastAction">-</div></article>
+      <article class="card"><div class="k">Recent Trades Loaded</div><div class="v" id="mRowsLoaded">-</div></article>
+      <article class="card"><div class="k">Last Trade Time</div><div class="v" id="mLastTradeTime">-</div></article>
+      <article class="card"><div class="k">Selected / Candidates</div><div class="v" id="mSelectedInfo">-</div></article>
     </section>
 
     <section class="panel">
@@ -8984,6 +9676,8 @@ function renderPolymarketDashboardHtml(symbol: string): string {
         <div class="kv"><div class="k">Chosen Edge</div><div class="v" id="pmChosenEdge">-</div></div>
         <div class="kv"><div class="k">Net Edge After Costs</div><div class="v" id="pmNetEdge">-</div></div>
         <div class="kv"><div class="k">Trading State</div><div class="v" id="pmTradingState">-</div></div>
+        <div class="kv"><div class="k">Hold Reason</div><div class="v" id="pmHoldReason">-</div></div>
+        <div class="kv"><div class="k">Selection</div><div class="v" id="pmSelection">-</div></div>
       </div>
     </section>
 
@@ -9012,9 +9706,12 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     <section class="panel">
       <h3>Open + Resolved Trades</h3>
       <div class="muted" id="resolvedTotals">wins - | losses - | win rate - | total pnl -</div>
+      <div id="pmTradesDebug" class="debug-strip">lastFetchTs=- | lastHttpStatus=- | lastParseError=- | payloadKeys=- | rowsLength=-</div>
+      <div id="pmTradesEmptyState" class="empty-state" style="display:none;"></div>
       <div class="split">
         <div style="overflow:auto;">
           <div class="muted" style="margin-bottom:6px;">Open trades</div>
+          <div id="openTradesEmpty" class="empty-state soft" style="display:none;"></div>
           <table>
             <thead>
               <tr>
@@ -9025,7 +9722,7 @@ function renderPolymarketDashboardHtml(symbol: string): string {
           </table>
         </div>
         <div style="overflow:auto;">
-          <div class="muted" style="margin-bottom:6px;">Last 20 resolved trades</div>
+          <div class="muted" style="margin-bottom:6px;">Recent Trades (resolved)</div>
           <table>
             <thead>
               <tr>
@@ -9054,6 +9751,29 @@ function renderPolymarketDashboardJs(): string {
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status + " " + url);
       return await res.json();
+    }
+
+    async function fetchJsonWithMeta(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      const status = Number(res.status || 0);
+      const text = await res.text();
+      let payload = null;
+      let parseError = "";
+      if (text.length > 0) {
+        try {
+          payload = JSON.parse(text);
+        } catch (error) {
+          parseError = error instanceof Error ? error.message : String(error || "parse_failed");
+        }
+      }
+      if (!res.ok) {
+        const err = new Error("HTTP " + status + " " + url);
+        err.status = status;
+        err.payload = payload;
+        err.parseError = parseError;
+        throw err;
+      }
+      return { payload, status, parseError };
     }
 
     function setText(id, value, cls) {
@@ -9091,6 +9811,173 @@ function renderPolymarketDashboardJs(): string {
       if (min < 60) return min + "m ago";
       const hr = Math.floor(min / 60);
       return hr + "h ago";
+    }
+
+    function escapeHtml(value) {
+      return String(value == null ? "" : value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function truncateText(value, maxLen) {
+      const text = String(value == null ? "" : value);
+      if (text.length <= maxLen) return text;
+      return text.slice(0, Math.max(0, maxLen - 1)) + "…";
+    }
+
+    function payloadTailPreview(payload) {
+      try {
+        const text = JSON.stringify(payload, null, 2);
+        const lines = String(text || "").split("\\n");
+        const tail = lines.slice(-2).join(" ");
+        return truncateText(tail, 320);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "preview_failed");
+        return truncateText(message, 320);
+      }
+    }
+
+    function normalizeTradesPayload(payload) {
+      if (Array.isArray(payload)) {
+        return { rows: payload, meta: {} };
+      }
+      if (payload && typeof payload === "object") {
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        return { rows, meta: payload };
+      }
+      return { rows: [], meta: {} };
+    }
+
+    function resolveTs(value) {
+      if (value == null || value === "" || value === 0 || value === "0") return 0;
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > 0) return numeric;
+      const parsed = Date.parse(String(value));
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }
+
+    function isResolvedTrade(row) {
+      return resolveTs(row && row.resolvedAt) > 0;
+    }
+
+    function classifyTrades(rows) {
+      const source = Array.isArray(rows) ? rows : [];
+      const open = [];
+      const resolved = [];
+      for (const row of source) {
+        if (isResolvedTrade(row)) {
+          resolved.push(row);
+        } else {
+          open.push(row);
+        }
+      }
+      return { open, resolved };
+    }
+
+    function payloadKeysText(payload) {
+      if (Array.isArray(payload)) return "array";
+      if (payload && typeof payload === "object") {
+        const keys = Object.keys(payload);
+        return keys.length > 0 ? truncateText(keys.join(","), 200) : "-";
+      }
+      if (payload == null) return "null";
+      return typeof payload;
+    }
+
+    function setTradesDebug(info) {
+      const node = el("pmTradesDebug");
+      if (!node) return;
+      const fetchText = Number.isFinite(Number(info.lastFetchTs))
+        ? new Date(Number(info.lastFetchTs)).toISOString()
+        : "-";
+      const statusText = Number.isFinite(Number(info.lastHttpStatus))
+        ? String(info.lastHttpStatus)
+        : "-";
+      const parseErrorText = String(info.lastParseError || "-");
+      const keysText = payloadKeysText(info.payload);
+      const rowsLen = Number.isFinite(Number(info.rowsLength)) ? String(info.rowsLength) : "-";
+      node.textContent =
+        "lastFetchTs=" + fetchText +
+        " | lastHttpStatus=" + statusText +
+        " | lastParseError=" + parseErrorText +
+        " | payloadKeys=" + keysText +
+        " | rowsLength=" + rowsLen;
+    }
+
+    function setTradesEmptyState(payload, rowsLength, status) {
+      const node = el("pmTradesEmptyState");
+      if (!node) return;
+      const shouldShow = payload != null && Number(rowsLength || 0) === 0;
+      if (!shouldShow) {
+        node.style.display = "none";
+        node.textContent = "";
+        return;
+      }
+      const preview = payloadTailPreview(payload);
+      const statusText = Number.isFinite(Number(status)) ? String(status) : "-";
+      node.style.display = "block";
+      node.innerHTML =
+        "No trades rows parsed from non-null payload (status " + escapeHtml(statusText) + "). " +
+        "Validate API directly: <code>curl http://127.0.0.1:8787/api/polymarket/trades?limit=5</code>\\n" +
+        "Payload tail: " + escapeHtml(preview || "-");
+    }
+
+    function setOpenTradesEmpty(openTradesCount, summaryOpenTrades, rowsLength, summary) {
+      const node = el("openTradesEmpty");
+      if (!node) return;
+      if (Number(openTradesCount || 0) > 0) {
+        node.style.display = "none";
+        node.textContent = "";
+        return;
+      }
+      node.style.display = "block";
+      const openCount = String(Math.max(0, Math.floor(Number(summaryOpenTrades || 0))));
+      const rowsCount = String(Math.max(0, Math.floor(Number(rowsLength || 0))));
+      const mode = String(summary && summary.mode ? summary.mode : "paper").toUpperCase();
+      if (mode === "PAPER" && Number(summaryOpenTrades || 0) === 0) {
+        const fetchOk = Boolean(summary && (summary.dataHealth && Number(summary.dataHealth.lastHttpStatus) === 200));
+        const candidates = Math.max(0, Math.floor(Number(summary && summary.candidatesCount ? summary.candidatesCount : 0)));
+        const windows = Math.max(0, Math.floor(Number(summary && summary.windowsCount ? summary.windowsCount : 0)));
+        const holdReason = String((summary && summary.holdReason) || "-");
+        node.textContent =
+          "POLY PAPER status: fetchOk=" +
+          String(fetchOk) +
+          " candidates=" +
+          String(candidates) +
+          " windows=" +
+          String(windows) +
+          " holdReason=" +
+          holdReason;
+        return;
+      }
+      node.textContent =
+        Number(rowsLength || 0) > 0
+          ? "No open positions (history available). summary.openTrades=" + openCount + " | rowsLength=" + rowsCount
+          : "No open trades right now. summary.openTrades=" + openCount + " | rowsLength=" + rowsCount;
+    }
+
+    function resolveLastTradeTs(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) return 0;
+      let latest = 0;
+      for (const row of rows) {
+        const createdTs = resolveTs(row && row.createdTs);
+        const resolvedTs = resolveTs(row && row.resolvedAt);
+        latest = Math.max(latest, createdTs, resolvedTs);
+      }
+      return latest;
+    }
+
+    function updateModeBanner(summary) {
+      const node = el("pmModeBanner");
+      if (!node) return;
+      const mode = String(summary.mode || "paper").toUpperCase();
+      const polyMoney = Boolean(summary.polyMoney);
+      node.textContent = polyMoney ? "POLY LIVE (real money)" : "POLY PAPER (no real money)";
+      node.className = polyMoney ? "empty-state" : "empty-state soft";
+      setText("mMode", mode, polyMoney ? "good" : "");
     }
 
     function drawEquity(points) {
@@ -9131,8 +10018,13 @@ function renderPolymarketDashboardJs(): string {
       const body = el(bodyId);
       if (!body) return;
       const source = Array.isArray(rows) ? rows : [];
-      const filtered = source.filter((row) => mode === "open" ? !row.resolvedAt : !!row.resolvedAt);
-      const limited = mode === "open" ? filtered.slice(0, 20) : filtered.slice(0, 20);
+      const sorted = source.slice().sort((a, b) => {
+        if (mode === "resolved") {
+          return resolveTs(b && b.resolvedAt) - resolveTs(a && a.resolvedAt);
+        }
+        return resolveTs(b && b.createdTs) - resolveTs(a && a.createdTs);
+      });
+      const limited = sorted.slice(0, mode === "resolved" ? 10 : 20);
       if (limited.length === 0) {
         body.innerHTML = '<tr><td colspan="' + (mode === "open" ? "7" : "9") + '" class="muted">No rows.</td></tr>';
         return;
@@ -9245,6 +10137,12 @@ function renderPolymarketDashboardJs(): string {
         paused ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : "")) : "RUNNING",
         paused ? "bad" : "good"
       );
+      setText("pmHoldReason", String(summary.holdReason || "-"));
+      setText(
+        "pmSelection",
+        String(summary.selectedSlug || summary.currentSlug || "-") +
+          " | cands=" + String(Number.isFinite(Number(summary.finalCandidatesCount)) ? Math.max(0, Math.floor(Number(summary.finalCandidatesCount))) : 0)
+      );
 
       const toMsPair = (metric) =>
         Number.isFinite(Number(metric.p50)) && Number.isFinite(Number(metric.p90))
@@ -9290,39 +10188,92 @@ function renderPolymarketDashboardJs(): string {
     }
 
     async function refresh() {
-      const [summaryResp, tradesResp, equityResp, lagResp] = await Promise.all([
-        fetchJson("/api/polymarket/summary"),
-        fetchJson("/api/polymarket/trades?limit=200"),
-        fetchJson("/api/polymarket/equity"),
-        fetchJson("/api/polymarket/lag")
-      ]);
+      try {
+        const [summaryResp, tradesRespMeta, equityResp, lagResp] = await Promise.all([
+          fetchJson("/api/polymarket/summary"),
+          fetchJsonWithMeta("/api/polymarket/trades?limit=200"),
+          fetchJson("/api/polymarket/equity"),
+          fetchJson("/api/polymarket/lag")
+        ]);
 
-      const summary = summaryResp && typeof summaryResp === "object" ? summaryResp : {};
-      setText("mOpen", String(summary.openTrades || 0));
-      setText("mResolved", String(summary.resolvedTrades || 0));
-      setText("mTotalTrades", String(summary.totalTrades || 0));
-      setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
-      setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
-      setText("mWinRate", fmtP.format(Number(summary.winRate || 0)));
-      setText("mWins", String(summary.wins || 0), "good");
-      setText("mLosses", String(summary.losses || 0), "bad");
+        const summary = summaryResp && typeof summaryResp === "object" ? summaryResp : {};
+        setText("mOpen", String(summary.openTrades || 0));
+        setText("mResolved", String(summary.resolvedTrades || 0));
+        setText("mTotalTrades", String(summary.totalTrades || 0));
+        setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
+        setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
+        setText("mWinRate", fmtP.format(Number(summary.winRate || 0)));
+        setText("mWins", String(summary.wins || 0), "good");
+        setText("mLosses", String(summary.losses || 0), "bad");
+        setText("mLastAction", String(summary.lastAction || "HOLD"));
+        updateModeBanner(summary);
+        setText(
+          "mSelectedInfo",
+          String(summary.selectedSlug || "-") +
+            " / " +
+            String(Number.isFinite(Number(summary.finalCandidatesCount)) ? Math.max(0, Math.floor(Number(summary.finalCandidatesCount))) : 0)
+        );
 
-      if ((!summary.latestLag || !summary.latestModel) && lagResp && typeof lagResp === "object") {
-        summary.latestLag = lagResp.stats || summary.latestLag || null;
+        if ((!summary.latestLag || !summary.latestModel) && lagResp && typeof lagResp === "object") {
+          summary.latestLag = lagResp.stats || summary.latestLag || null;
+        }
+        renderCurrent(summary);
+        const payload = tradesRespMeta && Object.prototype.hasOwnProperty.call(tradesRespMeta, "payload")
+          ? tradesRespMeta.payload
+          : null;
+        const normalized = normalizeTradesPayload(payload);
+        const rows = normalized.rows;
+        const meta = normalized.meta && typeof normalized.meta === "object" ? normalized.meta : {};
+        const classified = classifyTrades(rows);
+        renderRows(classified.open, "openTradesBody", "open");
+        renderRows(classified.resolved, "resolvedTradesBody", "resolved");
+        setTradesDebug({
+          lastFetchTs: Date.now(),
+          lastHttpStatus: tradesRespMeta.status,
+          lastParseError: tradesRespMeta.parseError || "",
+          payload,
+          rowsLength: rows.length
+        });
+        setTradesEmptyState(payload, rows.length, tradesRespMeta.status);
+        setOpenTradesEmpty(classified.open.length, summary.openTrades, rows.length, summary);
+        setText("mRowsLoaded", String(rows.length));
+        const lastTradeTs = resolveLastTradeTs(rows);
+        setText("mLastTradeTime", lastTradeTs > 0 ? new Date(lastTradeTs).toLocaleString() : "-");
+        const totalsNode = el("resolvedTotals");
+        if (totalsNode) {
+          const metaCount = Number(meta.count);
+          const count = Number.isFinite(metaCount) ? metaCount : rows.length;
+          const wins = Number(meta.wins ?? summary.wins ?? 0);
+          const losses = Number(meta.losses ?? summary.losses ?? 0);
+          const winRate = Number(meta.winRate ?? summary.winRate ?? 0);
+          const totalPnlUsd = Number(meta.totalPnlUsd ?? summary.pnlTotalUsd ?? 0);
+          totalsNode.textContent =
+            "count " + String(Math.max(0, Math.floor(count))) +
+            " | wins " + String(Math.max(0, Math.floor(Number.isFinite(wins) ? wins : 0))) +
+            " | losses " + String(Math.max(0, Math.floor(Number.isFinite(losses) ? losses : 0))) +
+            " | win rate " + fmtP.format(Number.isFinite(winRate) ? winRate : 0) +
+            " | total pnl " + money(Number.isFinite(totalPnlUsd) ? totalPnlUsd : 0);
+        }
+        drawEquity(Array.isArray(equityResp.points) ? equityResp.points : []);
+      } catch (error) {
+        const status = Number(error && error.status);
+        setTradesDebug({
+          lastFetchTs: Date.now(),
+          lastHttpStatus: Number.isFinite(status) ? status : null,
+          lastParseError: error instanceof Error ? error.message : String(error || "refresh_failed"),
+          payload: error && Object.prototype.hasOwnProperty.call(error, "payload") ? error.payload : null,
+          rowsLength: 0
+        });
+        setTradesEmptyState(
+          error && Object.prototype.hasOwnProperty.call(error, "payload") ? error.payload : null,
+          0,
+          Number.isFinite(status) ? status : null
+        );
+        setOpenTradesEmpty(0, 0, 0, {});
+        setText("mRowsLoaded", "0");
+        setText("mLastTradeTime", "-");
+        console.error("polymarket_refresh_error", error);
       }
-      renderCurrent(summary);
-      const rows = Array.isArray(tradesResp.rows) ? tradesResp.rows : [];
-      renderRows(rows, "openTradesBody", "open");
-      renderRows(rows, "resolvedTradesBody", "resolved");
-      const totalsNode = el("resolvedTotals");
-      if (totalsNode) {
-        totalsNode.textContent =
-          "wins " + String(tradesResp.wins || 0) +
-          " | losses " + String(tradesResp.losses || 0) +
-          " | win rate " + fmtP.format(Number(tradesResp.winRate || 0)) +
-          " | total pnl " + money(Number(tradesResp.totalPnlUsd || 0));
-      }
-      drawEquity(Array.isArray(equityResp.points) ? equityResp.points : []);
     }
 
     const refreshBtn = el("refreshBtn");
@@ -9350,9 +10301,40 @@ function toFiniteNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function toTimestampMs(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    if (numeric < 1e12) return Math.floor(numeric * 1000);
+    if (numeric < 1e15) return Math.floor(numeric);
+    if (numeric < 1e18) return Math.floor(numeric / 1000);
+    return null;
+  }
+  const text = String(value).trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
 function toOptionalString(value: unknown): string | null {
   const text = String(value ?? "").trim();
   return text.length > 0 ? text : null;
+}
+
+function deriveHoldReasonFromAction(action: string | null): string | null {
+  const raw = String(action || "").trim();
+  if (!raw) return null;
+  const [root, detail] = raw.split(":");
+  if (root.trim().toUpperCase() !== "HOLD") return null;
+  const value = String(detail || "HOLD")
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+  return value.length > 0 ? value : "HOLD";
 }
 
 function buildPolymarketTradesPayload(

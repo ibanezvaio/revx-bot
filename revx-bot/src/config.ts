@@ -7,17 +7,20 @@ dotenv.config();
 const RUNTIME_BASE_DIR = resolveRuntimeBaseDir(process.env.REVX_RUNTIME_DIR);
 
 export type PolymarketMode = "paper" | "live";
+export type LogVerbosity = "quiet" | "normal" | "debug";
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type PolymarketConfig = {
   enabled: boolean;
   mode: PolymarketMode;
+  fetchEnabled: boolean;
   liveConfirmed: boolean;
   killSwitch: boolean;
   loopMs: number;
   marketQuery: {
     symbol: string;
     cadenceMinutes: number;
-    search: string;
+    search: string[];
     minWindowSec: number;
     maxWindowSec: number;
     maxMarkets: number;
@@ -73,7 +76,9 @@ export type PolymarketConfig = {
   };
   baseUrls: {
     gamma: string;
+    data: string;
     clob: string;
+    bridge: string;
   };
   http: {
     requestsPerMinute: number;
@@ -123,6 +128,7 @@ export type PolymarketConfig = {
     forceIntervalSec: number;
     forceNotional: number;
     forceSide: "YES" | "NO" | "AUTO";
+    forceSlug: string;
   };
 };
 
@@ -310,6 +316,7 @@ export type BotConfig = {
   quotingMinVolMoveBpsForExtraWidening: number;
   quotingLowVolMode: "KEEP_QUOTING";
   quotingForceBaselineWhenEnabled: boolean;
+  forceBaselineWhenOverCap: boolean;
   quotingBaselineNotionalUsd: number;
   quotingMinNotionalUsd: number;
   shockEnterBps: number;
@@ -414,9 +421,16 @@ export type BotConfig = {
   dbPath: string;
   storeBackend: "json" | "sqlite";
   debugBalances: boolean;
-  logLevel: string;
+  debugHttp: boolean;
+  strictSanityCheck: boolean;
+  disableFillsReconcile: boolean;
+  logVerbosity: LogVerbosity;
+  logModules: string[];
+  truthIntervalMs: number;
+  logLevel: LogLevel;
   requestsPerMinute: number;
   reconcileSeconds: number;
+  reconcileTimeoutMs: number;
   dashboardEnabled: boolean;
   dashboardPort: number;
   externalVenues: string[];
@@ -587,7 +601,7 @@ export function loadConfig(): BotConfig {
   const takerFeeBps = clampNumber(numberWithFallback(["TAKER_FEE_BPS", "FEES_TAKER_BPS"], 9), 0, 100);
   const takerSlipBps = clampNumber(numberWithDefault("TAKER_SLIP_BPS", 6), 0, 200);
   const takerSafetyBps = clampNumber(numberWithDefault("TAKER_SAFETY_BPS", 4), 0, 200);
-  const minMakerEdgeBps = clampNumber(numberWithDefault("MIN_MAKER_EDGE_BPS", 0.2), 0, 100);
+  const minMakerEdgeBps = clampNumber(numberWithDefault("MIN_MAKER_EDGE_BPS", 0.05), 0, 100);
   const minRealizedEdgeBps = clampNumber(numberWithDefault("MIN_REALIZED_EDGE_BPS", 4), -500, 500);
   const minTakerEdgeBps = clampNumber(numberWithDefault("MIN_TAKER_EDGE_BPS", 14), -500, 500);
   const enableAdverseSelectionLoop = boolWithDefault("ENABLE_ADVERSE_SELECTION_LOOP", true);
@@ -763,6 +777,10 @@ export function loadConfig(): BotConfig {
   const quotingForceBaselineWhenEnabled = boolWithFallback(
     ["QUOTING_FORCE_BASELINE_WHEN_ENABLED", "quoting.forceBaselineWhenEnabled"],
     true
+  );
+  const forceBaselineWhenOverCap = boolWithFallback(
+    ["FORCE_BASELINE_WHEN_OVER_CAP", "quoting.forceBaselineWhenOverCap"],
+    false
   );
   const quotingBaselineNotionalUsd = clampNumber(
     numberWithFallback(["QUOTING_BASELINE_NOTIONAL_USD", "quoting.baselineNotionalUsd"], 10),
@@ -1003,6 +1021,10 @@ export function loadConfig(): BotConfig {
 
   const polymarketEnabled = boolWithDefault("POLYMARKET_ENABLED", false);
   const polymarketMode = parsePolymarketMode(optional("POLYMARKET_MODE"));
+  const polymarketFetchEnabled = boolWithFallback(
+    ["POLYMARKET_FETCH_ENABLED", "POLYMARKET_FETCH", "ENABLE_POLYMARKET_FETCH"],
+    true
+  );
   const polymarketLiveConfirmed = boolWithDefault("POLYMARKET_LIVE_CONFIRMED", false);
   const polymarketKillSwitch = boolWithDefault("POLYMARKET_KILL_SWITCH", false);
   const polymarketLoopMs = clampInt(numberWithDefault("POLYMARKET_LOOP_MS", 2_000), 250, 60_000);
@@ -1010,21 +1032,47 @@ export function loadConfig(): BotConfig {
     .trim()
     .toUpperCase();
   const polymarketCadenceMinutes = clampInt(numberWithDefault("POLYMARKET_CADENCE_MINUTES", 5), 1, 60);
-  const polymarketSearch = withDefault(
-    "POLYMARKET_MARKET_SEARCH",
-    "btc 5 minute up down"
+  const polymarketDefaultSearches = [
+    "btc",
+    "bitcoin",
+    "btc up down",
+    "bitcoin up down",
+    "btc 5m",
+    "btc 5 minute",
+    "up down",
+    "higher lower",
+    "above below"
+  ];
+  const polymarketSearchesFromCsv = parsePolymarketSearchList(optional("POLYMARKET_MARKET_SEARCHES"));
+  const polymarketSearchFallback = parsePolymarketSearchList(optional("POLYMARKET_MARKET_SEARCH"));
+  const polymarketSearches = (
+    polymarketSearchesFromCsv.length > 0
+      ? polymarketSearchesFromCsv
+      : polymarketSearchFallback.length > 0
+        ? polymarketSearchFallback
+        : polymarketDefaultSearches
+  ).filter((row) => row.trim().length > 0);
+  const defaultPolymarketMinWindowSec = polymarketCadenceMinutes === 5 ? 20 : 240;
+  const defaultPolymarketMaxWindowSec = polymarketCadenceMinutes === 5 ? 240 : 360;
+  const polymarketMinWindowSec = clampInt(
+    numberWithDefault("POLYMARKET_MIN_WINDOW_SEC", defaultPolymarketMinWindowSec),
+    10,
+    7_200
   );
-  const polymarketMinWindowSec = clampInt(numberWithDefault("POLYMARKET_MIN_WINDOW_SEC", 240), 10, 7_200);
-  const polymarketMaxWindowSec = clampInt(numberWithDefault("POLYMARKET_MAX_WINDOW_SEC", 360), 10, 7_200);
-  const polymarketMaxMarkets = clampInt(numberWithDefault("POLYMARKET_MAX_MARKETS", 40), 1, 500);
+  const polymarketMaxWindowSec = clampInt(
+    numberWithDefault("POLYMARKET_MAX_WINDOW_SEC", defaultPolymarketMaxWindowSec),
+    10,
+    7_200
+  );
+  const polymarketMaxMarkets = clampInt(numberWithDefault("POLYMARKET_MAX_MARKETS", 100), 1, 500);
   const polymarketMaxScanMarkets = clampInt(
-    numberWithDefault("POLYMARKET_SCAN_MAX_MARKETS", 5_000),
+    numberWithDefault("POLYMARKET_SCAN_MAX_MARKETS", 15_000),
     100,
     50_000
   );
   const polymarketScanPageSize = clampInt(numberWithDefault("POLYMARKET_SCAN_PAGE_SIZE", 200), 20, 1_000);
   const polymarketScanTargetCandidates = clampInt(
-    numberWithDefault("POLYMARKET_SCAN_TARGET_CANDIDATES", 20),
+    numberWithDefault("POLYMARKET_SCAN_TARGET_CANDIDATES", 60),
     1,
     1_000
   );
@@ -1043,10 +1091,10 @@ export function loadConfig(): BotConfig {
     "(?:up\\s*/\\s*down|up\\s+down|direction|higher\\s*/\\s*lower|higher|lower|above\\s*/\\s*below|above|below)"
   );
 
-  const polymarketBaseEdge = clampNumber(numberWithDefault("POLYMARKET_BASE_EDGE", 0.02), 0, 0.5);
-  const polymarketVolK = clampNumber(numberWithDefault("POLYMARKET_VOL_K", 3), 0, 200);
-  const polymarketClosePenalty = clampNumber(numberWithDefault("POLYMARKET_CLOSE_PENALTY", 0.05), 0, 1);
-  const polymarketMaxSpread = clampNumber(numberWithDefault("POLYMARKET_MAX_SPREAD", 0.06), 0, 1);
+  const polymarketBaseEdge = clampNumber(numberWithDefault("POLYMARKET_BASE_EDGE", 0.005), 0, 0.5);
+  const polymarketVolK = clampNumber(numberWithDefault("POLYMARKET_VOL_K", 1.5), 0, 200);
+  const polymarketClosePenalty = clampNumber(numberWithDefault("POLYMARKET_CLOSE_PENALTY", 0.02), 0, 1);
+  const polymarketMaxSpread = clampNumber(numberWithDefault("POLYMARKET_MAX_SPREAD", 0.12), 0, 1);
 
   const polymarketFractionalKelly = clampNumber(
     numberWithDefault("POLYMARKET_FRACTIONAL_KELLY", 0.2),
@@ -1054,7 +1102,7 @@ export function loadConfig(): BotConfig {
     1
   );
   const polymarketMaxNotionalPerWindow = clampNumber(
-    numberWithDefault("POLYMARKET_MAX_NOTIONAL_PER_WINDOW", 10),
+    numberWithDefault("POLYMARKET_MAX_NOTIONAL_PER_WINDOW", 20),
     0.1,
     100_000
   );
@@ -1062,36 +1110,44 @@ export function loadConfig(): BotConfig {
   const polymarketMaxDailyLoss = clampNumber(numberWithDefault("POLYMARKET_MAX_DAILY_LOSS", 25), 0.1, 1_000_000);
   const polymarketMaxDailyLossRaw = optional("POLYMARKET_MAX_DAILY_LOSS");
   const polymarketMaxConcurrentWindows = clampInt(
-    numberWithDefault("POLYMARKET_MAX_CONCURRENT_WINDOWS", 3),
+    numberWithDefault("POLYMARKET_MAX_CONCURRENT_WINDOWS", 6),
     1,
     100
   );
   const polymarketMinOrderNotional = clampNumber(
-    numberWithDefault("POLYMARKET_MIN_ORDER_NOTIONAL", 1),
+    numberWithDefault("POLYMARKET_MIN_ORDER_NOTIONAL", 0.5),
     0.01,
     10_000
   );
 
-  const polymarketStaleMs = clampInt(numberWithDefault("POLYMARKET_STALE_MS", 5000), 250, 120_000);
+  const polymarketStaleMs = clampInt(numberWithDefault("POLYMARKET_STALE_MS", 15000), 250, 120_000);
   const polymarketStaleKillAfterMs = clampInt(
-    numberWithDefault("POLYMARKET_STALE_KILL_AFTER_SEC", 60) * 1000,
+    numberWithDefault("POLYMARKET_STALE_KILL_AFTER_SEC", 180) * 1000,
     polymarketStaleMs,
     30 * 60 * 1000
   );
   const polymarketNoNewOrdersInLastSec = clampInt(
-    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", 30),
+    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", 5),
     0,
     300
   );
-  const polymarketMaxOpenOrders = clampInt(numberWithDefault("POLYMARKET_MAX_OPEN_ORDERS", 6), 1, 100);
+  const polymarketMaxOpenOrders = clampInt(numberWithDefault("POLYMARKET_MAX_OPEN_ORDERS", 12), 1, 100);
   const polymarketMaxExposure = clampNumber(numberWithDefault("POLYMARKET_MAX_EXPOSURE", 30), 0.1, 1_000_000);
 
-  const polymarketGammaBaseUrl = withDefault(
-    "POLYMARKET_GAMMA_BASE_URL",
-    "https://gamma-api.polymarket.com"
+  const polymarketGammaBaseUrl =
+    optional("POLY_GAMMA_BASE_URL") ||
+    withDefault("POLYMARKET_GAMMA_BASE_URL", "https://gamma-api.polymarket.com");
+  const polymarketDataBaseUrl =
+    optional("POLY_DATA_BASE_URL") ||
+    withDefault("POLYMARKET_DATA_BASE_URL", "https://data-api.polymarket.com");
+  const polymarketLegacyBaseUrl = optional("POLYMARKET_BASE_URL");
+  const polymarketClobBaseUrl =
+    optional("POLY_CLOB_BASE_URL") ||
+    withDefault("POLYMARKET_CLOB_BASE_URL", polymarketLegacyBaseUrl || "https://clob.polymarket.com");
+  const polymarketBridgeBaseUrl = withDefault(
+    "POLYMARKET_BRIDGE_BASE_URL",
+    "https://bridge.polymarket.com"
   );
-  const polymarketBaseUrl = withDefault("POLYMARKET_BASE_URL", "https://clob.polymarket.com");
-  const polymarketClobBaseUrl = withDefault("POLYMARKET_CLOB_BASE_URL", polymarketBaseUrl);
   const polymarketHttpRequestsPerMinute = clampInt(
     numberWithDefault("POLYMARKET_HTTP_RPM", 360),
     30,
@@ -1172,13 +1228,13 @@ export function loadConfig(): BotConfig {
   const polymarketPaperMinEdgeThreshold = clampNumber(
     numberWithFallback(
       ["POLYMARKET_PAPER_MIN_EDGE", "POLYMARKET_PAPER_MIN_EDGE_THRESHOLD"],
-      polymarketBaseEdge
+      0.002
     ),
     0,
     0.5
   );
   const polymarketMinNetEdge = clampNumber(
-    numberWithDefault("POLYMARKET_MIN_NET_EDGE", 0.01),
+    numberWithDefault("POLYMARKET_MIN_NET_EDGE", 0.001),
     0,
     0.5
   );
@@ -1198,7 +1254,7 @@ export function loadConfig(): BotConfig {
     0.5
   );
   const polymarketEntryMinElapsedSec = clampInt(
-    numberWithDefault("POLYMARKET_ENTRY_MIN_ELAPSED_SEC", 20),
+    numberWithDefault("POLYMARKET_ENTRY_MIN_ELAPSED_SEC", 5),
     0,
     299
   );
@@ -1207,13 +1263,17 @@ export function loadConfig(): BotConfig {
     1,
     300
   );
+  const defaultPolymarketEntryMaxRemainingSec = polymarketCadenceMinutes === 5 ? 600 : 180;
   const polymarketEntryMaxRemainingSec = clampInt(
-    numberWithDefault("POLYMARKET_ENTRY_MAX_REMAINING_SEC", 90),
+    numberWithFallback(
+      ["POLY_SNIPER_MAX_SEC", "POLYMARKET_ENTRY_MAX_REMAINING_SEC"],
+      defaultPolymarketEntryMaxRemainingSec
+    ),
     1,
-    300
+    1800
   );
   const polymarketEntryMinRemainingSec = clampInt(
-    numberWithDefault("POLYMARKET_ENTRY_MIN_REMAINING_SEC", 20),
+    numberWithFallback(["POLY_SNIPER_MIN_SEC", "POLYMARKET_ENTRY_MIN_REMAINING_SEC"], 20),
     0,
     300
   );
@@ -1224,10 +1284,10 @@ export function loadConfig(): BotConfig {
   );
   const polymarketPaperAllowMultipleTradesPerWindow = boolWithDefault(
     "POLYMARKET_PAPER_ALLOW_MULTIPLE_TRADES_PER_WINDOW",
-    false
+    true
   );
   const polymarketPaperStopLossEdge = clampNumber(
-    numberWithDefault("POLYMARKET_PAPER_STOP_LOSS_EDGE", 0.02),
+    numberWithDefault("POLYMARKET_PAPER_STOP_LOSS_EDGE", 0.01),
     0.0001,
     0.5
   );
@@ -1258,6 +1318,7 @@ export function loadConfig(): BotConfig {
     100_000
   );
   const polymarketPaperForceSide = parsePolymarketPaperForceSide(optional("POLYMARKET_PAPER_FORCE_SIDE"));
+  const polymarketPaperForceSlug = optional("POLY_FORCE_SLUG") || "";
 
   if (volSpreadMultMax < volSpreadMultMin) {
     throw new Error("VOL_SPREAD_MULT_MAX must be >= VOL_SPREAD_MULT_MIN");
@@ -1507,6 +1568,7 @@ export function loadConfig(): BotConfig {
     quotingMinVolMoveBpsForExtraWidening,
     quotingLowVolMode,
     quotingForceBaselineWhenEnabled,
+    forceBaselineWhenOverCap,
     quotingBaselineNotionalUsd,
     quotingMinNotionalUsd,
     shockEnterBps,
@@ -1622,9 +1684,19 @@ export function loadConfig(): BotConfig {
     dbPath: withDefault("DB_PATH", "./revx-bot.sqlite"),
     storeBackend: parseStoreBackend(optional("STORE_BACKEND")),
     debugBalances: boolWithDefault("DEBUG_BALANCES", false),
-    logLevel: withDefault("LOG_LEVEL", "info"),
+    debugHttp: boolWithDefault("DEBUG_HTTP", false),
+    strictSanityCheck: boolWithDefault("STRICT_SANITY_CHECK", false),
+    disableFillsReconcile: boolWithFallback(
+      ["DISABLE_FILLS_RECONCILE", "REVX_DISABLE_FILLS_RECONCILE"],
+      false
+    ),
+    logVerbosity: parseLogVerbosity(optional("LOG_VERBOSITY")),
+    logModules: parseCsvListRaw(optional("LOG_MODULES")).map((row) => row.toLowerCase()),
+    truthIntervalMs: clampInt(numberWithDefault("TRUTH_INTERVAL_MS", 10_000), 1_000, 120_000),
+    logLevel: parseLogLevel(optional("LOG_LEVEL")),
     requestsPerMinute: numberWithDefault("REQUESTS_PER_MINUTE", 800),
     reconcileSeconds: clampInt(numberWithDefault("RECONCILE_SECONDS", 5), 3, 60),
+    reconcileTimeoutMs: clampInt(numberWithFallback(["RECONCILE_TIMEOUT_MS", "REVX_HTTP_TIMEOUT_MS"], 30_000), 1_000, 120_000),
     dashboardEnabled: boolWithDefault("DASHBOARD_ENABLED", true),
     dashboardPort: numberWithDefault("DASHBOARD_PORT", 8787),
     externalVenues,
@@ -1640,13 +1712,14 @@ export function loadConfig(): BotConfig {
     polymarket: {
       enabled: polymarketEnabled,
       mode: polymarketMode,
+      fetchEnabled: polymarketFetchEnabled,
       liveConfirmed: polymarketLiveConfirmed,
       killSwitch: polymarketKillSwitch,
       loopMs: polymarketLoopMs,
       marketQuery: {
         symbol: polymarketMarketSymbol,
         cadenceMinutes: polymarketCadenceMinutes,
-        search: polymarketSearch,
+        search: polymarketSearches,
         minWindowSec: polymarketMinWindowSec,
         maxWindowSec: polymarketMaxWindowSec,
         maxMarkets: polymarketMaxMarkets,
@@ -1702,7 +1775,9 @@ export function loadConfig(): BotConfig {
       },
       baseUrls: {
         gamma: polymarketGammaBaseUrl,
-        clob: polymarketClobBaseUrl
+        data: polymarketDataBaseUrl,
+        clob: polymarketClobBaseUrl,
+        bridge: polymarketBridgeBaseUrl
       },
       http: {
         requestsPerMinute: polymarketHttpRequestsPerMinute,
@@ -1751,7 +1826,8 @@ export function loadConfig(): BotConfig {
         forceTrade: polymarketPaperForceTrade,
         forceIntervalSec: polymarketPaperForceIntervalSec,
         forceNotional: polymarketPaperForceNotional,
-        forceSide: polymarketPaperForceSide
+        forceSide: polymarketPaperForceSide,
+        forceSlug: polymarketPaperForceSlug
       }
     }
   };
@@ -1926,6 +2002,21 @@ function parseStoreBackend(value: string | undefined): "json" | "sqlite" {
   throw new Error("STORE_BACKEND must be either 'json' or 'sqlite'");
 }
 
+function parseLogVerbosity(value: string | undefined): LogVerbosity {
+  const normalized = String(value ?? "normal").trim().toLowerCase();
+  if (normalized === "quiet") return "quiet";
+  if (normalized === "debug") return "debug";
+  return "normal";
+}
+
+function parseLogLevel(value: string | undefined): LogLevel {
+  const normalized = String(value ?? "info").trim().toLowerCase();
+  if (normalized === "debug" || normalized === "info" || normalized === "warn" || normalized === "error") {
+    return normalized;
+  }
+  return "info";
+}
+
 function resolveAbsolutePath(inputPath: string): string {
   const value = inputPath.trim();
   if (path.isAbsolute(value)) {
@@ -1996,6 +2087,25 @@ function parseCsvListRaw(value: string | undefined): string[] {
     unique.add(normalized);
   }
   return Array.from(unique.values());
+}
+
+function parsePolymarketSearchList(value: string | undefined): string[] {
+  if (!value) return [];
+  const normalized = value.trim();
+  if (!normalized) return [];
+  if (normalized.startsWith("[") && normalized.endsWith("]")) {
+    try {
+      const parsed = JSON.parse(normalized);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((row) => String(row ?? "").trim())
+          .filter((row) => row.length > 0);
+      }
+    } catch {
+      // fall through to CSV parsing
+    }
+  }
+  return parseCsvListRaw(normalized);
 }
 
 function parseNumberCsv(value: string | undefined, fallback: number[]): number[] {

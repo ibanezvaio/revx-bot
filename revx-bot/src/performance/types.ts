@@ -52,15 +52,21 @@ export type AnalysisSummary = {
 export type FillAnalysisRow = {
   id: string;
   ts: number;
+  symbol: string;
   side: "BUY" | "SELL";
   price: number;
   baseQty: number;
+  sizeBTC: number;
   quoteQty: number;
   feeUsd: number;
   orderId: string;
+  venueOrderId: string;
   clientOrderId: string;
   posture: string;
   revxMidAtFill: number;
+  source: string;
+  deltaUSD: number | null;
+  deltaBTC: number | null;
   edgeBps: number | null;
   toxBps30s: number | null;
   toxBps2m: number | null;
@@ -114,4 +120,3 @@ export type AdaptiveStatus = {
     hardLimited: boolean;
   };
 };
-

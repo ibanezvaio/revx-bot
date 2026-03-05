@@ -389,6 +389,7 @@ async function run(): Promise<void> {
         JSON.stringify(
           {
             mode,
+            fetchEnabled: effectiveConfig.polymarket.fetchEnabled,
             loopMs: effectiveConfig.polymarket.loopMs,
             marketQuery: effectiveConfig.polymarket.marketQuery,
             threshold: effectiveConfig.polymarket.threshold,

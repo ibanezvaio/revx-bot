@@ -23,7 +23,7 @@ import {
 import { SignalsEngine } from "../signals/SignalsEngine";
 import { SignalSnapshot as AggregateSignalsSnapshot } from "../signals/types";
 import { signalDebugState } from "../signals/SignalDebugState";
-import { BotStatus, OrderRecord, Side, Store } from "../store/Store";
+import { BotEvent, BotStatus, OrderRecord, Side, Store } from "../store/Store";
 import {
   AdverseSelectionSummary,
   AdverseSelectionTracker
@@ -44,6 +44,7 @@ import { seedDebugState } from "./SeedDebugState";
 import { strategyHealthState } from "./StrategyHealthState";
 import { SignalsGuard, SignalsGuardDecision } from "./SignalsGuard";
 import { sleep } from "../util/time";
+import { getTradingTruthReporter, isDebugVerbosity } from "../logging/truth";
 
 type DesiredQuote = {
   tag: string;
@@ -317,6 +318,11 @@ export class MakerStrategy {
   private lastRecoverableError = "";
   private privateCallBackoffUntilTs = 0;
   private privateCallBackoffMs = 0;
+  private reconcileInFlightPromise: Promise<void> | null = null;
+  private reconcileInFlightStartedMs = 0;
+  private lastTruthBalanceTotals: { usdTotal: number; btcTotal: number } | null = null;
+  private lastTruthInventoryCapBlock: { ts: number; btcNotionalUsd: number; maxBtcNotionalUsd: number } | null = null;
+  private readonly truthReporter: ReturnType<typeof getTradingTruthReporter>;
   private lastShockDecision: MarketShockDecision = {
     phase: "STABILIZING",
     state: "STABILIZING",
@@ -379,6 +385,7 @@ export class MakerStrategy {
       decayBpsPerMin: this.config.asDecayBpsPerMin
     });
     this.balanceManager.setRefreshIntervalMs(this.config.balanceRefreshSeconds * 1000);
+    this.truthReporter = getTradingTruthReporter(this.config, this.logger);
   }
 
   stop(): void {
@@ -455,7 +462,7 @@ export class MakerStrategy {
             await this.reconciler.refreshBalancesNow("insufficient_balance");
           }
           if (classification.isStaleSnapshot) {
-            await this.reconcileOnceWithTimeout(5_000);
+            await this.reconcileOnceWithTimeout();
           }
           this.risk.recordSuccess();
           return;
@@ -507,7 +514,9 @@ export class MakerStrategy {
 
   async runSingleCycle(): Promise<void> {
     let cycleErrored = false;
-    this.logger.info({ symbol: this.config.symbol }, "Cycle start");
+    if (isDebugVerbosity(this.config)) {
+      this.logger.info({ symbol: this.config.symbol }, "Cycle start");
+    }
     try {
     const effectiveConfig = this.store.getEffectiveConfig(this.config.symbol);
     if (this.balanceManager.shouldRefresh(Date.now())) {
@@ -1235,7 +1244,7 @@ export class MakerStrategy {
 
     const latest = this.reconciler.getLatestState();
     if (!latest || Date.now() - latest.ts > this.config.reconcileSeconds * 1500) {
-      await this.reconcileOnceWithTimeout(10_000);
+      await this.reconcileOnceWithTimeout();
     }
 
     const ticker = await this.marketData.getTicker(this.config.symbol);
@@ -3384,7 +3393,11 @@ export class MakerStrategy {
     }
 
     const desiredBeforeMakerEdgeGuard = desired.slice();
-    const makerMinEdgeBps = computeMakerMinEdgeBps(this.config.minMakerEdgeBps, marketSpreadBps);
+    const fillDroughtTightenActive = adaptiveAdjustments.includes("FILL_DROUGHT_TIGHTEN");
+    const makerEdgeDroughtOverrideActive = rolling.fills_last_1h === 0 || fillDroughtTightenActive;
+    const makerMinEdgeConfiguredBps = Math.max(0, this.config.minMakerEdgeBps);
+    const makerMinEdgeTargetBps = makerEdgeDroughtOverrideActive ? 0 : makerMinEdgeConfiguredBps;
+    const makerMinEdgeBps = computeMakerMinEdgeBps(makerMinEdgeTargetBps, marketSpreadBps);
     if (fairMidForGuards > 0 && Number.isFinite(fairMidForGuards) && desired.length > 0) {
       const edgeGuard = applyMakerQuoteGuard({
         orders: desired,
@@ -3394,7 +3407,7 @@ export class MakerStrategy {
       });
       if (edgeGuard.kept.length !== desired.length) {
         desired = edgeGuard.kept;
-        const reason = `MAKER_EDGE_SOFT_FILTER (minMakerEdge=${edgeGuard.appliedMinMakerEdgeBps.toFixed(2)} fairMid=${fairMidForGuards.toFixed(2)} dropped=${desired.length === 0 ? "all" : "some"})`;
+        const reason = `MAKER_EDGE_SOFT_FILTER (minMakerEdge=${edgeGuard.appliedMinMakerEdgeBps.toFixed(2)} fairMid=${fairMidForGuards.toFixed(2)} droughtOverride=${makerEdgeDroughtOverrideActive} dropped=${desired.length === 0 ? "all" : "some"})`;
         quotePlan.blockedReasons.push(reason);
         if (edgeGuard.droppedBySide.BUY > 0) {
           const buyReason = `Maker guard dropped ${edgeGuard.droppedBySide.BUY} BUY maker levels below ${edgeGuard.appliedMinMakerEdgeBps.toFixed(2)} bps`;
@@ -3984,6 +3997,9 @@ export class MakerStrategy {
         signal_spread_action: signalSpreadAction,
         fills_last_1h: rolling.fills_last_1h,
         fills_last_30m: rolling.fills_last_30m,
+        maker_min_edge_bps: makerMinEdgeBps,
+        maker_min_edge_configured_bps: makerMinEdgeConfiguredBps,
+        maker_min_edge_drought_override: makerEdgeDroughtOverrideActive,
         edge_lookback_minutes: this.config.edgeLookbackMinutes,
         edge_lookback_avg_buy_bps: edgeLookback.avgBuy,
         edge_lookback_avg_sell_bps: edgeLookback.avgSell,
@@ -4245,6 +4261,8 @@ export class MakerStrategy {
     let whyNotQuoting: string | undefined;
     let whyNotQuotingDetails: string | undefined;
     let forceBaselineApplied = false;
+    let baselineAckReceived = false;
+    let baselineAckMissing = false;
     if (plannerZeroOutputDetails) {
       whyNotQuoting = "PLANNER_ZERO_OUTPUT";
       whyNotQuotingDetails = plannerZeroOutputDetails;
@@ -4336,31 +4354,38 @@ export class MakerStrategy {
           botStatusBase.lastError = errorText;
           this.logger.warn({ errors: baseline.errors }, "Forced baseline placement errors");
         }
+        baselineAckReceived = baseline.ackReceived;
+        baselineAckMissing = baseline.ackMissing;
       }
 
       postReconcileActiveOrders = this.store.getActiveBotOrders(this.config.symbol);
       openVenueSides = this.countOpenVenueSides(postReconcileActiveOrders);
       if (openVenueSides.buy < 1 || openVenueSides.sell < 1) {
-        if (this.baselineInvariantMissingSinceTs <= 0) {
-          this.baselineInvariantMissingSinceTs = Date.now();
-        }
-        if (Date.now() - this.baselineInvariantMissingSinceTs >= 5_000) {
-          whyNotQuoting = "ORDER_ACK_MISSING";
-          whyNotQuotingDetails =
-            `forced baseline active but venue-open sides still missing (buy=${openVenueSides.buy} sell=${openVenueSides.sell})`;
-          botStatusBase.lastError = whyNotQuotingDetails;
-          orderReconcileState.markReconcileError(whyNotQuotingDetails, Date.now());
-          if (Date.now() - this.baselineAckMissingLoggedAtTs >= 5_000) {
-            this.baselineAckMissingLoggedAtTs = Date.now();
-            this.logger.warn(
-              {
-                buyOpen: openVenueSides.buy,
-                sellOpen: openVenueSides.sell,
-                quoteEnabled: quotePlan.quoteEnabled
-              },
-              "Forced baseline submitted but venue ack missing"
-            );
+        if (baselineAckMissing && !baselineAckReceived) {
+          if (this.baselineInvariantMissingSinceTs <= 0) {
+            this.baselineInvariantMissingSinceTs = Date.now();
           }
+          if (Date.now() - this.baselineInvariantMissingSinceTs >= 5_000) {
+            whyNotQuoting = "ORDER_ACK_MISSING";
+            whyNotQuotingDetails =
+              `forced baseline active but venue-open sides still missing (buy=${openVenueSides.buy} sell=${openVenueSides.sell})`;
+            botStatusBase.lastError = whyNotQuotingDetails;
+            orderReconcileState.markReconcileError(whyNotQuotingDetails, Date.now());
+            if (Date.now() - this.baselineAckMissingLoggedAtTs >= 5_000) {
+              this.baselineAckMissingLoggedAtTs = Date.now();
+              this.logger.warn(
+                {
+                  buyOpen: openVenueSides.buy,
+                  sellOpen: openVenueSides.sell,
+                  quoteEnabled: quotePlan.quoteEnabled
+                },
+                "Forced baseline submitted but venue ack missing"
+              );
+            }
+          }
+        } else {
+          this.baselineInvariantMissingSinceTs = 0;
+          this.baselineAckMissingLoggedAtTs = 0;
         }
       } else {
         this.baselineInvariantMissingSinceTs = 0;
@@ -4464,7 +4489,7 @@ export class MakerStrategy {
     });
 
     const now = Date.now();
-    if (now - this.lastMetricsLogMs >= this.config.metricsLogEverySeconds * 1000) {
+    if (isDebugVerbosity(this.config) && now - this.lastMetricsLogMs >= this.config.metricsLogEverySeconds * 1000) {
       this.lastMetricsLogMs = now;
       this.logger.info(
         {
@@ -4485,6 +4510,10 @@ export class MakerStrategy {
           signalConfidence: Number(signalState.confidence.toFixed(2)),
           fillsLast30m: rolling.fills_last_30m,
           fillsLast1h: rolling.fills_last_1h,
+          makerMinEdgeBps: Number(makerMinEdgeBps.toFixed(4)),
+          makerMinEdgeConfiguredBps: Number(makerMinEdgeConfiguredBps.toFixed(4)),
+          makerMinEdgeDroughtOverride: makerEdgeDroughtOverrideActive,
+          reconcileTimeoutMs: this.config.reconcileTimeoutMs,
           avgEdgeBuy: Number(edgeLookback.avgBuy.toFixed(2)),
           avgEdgeSell: Number(edgeLookback.avgSell.toFixed(2)),
           cancels1h: rolling.cancels_last_1h,
@@ -4574,10 +4603,109 @@ export class MakerStrategy {
       this.logger.error({ symbol: this.config.symbol, error }, "Cycle failed");
       throw error;
     } finally {
-      if (!cycleErrored) {
+      if (!cycleErrored && isDebugVerbosity(this.config)) {
         this.logger.info({ symbol: this.config.symbol }, "Cycle complete");
       }
+      if (!cycleErrored) {
+        this.emitRevxTruthFromStore(Date.now());
+      }
     }
+  }
+
+  private emitRevxTruthFromStore(ts: number): void {
+    const activeOrders = this.store.getActiveBotOrders(this.config.symbol);
+    const buyOpen = activeOrders.filter((row) => row.side === "BUY").length;
+    const sellOpen = activeOrders.filter((row) => row.side === "SELL").length;
+    const balances = this.store.getLatestBalances();
+    const usdTotal = findBalanceTotalByAsset(balances, ["USD", "USDC"]);
+    const btcTotal = findBalanceTotalByAsset(balances, ["BTC", "XBT"]);
+    const deltaUsd =
+      this.lastTruthBalanceTotals !== null ? usdTotal - this.lastTruthBalanceTotals.usdTotal : null;
+    const deltaBtc =
+      this.lastTruthBalanceTotals !== null ? btcTotal - this.lastTruthBalanceTotals.btcTotal : null;
+    this.lastTruthBalanceTotals = {
+      usdTotal,
+      btcTotal
+    };
+    const truthOrderAction = this.resolveTruthOrderAction(this.store.getRecentBotEvents(200));
+    const lastFill = this.store.getRecentFills(1)[0] ?? null;
+    const lastFillOrderSide = lastFill ? this.store.getOrderByVenueId(lastFill.venue_order_id)?.side ?? null : null;
+    const inferredSide =
+      Number.isFinite(Number(deltaBtc)) &&
+      Number.isFinite(Number(deltaUsd)) &&
+      Number(deltaBtc) > 0 &&
+      Number(deltaUsd) < 0
+        ? "BUY"
+        : Number.isFinite(Number(deltaBtc)) &&
+            Number.isFinite(Number(deltaUsd)) &&
+            Number(deltaBtc) < 0 &&
+            Number(deltaUsd) > 0
+          ? "SELL"
+          : null;
+    const resolvedLastFillSide =
+      lastFillOrderSide === "BUY" || lastFillOrderSide === "SELL" ? lastFillOrderSide : inferredSide;
+    const inventoryCapBlockActive =
+      this.lastTruthInventoryCapBlock && ts - this.lastTruthInventoryCapBlock.ts <= 30_000
+        ? this.lastTruthInventoryCapBlock
+        : null;
+    if (!inventoryCapBlockActive) {
+      this.lastTruthInventoryCapBlock = null;
+    }
+    this.truthReporter.updateRevx({
+      ts,
+      force: false,
+      mode: this.config.dryRun ? "DRY" : "LIVE",
+      symbol: this.config.symbol,
+      buyOpen,
+      sellOpen,
+      lastOrderAction: truthOrderAction.action,
+      lastVenueOrderId: truthOrderAction.venueOrderId,
+      usdTotal,
+      btcTotal,
+      deltaUsd,
+      deltaBtc,
+      lastFillTs: lastFill?.ts ?? null,
+      lastFillSide: resolvedLastFillSide,
+      lastFillInferredSide: inferredSide,
+      lastFillPrice: lastFill?.price ?? null,
+      lastFillSize: lastFill?.qty ?? null,
+      blockedReason: inventoryCapBlockActive ? "INVENTORY_CAP" : null,
+      blockedBtcNotional: inventoryCapBlockActive?.btcNotionalUsd ?? null,
+      blockedMaxBtcNotional: inventoryCapBlockActive?.maxBtcNotionalUsd ?? null
+    });
+  }
+
+  private resolveTruthOrderAction(
+    events: BotEvent[]
+  ): { action: "PLACED" | "CANCELLED" | "FILL" | "NONE"; venueOrderId: string | null } {
+    const sorted = events
+      .filter((row) => row && Number.isFinite(Number(row.ts)))
+      .slice()
+      .sort((a, b) => Number(b.ts) - Number(a.ts));
+    for (const event of sorted) {
+      if (event.type === "PLACED") {
+        return {
+          action: "PLACED",
+          venueOrderId: event.venue_order_id ?? null
+        };
+      }
+      if (event.type === "CANCELLED") {
+        return {
+          action: "CANCELLED",
+          venueOrderId: event.venue_order_id ?? null
+        };
+      }
+      if (event.type === "FILLED") {
+        return {
+          action: "FILL",
+          venueOrderId: event.venue_order_id ?? null
+        };
+      }
+    }
+    return {
+      action: "NONE",
+      venueOrderId: null
+    };
   }
 
   private activateRuntimeHardHalt(reason: string): void {
@@ -5226,12 +5354,23 @@ export class MakerStrategy {
     missingBuy: boolean;
     missingSell: boolean;
     remainingActionsBudget: number;
-  }): Promise<{ applied: boolean; placed: number; actionsUsed: number; details: string[]; errors: string[] }> {
+  }): Promise<{
+    applied: boolean;
+    placed: number;
+    actionsUsed: number;
+    details: string[];
+    errors: string[];
+    ackReceived: boolean;
+    ackMissing: boolean;
+  }> {
+    this.lastTruthInventoryCapBlock = null;
     const details: string[] = [];
     const errors: string[] = [];
     let placed = 0;
     let actionsUsed = 0;
     let applied = false;
+    let ackReceived = false;
+    let ackMissing = false;
 
     const minNotionalUsd = Math.max(0.01, this.config.quotingMinNotionalUsd);
     const baselineNotionalUsd = Math.max(minNotionalUsd, this.config.quotingBaselineNotionalUsd);
@@ -5240,10 +5379,23 @@ export class MakerStrategy {
       0,
       Math.max(0, params.balances.btc_free - Math.max(0, params.reserveBtc)) * params.tickerMid
     );
-    const allowBuyByInventory = params.btcNotionalUsd < params.maxBtcNotionalUsd;
+    const allowBuyByInventory =
+      this.config.forceBaselineWhenOverCap || params.btcNotionalUsd < params.maxBtcNotionalUsd;
 
     if (params.missingBuy && actionsUsed < params.remainingActionsBudget) {
       if (!allowBuyByInventory) {
+        this.lastTruthInventoryCapBlock = {
+          ts: Date.now(),
+          btcNotionalUsd: params.btcNotionalUsd,
+          maxBtcNotionalUsd: params.maxBtcNotionalUsd
+        };
+        this.logger.info(
+          {
+            btcNotionalUsd: Number(params.btcNotionalUsd.toFixed(2)),
+            maxGateUsd: Number(params.maxBtcNotionalUsd.toFixed(2))
+          },
+          "skip_baseline_buy_inventory_cap"
+        );
         errors.push(
           `baseline BUY blocked by inventory cap (btcNotional=${params.btcNotionalUsd.toFixed(2)} >= max=${params.maxBtcNotionalUsd.toFixed(2)})`
         );
@@ -5262,7 +5414,7 @@ export class MakerStrategy {
           params.tickSize
         );
         try {
-          await this.execution.placeTaggedMakerOrder({
+          const order = await this.execution.placeTaggedMakerOrder({
             symbol: this.config.symbol,
             side: "BUY",
             price: buyPrice,
@@ -5270,6 +5422,15 @@ export class MakerStrategy {
             botTag: this.execution.makeTag(this.config.symbol, "BUY", "L0-BASELINE"),
             retryOnPostOnlyReject: true
           });
+          if (order.venueOrderId) {
+            ackReceived = true;
+          } else {
+            ackMissing = true;
+            this.logger.warn(
+              { side: "BUY", clientOrderId: order.clientOrderId, responseBody: order },
+              "Baseline order ack missing venueOrderId"
+            );
+          }
           placed += 1;
           actionsUsed += 1;
           applied = true;
@@ -5301,7 +5462,7 @@ export class MakerStrategy {
           params.tickSize
         );
         try {
-          await this.execution.placeTaggedMakerOrder({
+          const order = await this.execution.placeTaggedMakerOrder({
             symbol: this.config.symbol,
             side: "SELL",
             price: sellPrice,
@@ -5309,6 +5470,15 @@ export class MakerStrategy {
             botTag: this.execution.makeTag(this.config.symbol, "SELL", "L0-BASELINE"),
             retryOnPostOnlyReject: true
           });
+          if (order.venueOrderId) {
+            ackReceived = true;
+          } else {
+            ackMissing = true;
+            this.logger.warn(
+              { side: "SELL", clientOrderId: order.clientOrderId, responseBody: order },
+              "Baseline order ack missing venueOrderId"
+            );
+          }
           placed += 1;
           actionsUsed += 1;
           applied = true;
@@ -5324,11 +5494,12 @@ export class MakerStrategy {
       }
     }
 
-    return { applied, placed, actionsUsed, details, errors };
+    return { applied, placed, actionsUsed, details, errors, ackReceived, ackMissing };
   }
 
   private logIntelAdjustment(ts: number, posture: IntelPosture, adjustment: IntelAdjustment): void {
     if (!this.config.enableIntel) return;
+    if (!isDebugVerbosity(this.config)) return;
     const reasons = Array.isArray(adjustment.reasonCodes)
       ? adjustment.reasonCodes.slice(0, 4)
       : [];
@@ -5361,24 +5532,86 @@ export class MakerStrategy {
     );
   }
 
-  private async reconcileOnceWithTimeout(timeoutMs: number): Promise<void> {
-    let timer: NodeJS.Timeout | null = null;
-    const reconcilePromise = this.reconciler
-      .reconcileOnce()
-      .then(() => ({ type: "done" as const }))
-      .catch((error: unknown) => ({ type: "error" as const, error }));
-    const timeoutPromise = new Promise<{ type: "timeout" }>((resolve) => {
-      timer = setTimeout(() => resolve({ type: "timeout" }), timeoutMs);
+  private async reconcileOnceWithTimeout(timeoutMs = this.config.reconcileTimeoutMs): Promise<void> {
+    const endpoint = "reconciler.reconcileOnce";
+    const attempts = 1;
+    const boundedTimeoutMs = Math.max(1_000, Math.floor(timeoutMs));
+    if (this.reconcileInFlightPromise) {
+      const ageMs =
+        this.reconcileInFlightStartedMs > 0
+          ? Math.max(0, Date.now() - this.reconcileInFlightStartedMs)
+          : 0;
+      this.logger.debug(
+        { symbol: this.config.symbol, ageMs, timeoutMs: boundedTimeoutMs, endpoint },
+        "reconcile_inflight_skip"
+      );
+      return;
+    }
+
+    const startedMs = Date.now();
+    const reconcilePromise = this.reconciler.reconcileOnce();
+    let trackedPromise: Promise<void>;
+    trackedPromise = reconcilePromise.finally(() => {
+      if (this.reconcileInFlightPromise === trackedPromise) {
+        this.reconcileInFlightPromise = null;
+        this.reconcileInFlightStartedMs = 0;
+      }
     });
-    const result = await Promise.race([reconcilePromise, timeoutPromise]);
+    this.reconcileInFlightPromise = trackedPromise;
+    this.reconcileInFlightStartedMs = startedMs;
+    trackedPromise.catch(() => undefined);
+
+    let timer: NodeJS.Timeout | null = null;
+    const result = await Promise.race([
+      trackedPromise
+        .then(() => ({ type: "done" as const }))
+        .catch((error: unknown) => ({ type: "error" as const, error })),
+      new Promise<{ type: "timeout" }>((resolve) => {
+        timer = setTimeout(() => resolve({ type: "timeout" }), boundedTimeoutMs);
+      })
+    ]);
     if (timer) clearTimeout(timer);
+    const durationMs = Math.max(0, Date.now() - startedMs);
     if (result.type === "timeout") {
-      this.logger.warn({ symbol: this.config.symbol, timeoutMs }, "Reconcile timeout");
+      this.logger.warn(
+        {
+          symbol: this.config.symbol,
+          timeoutMs: boundedTimeoutMs,
+          durationMs,
+          timedOut: true,
+          attempts,
+          endpoint
+        },
+        "Reconcile timeout"
+      );
       return;
     }
     if (result.type === "error") {
+      this.logger.warn(
+        {
+          symbol: this.config.symbol,
+          timeoutMs: boundedTimeoutMs,
+          durationMs,
+          timedOut: false,
+          attempts,
+          endpoint,
+          error: result.error instanceof Error ? result.error.message : String(result.error)
+        },
+        "Reconcile failed"
+      );
       throw result.error;
     }
+    this.logger.debug(
+      {
+        symbol: this.config.symbol,
+        timeoutMs: boundedTimeoutMs,
+        durationMs,
+        timedOut: false,
+        attempts,
+        endpoint
+      },
+      "Reconcile complete"
+    );
   }
 
   private async reconcileDesiredOrders(
@@ -6445,7 +6678,7 @@ export function computeMakerMinEdgeBps(
 ): number {
   const configured = Number.isFinite(Number(configuredMinMakerEdgeBps))
     ? Math.max(0, Number(configuredMinMakerEdgeBps))
-    : 0.2;
+    : 0.05;
   const spreadCap =
     Number.isFinite(Number(currentSpreadBps)) && Number(currentSpreadBps) > 0
       ? Math.max(0, Number(currentSpreadBps) * 0.5)
@@ -6815,4 +7048,18 @@ function extractRuntimeErrorMessage(value: unknown): string {
   if (typeof obj.message === "string") return obj.message;
   if (typeof obj.error === "string") return obj.error;
   return "";
+}
+
+function findBalanceTotalByAsset(
+  rows: Array<{ asset: string; total: number }>,
+  candidates: string[]
+): number {
+  const wanted = new Set(candidates.map((row) => String(row || "").trim().toUpperCase()).filter(Boolean));
+  for (const row of rows) {
+    const asset = String(row.asset || "").trim().toUpperCase();
+    if (!wanted.has(asset)) continue;
+    const total = Number(row.total);
+    return Number.isFinite(total) ? total : 0;
+  }
+  return 0;
 }

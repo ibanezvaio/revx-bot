@@ -20,13 +20,14 @@ export const endpointCandidates = {
   ],
   placeOrder: ["/api/1.0/orders", "/api/1.0/crypto-exchange/orders", "/api/v2/orders/", "/api/v2/orders"],
   orderById: ["/api/1.0/orders/{id}", "/api/1.0/crypto-exchange/orders/{id}", "/api/v2/orders/{id}/", "/api/v2/orders/{id}"],
+  orderTrades: ["/api/v2/orders/{id}/trades", "/api/v2/orders/{id}/trades/"],
   orderFills: [
     "/api/1.0/orders/{id}/fills",
     "/api/1.0/crypto-exchange/orders/{id}/fills",
     "/api/v2/orders/{id}/trades/",
     "/api/v2/orders/{id}/trades"
   ],
-  privateTrades: ["/api/1.0/private-trades", "/api/1.0/trades/private", "/api/v2/trades/", "/api/v2/trades"]
+  privateTrades: ["/api/1.0/private-trades", "/api/1.0/trades/private"]
 };
 
 export function withSymbol(pathTemplate: string, symbol: string): string {

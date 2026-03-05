@@ -3,6 +3,8 @@ import { createPrivateKey, KeyObject, sign as cryptoSign } from "node:crypto";
 import nacl from "tweetnacl";
 import { fetch } from "undici";
 import { BotConfig } from "../config";
+import { beginHttpRequestTrace } from "../http/endpointGuard";
+import { registerVenueServiceHosts } from "../http/venueGuard";
 import { Logger } from "../logger";
 import { BalanceState } from "../recon/BalanceState";
 import { canonicalJsonStringify } from "../util/canonicalJson";
@@ -262,17 +264,26 @@ export class RevXClient {
   private readonly signer: SignerFn;
   private readonly scheduler: RequestScheduler;
   private readonly mockMode: boolean;
+  private readonly disableFillsReconcileOverride: boolean;
   private readonly maxRetries = 4;
   private readonly readCircuitBreaker: ReadCircuitBreaker;
   private readonly activeOrdersCache = new Map<string, RequestCacheEntry<RevXOrder[]>>();
   private readonly orderByIdCache = new Map<string, RequestCacheEntry<unknown>>();
+  private revxSupportedTradesEndpoint: string | null = null;
+  private disableFillsReconcile = false;
+  private tradesEndpointProbePromise: Promise<void> | null = null;
+  private tradesEndpointWarningLogged = false;
   private mockMid = 50_000;
   private readonly mockOrders: RevXOrder[] = [];
 
   constructor(private readonly config: BotConfig, private readonly logger: Logger) {
     this.baseUrl = config.revxBaseUrl.replace(/\/+$/, "");
+    registerVenueServiceHosts("REVX", [this.baseUrl, "https://revx.revolut.com"]);
     this.apiKey = config.revxApiKey;
     this.mockMode = config.mockMode;
+    this.disableFillsReconcileOverride =
+      config.disableFillsReconcile || isTruthyEnv(process.env.DISABLE_FILLS_RECONCILE);
+    this.disableFillsReconcile = this.disableFillsReconcileOverride;
     this.signer = this.mockMode ? () => "" : buildSigner(config);
 
     const minIntervalMs = Math.ceil((60_000 / Math.max(config.requestsPerMinute, 1)) * 1.05);
@@ -287,6 +298,22 @@ export class RevXClient {
 
   getReadHealth(): RevXReadHealth {
     return this.readCircuitBreaker.getHealth(Date.now());
+  }
+
+  getFillsReconcileMode(): {
+    fillsEndpoint: string | null;
+    fillsReconcile: "ENABLED" | "DISABLED";
+    disableFillsReconcile: boolean;
+  } {
+    return {
+      fillsEndpoint: this.revxSupportedTradesEndpoint,
+      fillsReconcile: this.disableFillsReconcile ? "DISABLED" : "ENABLED",
+      disableFillsReconcile: this.disableFillsReconcile
+    };
+  }
+
+  async initializeTradesEndpointCapability(): Promise<void> {
+    await this.ensureTradesEndpointCapability();
   }
 
   async getAllTickers(): Promise<unknown[]> {
@@ -330,7 +357,7 @@ export class RevXClient {
     });
   }
 
-  async getBalances(): Promise<unknown[]> {
+  async getBalances(options?: { traceId?: string }): Promise<unknown[]> {
     if (this.mockMode) {
       const payload = [
         { asset: "USD", free: 160, total: 160, timestamp: Date.now() },
@@ -342,7 +369,8 @@ export class RevXClient {
     try {
       const payload = await this.requestWithCandidates<unknown>({
         method: "GET",
-        pathCandidates: endpointCandidates.balances
+        pathCandidates: endpointCandidates.balances,
+        traceId: options?.traceId
       });
       BalanceState.markRawSuccess(payload, Date.now());
       return coerceArray(payload);
@@ -352,7 +380,7 @@ export class RevXClient {
     }
   }
 
-  async getActiveOrders(symbol?: string): Promise<RevXOrder[]> {
+  async getActiveOrders(symbol?: string, options?: { traceId?: string }): Promise<RevXOrder[]> {
     if (this.mockMode) {
       const active = this.mockOrders.filter((o) => {
         const state = String(o.state ?? o.status ?? "NEW").toUpperCase();
@@ -381,7 +409,8 @@ export class RevXClient {
           const payload = await this.requestWithCandidates<unknown>({
             method: "GET",
             pathCandidates: endpointCandidates.activeOrders,
-            query: symbol ? { symbol } : undefined
+            query: symbol ? { symbol } : undefined,
+            traceId: options?.traceId
           });
           const orders = coerceArray(payload) as RevXOrder[];
           return orders.filter((order) => {
@@ -456,7 +485,7 @@ export class RevXClient {
     });
   }
 
-  async getOrderById(venueOrderId: string): Promise<unknown> {
+  async getOrderById(venueOrderId: string, options?: { traceId?: string }): Promise<unknown> {
     if (this.mockMode) {
       const order = this.mockOrders.find(
         (o) =>
@@ -484,7 +513,8 @@ export class RevXClient {
           const paths = endpointCandidates.orderById.map((p) => withId(p, venueOrderId));
           return this.requestWithCandidates<unknown>({
             method: "GET",
-            pathCandidates: paths
+            pathCandidates: paths,
+            traceId: options?.traceId
           });
         }
       );
@@ -500,41 +530,179 @@ export class RevXClient {
     }
   }
 
-  async getOrderFills(venueOrderId: string): Promise<RevXFill[]> {
+  private async ensureTradesEndpointCapability(traceId?: string): Promise<void> {
+    if (this.mockMode) return;
+    if (this.revxSupportedTradesEndpoint) return;
+    if (this.disableFillsReconcileOverride) {
+      this.disableFillsReconcile = true;
+      this.logFillsDisabledOnce("env_override");
+      return;
+    }
+    if (!this.tradesEndpointProbePromise) {
+      this.tradesEndpointProbePromise = this.probeTradesEndpointCapability(traceId);
+    }
+    await this.tradesEndpointProbePromise;
+  }
+
+  private async probeTradesEndpointCapability(traceId?: string): Promise<void> {
+    const probeOrderId = "__capability_probe__";
+    const probeCandidates: Array<{ template: string; path: string }> = endpointCandidates.orderTrades.map(
+      (template) => ({
+        template,
+        path: withId(template, probeOrderId)
+      })
+    );
+    let allMissing404 = probeCandidates.length > 0;
+    for (const candidate of probeCandidates) {
+      try {
+        await this.requestWithRetry<unknown>({
+          method: "GET",
+          path: candidate.path,
+          traceId
+        });
+        this.revxSupportedTradesEndpoint = candidate.template;
+        this.disableFillsReconcile = false;
+        this.logger.info(
+          { endpoint: candidate.template, status: 200 },
+          "RevX trades endpoint capability detected"
+        );
+        return;
+      } catch (error) {
+        if (error instanceof RevXHttpError) {
+          const message = extractHttpErrorMessage(error);
+          if (error.status === 401 || error.status === 403) {
+            this.revxSupportedTradesEndpoint = candidate.template;
+            this.disableFillsReconcile = false;
+            this.logger.info(
+              { endpoint: candidate.template, status: error.status, message },
+              "RevX trades endpoint capability detected (auth required)"
+            );
+            return;
+          }
+          if (error.status === 404 || error.status === 410) {
+            if (isEndpointMissingMessage(message)) {
+              this.logger.debug(
+                { endpoint: candidate.template, status: error.status, message },
+                "RevX trades endpoint candidate missing"
+              );
+              continue;
+            }
+            this.revxSupportedTradesEndpoint = candidate.template;
+            this.disableFillsReconcile = false;
+            this.logger.info(
+              { endpoint: candidate.template, status: error.status, message },
+              "RevX trades endpoint capability inferred from non-endpoint 404"
+            );
+            return;
+          }
+          allMissing404 = false;
+          this.logger.warn(
+            { endpoint: candidate.template, status: error.status, message },
+            "RevX trades endpoint probe failed with non-404 response"
+          );
+          continue;
+        }
+        allMissing404 = false;
+        this.logger.warn(
+          { endpoint: candidate.template, error: error instanceof Error ? error.message : String(error) },
+          "RevX trades endpoint probe failed"
+        );
+      }
+    }
+    if (allMissing404) {
+      this.disableFillsReconcile = true;
+      this.revxSupportedTradesEndpoint = null;
+      this.logFillsDisabledOnce("all_endpoints_missing_404");
+    }
+  }
+
+  private logFillsDisabledOnce(reason: string): void {
+    if (this.tradesEndpointWarningLogged) return;
+    this.tradesEndpointWarningLogged = true;
+    this.logger.warn(
+      { reason },
+      "RevX trades endpoints unavailable; fills reconciliation disabled"
+    );
+  }
+
+  async getOrderFills(venueOrderId: string, options?: { traceId?: string }): Promise<RevXFill[]> {
     if (this.mockMode) {
       return [];
     }
 
-    const paths = endpointCandidates.orderFills.map((p) => withId(p, venueOrderId));
+    await this.ensureTradesEndpointCapability(options?.traceId);
+    if (this.disableFillsReconcile) {
+      const disabled: RevXFill[] & {
+        endpointMissing404?: boolean;
+        disableFillsReconcile?: boolean;
+      } = [];
+      disabled.endpointMissing404 = true;
+      disabled.disableFillsReconcile = true;
+      return disabled;
+    }
+    if (!this.revxSupportedTradesEndpoint) {
+      throw new Error("No supported RevX trades endpoint detected");
+    }
+
+    const template = this.revxSupportedTradesEndpoint;
+    const path = template.includes("{id}") ? withId(template, venueOrderId) : template;
     try {
-      const payload = await this.requestWithCandidates<unknown>({
+      const payload = await this.requestWithRetry<unknown>({
         method: "GET",
-        pathCandidates: paths
+        path,
+        traceId: options?.traceId
       });
-      return coerceArray(payload) as RevXFill[];
+      this.logger.debug(
+        { venueOrderId, endpointTemplate: template, path },
+        "getOrderFills endpoint succeeded"
+      );
+      const fills = coerceArray(payload) as RevXFill[];
+      if (!template.includes("{id}")) {
+        return fills.filter((row) => {
+          const orderId = pickFirstString(row as Record<string, unknown>, ["venue_order_id", "order_id", "id"]);
+          return orderId === venueOrderId;
+        });
+      }
+      return fills;
     } catch (error) {
       if (
         error instanceof RevXHttpError &&
-        (error.status === 404 || error.status === 405)
+        (error.status === 404 || error.status === 410) &&
+        (isEndpointMissingHttpError(error) || template.includes("/orders/{id}/trades"))
       ) {
-        const trades = await this.getPrivateTrades();
-        return trades.filter((t) => {
-          const orderId = pickFirstString(t, ["venue_order_id", "order_id", "id"]);
-          return orderId === venueOrderId;
-        });
+        this.disableFillsReconcile = true;
+        this.revxSupportedTradesEndpoint = null;
+        this.logFillsDisabledOnce("runtime_endpoint_missing_404");
+        const disabled: RevXFill[] & {
+          endpointMissing404?: boolean;
+          disableFillsReconcile?: boolean;
+        } = [];
+        disabled.endpointMissing404 = true;
+        disabled.disableFillsReconcile = true;
+        this.logger.info(
+          {
+            venueOrderId,
+            status: error.status,
+            message: extractHttpErrorMessage(error),
+            traceId: options?.traceId
+          },
+          "getOrderFills disabled after endpoint-missing 404/410"
+        );
+        return disabled;
       }
       throw error;
     }
   }
 
-  async getPrivateTrades(): Promise<RevXFill[]> {
+  async getPrivateTrades(options?: { traceId?: string }): Promise<RevXFill[]> {
     if (this.mockMode) {
       return [];
     }
 
     const payload = await this.requestWithCandidates<unknown>({
       method: "GET",
-      pathCandidates: endpointCandidates.privateTrades
+      pathCandidates: endpointCandidates.privateTrades,
+      traceId: options?.traceId
     });
     return coerceArray(payload) as RevXFill[];
   }
@@ -628,6 +796,7 @@ export class RevXClient {
     pathCandidates: string[];
     query?: Record<string, QueryValue>;
     body?: unknown;
+    traceId?: string;
   }): Promise<T> {
     let lastError: unknown;
 
@@ -637,7 +806,8 @@ export class RevXClient {
           method: params.method,
           path,
           query: params.query,
-          body: params.body
+          body: params.body,
+          traceId: params.traceId
         });
       } catch (error) {
         lastError = error;
@@ -657,6 +827,7 @@ export class RevXClient {
     path: string;
     query?: Record<string, QueryValue>;
     body?: unknown;
+    traceId?: string;
   }): Promise<T> {
     const degradedEndpoint = classifyDegradedReadEndpoint(params.method, params.path);
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
@@ -710,7 +881,8 @@ export class RevXClient {
             attempt: attempt + 1,
             maxRetries: this.maxRetries,
             backoffMs,
-            path: params.path
+            path: params.path,
+            traceId: params.traceId
           },
           "RevX request retry"
         );
@@ -726,6 +898,7 @@ export class RevXClient {
     path: string;
     query?: Record<string, QueryValue>;
     body?: unknown;
+    traceId?: string;
   }): Promise<T> {
     const path = ensureLeadingSlash(params.path);
     const queryString = buildQueryString(params.query);
@@ -749,14 +922,32 @@ export class RevXClient {
       headers["Content-Type"] = "application/json";
     }
 
-    const response = await fetch(url.toString(), {
+    const trace = beginHttpRequestTrace({
+      logger: this.logger,
+      service: "REVX",
+      baseUrl: this.baseUrl,
       method: params.method,
-      headers,
-      body: params.body === undefined ? undefined : bodyString
+      path,
+      debugHttp: this.config.debugHttp,
+      traceId: params.traceId,
+      module: "revx"
     });
+
+    let response: Awaited<ReturnType<typeof fetch>>;
+    try {
+      response = await fetch(url.toString(), {
+        method: params.method,
+        headers,
+        body: params.body === undefined ? undefined : bodyString
+      });
+    } catch (error) {
+      trace.fail(error);
+      throw error;
+    }
 
     const rawBody = await response.text();
     const parsedBody = tryParseJson(rawBody);
+    trace.done(response.status, response.headers);
 
     if (!response.ok) {
       const retryAfterHeader = response.headers.get("retry-after");
@@ -912,6 +1103,32 @@ function pickFirstString(obj: Record<string, unknown>, keys: string[]): string |
     }
   }
   return undefined;
+}
+
+function extractHttpErrorMessage(error: RevXHttpError): string {
+  if (error.responseBody && typeof error.responseBody === "object") {
+    const obj = error.responseBody as Record<string, unknown>;
+    const candidate = obj.message ?? obj.error ?? obj.detail ?? obj.description;
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return error.message || "";
+}
+
+function isEndpointMissingMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  return normalized.includes("endpoint get") && normalized.includes("not found");
+}
+
+function isEndpointMissingHttpError(error: RevXHttpError): boolean {
+  return isEndpointMissingMessage(extractHttpErrorMessage(error));
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
 function isActiveOrderState(state: string): boolean {

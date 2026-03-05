@@ -72,18 +72,25 @@ export function analyzeFillsWindow(params: {
   const rows: FillAnalysisRow[] = inWindow.map((fill) => {
     const tox30 = computeToxBps(fill, lookupMidAtOrAfter(midsSorted, fill.ts + 30_000));
     const tox2m = computeToxBps(fill, lookupMidAtOrAfter(midsSorted, fill.ts + 120_000));
+    const sourceMeta = parseSourceMeta(fill.source_json);
     return {
       id: fill.id,
       ts: fill.ts,
+      symbol: fill.symbol,
       side: fill.side,
       price: fill.price,
       baseQty: fill.base_qty,
+      sizeBTC: fill.base_qty,
       quoteQty: fill.quote_qty,
       feeUsd: fill.fee_usd,
       orderId: fill.order_id,
+      venueOrderId: fill.order_id,
       clientOrderId: fill.client_order_id,
       posture: fill.posture,
       revxMidAtFill: fill.revx_mid_at_fill,
+      source: sourceMeta.source,
+      deltaUSD: sourceMeta.deltaUSD,
+      deltaBTC: sourceMeta.deltaBTC,
       edgeBps: computeEdgeBps(fill),
       toxBps30s: tox30,
       toxBps2m: tox2m
@@ -319,3 +326,31 @@ function percentile(values: number[], p: number): number {
   return sorted[index];
 }
 
+function parseSourceMeta(sourceJson: string): {
+  source: string;
+  deltaUSD: number | null;
+  deltaBTC: number | null;
+} {
+  const normalized = String(sourceJson || "").trim();
+  if (!normalized) {
+    return { source: "venue", deltaUSD: null, deltaBTC: null };
+  }
+  try {
+    const parsed = JSON.parse(normalized) as Record<string, unknown>;
+    const sourceRaw = parsed.source;
+    const source =
+      typeof sourceRaw === "string" && sourceRaw.trim().length > 0
+        ? sourceRaw.trim().toLowerCase()
+        : "venue";
+    const deltaUSD = parseOptionalNumber(parsed.deltaUSD);
+    const deltaBTC = parseOptionalNumber(parsed.deltaBTC);
+    return { source, deltaUSD, deltaBTC };
+  } catch {
+    return { source: "venue", deltaUSD: null, deltaBTC: null };
+  }
+}
+
+function parseOptionalNumber(value: unknown): number | null {
+  const asNumber = Number(value);
+  return Number.isFinite(asNumber) ? asNumber : null;
+}
