@@ -1032,6 +1032,10 @@ export function loadConfig(): BotConfig {
     .trim()
     .toUpperCase();
   const polymarketCadenceMinutes = clampInt(numberWithDefault("POLYMARKET_CADENCE_MINUTES", 5), 1, 60);
+  const btc5mPaperModeDefaults =
+    polymarketMode === "paper" &&
+    polymarketMarketSymbol === "BTC-USD" &&
+    polymarketCadenceMinutes === 5;
   const polymarketDefaultSearches = [
     "btc",
     "bitcoin",
@@ -1127,7 +1131,7 @@ export function loadConfig(): BotConfig {
     30 * 60 * 1000
   );
   const polymarketNoNewOrdersInLastSec = clampInt(
-    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", 5),
+    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", btc5mPaperModeDefaults ? 15 : 5),
     0,
     300
   );
@@ -1166,7 +1170,7 @@ export function loadConfig(): BotConfig {
   );
   const polymarketHttpJitterMs = clampInt(numberWithDefault("POLYMARKET_HTTP_JITTER_MS", 120), 0, 10_000);
   const polymarketHttpTimeoutMs = clampInt(
-    numberWithDefault("POLYMARKET_HTTP_TIMEOUT_MS", 12_000),
+    numberWithDefault("POLYMARKET_HTTP_TIMEOUT_MS", 15_000),
     500,
     120_000
   );
@@ -1263,7 +1267,11 @@ export function loadConfig(): BotConfig {
     1,
     300
   );
-  const defaultPolymarketEntryMaxRemainingSec = polymarketCadenceMinutes === 5 ? 600 : 180;
+  const defaultPolymarketEntryMaxRemainingSec = btc5mPaperModeDefaults
+    ? 240
+    : polymarketCadenceMinutes === 5
+      ? 600
+      : 180;
   const polymarketEntryMaxRemainingSec = clampInt(
     numberWithFallback(
       ["POLY_SNIPER_MAX_SEC", "POLYMARKET_ENTRY_MAX_REMAINING_SEC"],

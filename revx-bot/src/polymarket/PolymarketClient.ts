@@ -1161,7 +1161,7 @@ export class PolymarketClient {
   }
 
   private getHttpTimeoutMs(): number {
-    return Math.max(10_000, Math.floor(this.config.polymarket.http.timeoutMs));
+    return Math.max(15_000, Math.floor(this.config.polymarket.http.timeoutMs));
   }
 
   private async probePublicEndpoint(
@@ -1185,7 +1185,7 @@ export class PolymarketClient {
       try {
         const controller = new AbortController();
         const timeoutHandle = setTimeout(() => {
-          controller.abort();
+          controller.abort("timeout");
         }, this.getHttpTimeoutMs());
         try {
           const response = await fetch(url, {
@@ -1247,7 +1247,7 @@ export class PolymarketClient {
           const response = await this.requestScheduler.schedule(async () => {
             const controller = new AbortController();
             const timeoutHandle = setTimeout(() => {
-              controller.abort();
+              controller.abort("timeout");
             }, this.getHttpTimeoutMs());
             const trace = beginHttpRequestTrace({
               logger: this.logger,
@@ -1726,8 +1726,10 @@ function pickBoolean(input: unknown, keys: string[]): boolean | undefined {
 function parseMarketResolution(row: Record<string, unknown>): PolymarketMarketResolution {
   const resolvedFlag = pickBoolean(row, ["closed", "resolved", "is_closed", "isResolved"]);
   const clobTokenIds = parseStringArray(row.clobTokenIds);
-  const yesTokenId = clobTokenIds[0] || null;
-  const noTokenId = clobTokenIds[1] || null;
+  const rawYesTokenId = clobTokenIds[0] || null;
+  const rawNoTokenId = clobTokenIds[1] || null;
+  const yesTokenId = rawYesTokenId;
+  const noTokenId = rawYesTokenId && rawNoTokenId && rawYesTokenId === rawNoTokenId ? null : rawNoTokenId;
   const outcomeNames = parseOutcomeNames(row);
   let yesOutcomeText = outcomeNames[0] || "";
   let noOutcomeText = outcomeNames[1] || "";
@@ -1740,11 +1742,16 @@ function parseMarketResolution(row: Record<string, unknown>): PolymarketMarketRe
     "resolvedTokenId",
     "resolved_token_id"
   ]);
-  let winningTokenId: string | null = directWinnerTokenId || null;
+  let winningTokenId: string | null =
+    directWinnerTokenId && (directWinnerTokenId === yesTokenId || directWinnerTokenId === noTokenId)
+      ? directWinnerTokenId
+      : null;
   let winningOutcomeText =
     pickString(row, ["outcome", "winning_outcome", "resolved_outcome", "winner", "result"]) || null;
 
   const tokens = Array.isArray(row.tokens) ? row.tokens : [];
+  const winnerTokenIds = new Set<string>();
+  const winnerOutcomeByTokenId = new Map<string, string>();
   for (const token of tokens) {
     if (!token || typeof token !== "object") continue;
     const obj = token as Record<string, unknown>;
@@ -1758,11 +1765,23 @@ function parseMarketResolution(row: Record<string, unknown>): PolymarketMarketRe
     }
     const winner = pickBoolean(obj, ["winner", "is_winner", "won"]);
     if (winner) {
-      if (!winningTokenId && tokenId) {
-        winningTokenId = tokenId;
+      if (tokenId) {
+        winnerTokenIds.add(tokenId);
+        if (outcomeLabel && !winnerOutcomeByTokenId.has(tokenId)) {
+          winnerOutcomeByTokenId.set(tokenId, outcomeLabel);
+        }
       }
-      if (!winningOutcomeText && outcomeLabel) {
-        winningOutcomeText = outcomeLabel;
+    }
+  }
+
+  if (!winningTokenId) {
+    const winnerTokensFromBook = Array.from(winnerTokenIds).filter(
+      (tokenId) => tokenId === yesTokenId || tokenId === noTokenId
+    );
+    if (winnerTokensFromBook.length === 1) {
+      winningTokenId = winnerTokensFromBook[0];
+      if (!winningOutcomeText) {
+        winningOutcomeText = winnerOutcomeByTokenId.get(winnerTokensFromBook[0]) || null;
       }
     }
   }

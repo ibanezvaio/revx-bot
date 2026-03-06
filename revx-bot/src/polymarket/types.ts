@@ -182,7 +182,9 @@ export type DecisionLogLine = {
   ts: string;
   marketId: string;
   slug?: string;
+  selectedSlug?: string | null;
   tauSec: number;
+  remainingSec?: number;
   priceToBeat: number;
   oracleEst: number;
   sigma: number;
@@ -203,10 +205,13 @@ export type DecisionLogLine = {
   edgeYes?: number;
   edgeNo?: number;
   chosenSide?: "YES" | "NO";
+  grossEdge?: number;
   chosenEdge?: number;
   conviction?: number;
   stalenessEdge?: number;
   netEdgeAfterCosts?: number;
+  minEdgeThreshold?: number;
+  minNetEdgeThreshold?: number;
   threshold: number;
   action: string;
   holdReason?: string;

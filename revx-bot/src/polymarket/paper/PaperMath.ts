@@ -35,7 +35,10 @@ export type PaperBinarySettlementInput = {
   qty: number;
   entryCostUsd: number;
   feesUsd: number;
+  heldSide: PaperSide;
   heldTokenId: string;
+  yesTokenId: string;
+  noTokenId: string;
   winningTokenId: string;
 };
 
@@ -43,6 +46,14 @@ export type PaperBinarySettlementOutput = {
   payoutPerShare: number;
   exitPayoutUsd: number;
   pnlUsd: number;
+};
+
+export type PaperResult = "WIN" | "LOSS" | "FLAT";
+
+export type RealizedPnlInput = {
+  exitPayoutUsd: number;
+  entryCostUsd: number;
+  feesUsd: number;
 };
 
 export function applyTakerSlippage(price: number, slippageBps: number): number {
@@ -60,7 +71,11 @@ export function computePaperPnl(input: PaperPnlInput): PaperPnlOutput {
   const payoutUsd = qty * payoutPerShare;
   const entryCostUsd = qty * entryPrice;
   const feesUsd = entryCostUsd * (feeBps / 10_000);
-  const pnlUsd = payoutUsd - entryCostUsd - feesUsd;
+  const pnlUsd = computeRealizedPnlUsd({
+    exitPayoutUsd: payoutUsd,
+    entryCostUsd,
+    feesUsd
+  });
 
   return {
     payoutPerShare,
@@ -109,18 +124,47 @@ export function computePaperBinarySettlementPnl(
   const qty = Math.max(0, input.qty);
   const entryCostUsd = Math.max(0, input.entryCostUsd);
   const feesUsd = Math.max(0, input.feesUsd);
+  const heldTokenId = String(input.heldTokenId || "").trim();
+  const yesTokenId = String(input.yesTokenId || "").trim();
+  const noTokenId = String(input.noTokenId || "").trim();
+  const winningTokenId = String(input.winningTokenId || "").trim();
+  const mappingValid = yesTokenId.length > 0 && noTokenId.length > 0 && yesTokenId !== noTokenId;
+  const winningTokenValid = winningTokenId === yesTokenId || winningTokenId === noTokenId;
+  const heldMatchesSide =
+    input.heldSide === "YES"
+      ? heldTokenId === yesTokenId
+      : input.heldSide === "NO"
+        ? heldTokenId === noTokenId
+        : false;
   const payoutPerShare =
-    String(input.heldTokenId || "").trim() !== "" &&
-    String(input.heldTokenId || "").trim() === String(input.winningTokenId || "").trim()
+    mappingValid &&
+    winningTokenValid &&
+    heldMatchesSide &&
+    heldTokenId.length > 0 &&
+    heldTokenId === winningTokenId
       ? 1
       : 0;
   const exitPayoutUsd = qty * payoutPerShare;
-  const pnlUsd = exitPayoutUsd - entryCostUsd - feesUsd;
+  const pnlUsd = computeRealizedPnlUsd({
+    exitPayoutUsd,
+    entryCostUsd,
+    feesUsd
+  });
   return {
     payoutPerShare,
     exitPayoutUsd,
     pnlUsd
   };
+}
+
+export function computeRealizedPnlUsd(input: RealizedPnlInput): number {
+  return Math.max(0, input.exitPayoutUsd) - Math.max(0, input.entryCostUsd) - Math.max(0, input.feesUsd);
+}
+
+export function classifyPaperResult(pnlUsd: number): PaperResult {
+  if (pnlUsd > 0) return "WIN";
+  if (pnlUsd < 0) return "LOSS";
+  return "FLAT";
 }
 
 function computePayoutPerShare(side: PaperSide, outcome: PaperOutcome): number {

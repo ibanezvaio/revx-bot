@@ -29,6 +29,7 @@ import { getTradingTruthReporter } from "../logging/truth";
 import {
   applySellSlippage,
   applyTakerSlippage,
+  classifyPaperResult,
   computePaperBinarySettlementPnl,
   computePaperClosePnl,
   estimateNoBidFromYesBook,
@@ -113,6 +114,15 @@ type PolymarketState = {
   oracleSource: string | null;
   oracleState: string | null;
 };
+type YesBookSnapshot = {
+  yesBid: number;
+  yesAsk: number;
+  yesMid: number;
+  spread: number;
+  topBidSize: number;
+  topAskSize: number;
+  bookTs: number;
+};
 
 export class PolymarketEngine {
   private running = false;
@@ -142,6 +152,7 @@ export class PolymarketEngine {
     string,
     { impliedMid: number; oracleEst: number; ts: number }
   >();
+  private readonly latestYesBookByMarketId = new Map<string, YesBookSnapshot>();
   private readonly resolutionPendingLogByTradeId = new Map<string, number>();
   private readonly paperStopLossTicksByTradeId = new Map<string, number>();
   private latestPolymarketSnapshot: {
@@ -1176,7 +1187,10 @@ export class PolymarketEngine {
       const elapsedSec = Math.max(0, Math.floor((nowTs - windowStartTs) / 1000));
       const remainingSec = tauSec;
 
-      const implied = await this.getImpliedYesBook(market);
+      const implied = await this.getImpliedYesBook(market, {
+        isSelectedMarket: selectedMarket?.marketId === market.marketId,
+        remainingSec
+      });
       this.polyState.lastBookTsMs = Math.max(this.polyState.lastBookTsMs, Math.floor(implied.bookTs));
       this.polyState.lastYesBid = Number.isFinite(implied.yesBid) ? implied.yesBid : null;
       this.polyState.lastYesAsk = Number.isFinite(implied.yesAsk) ? implied.yesAsk : null;
@@ -1305,9 +1319,11 @@ export class PolymarketEngine {
       const inSnipingWindow =
         remainingSec <= this.config.polymarket.paper.entryMaxRemainingSec &&
         remainingSec >= this.config.polymarket.paper.entryMinRemainingSec;
+      const minEdgeThreshold = this.config.polymarket.paper.minEdgeThreshold;
+      const minNetEdgeThreshold = this.config.polymarket.paper.minNetEdge;
       const minNetEdge = Math.max(
-        this.config.polymarket.paper.minNetEdge,
-        this.config.polymarket.paper.minEdgeThreshold
+        minNetEdgeThreshold,
+        minEdgeThreshold
       );
       const forceTrade = paperMode && this.config.polymarket.paper.forceTrade;
       const bypassBaseAndSpreadChecks = forceTrade;
@@ -1601,25 +1617,27 @@ export class PolymarketEngine {
         action = "HOLD";
         executedSize = 0;
       }
+      if (action === "HOLD" && !blockReason) {
+        if (decisionAction === "HOLD") {
+          if (!forceTrade && !(netEdgeAfterCosts > minNetEdge)) {
+            blockReason = "NET_EDGE_BELOW_MIN_NET_EDGE";
+          } else if (netEdgeAfterCosts <= decision.threshold) {
+            blockReason = "NET_EDGE_BELOW_DYNAMIC_THRESHOLD";
+          } else {
+            blockReason = "EDGE_BELOW_THRESHOLD";
+          }
+        } else if (!(size.notionalUsd > 0)) {
+          blockReason = "SIZE_BELOW_MIN_NOTIONAL";
+        } else {
+          blockReason = "HOLD_UNSPECIFIED";
+        }
+      }
       if (action === "HOLD" && blockReason) {
         const classified = classifyRejectReason(blockReason);
         addRejectCount(rejectCountsByStage, classified.stage, classified.reason, 1);
         addRejectedSample(classified.stage, classified.reason, market);
       }
       dominantReject = computeDominantReject(rejectCountsByStage);
-      if (action === "HOLD" && blockReason) {
-        this.logger.debug(
-          {
-            reason: blockReason,
-            edge: chosenEdge,
-            netEdge: netEdgeAfterCosts,
-            spread: decision.spread,
-            forceTrade,
-            candidates: hydratedMarkets?.length
-          },
-          "Polymarket skip"
-        );
-      }
 
       const openTradesCount = this.paperLedger.getOpenTrades().length;
       const resolvedTradesCount = this.paperLedger.getResolvedTrades().length;
@@ -1684,7 +1702,9 @@ export class PolymarketEngine {
         ts: new Date(nowTs).toISOString(),
         marketId: market.marketId,
         slug: market.eventSlug || market.slug || selectedSlug || undefined,
+        selectedSlug: selectedSlug || null,
         tauSec,
+        remainingSec,
         priceToBeat: market.priceToBeat,
         oracleEst,
         sigma: sigmaPricePerSqrtSec,
@@ -1705,10 +1725,13 @@ export class PolymarketEngine {
         edgeYes,
         edgeNo,
         chosenSide,
+        grossEdge: chosenEdge,
         chosenEdge,
         conviction,
         stalenessEdge,
         netEdgeAfterCosts,
+        minEdgeThreshold,
+        minNetEdgeThreshold,
         threshold: decision.threshold,
         action: blockReason ? `${action}:${blockReason}` : action,
         holdReason: holdReason || undefined,
@@ -1801,7 +1824,7 @@ export class PolymarketEngine {
 
     const yesTokenId = String(params.yesTokenId || "").trim();
     const noTokenId = String(params.noTokenId || "").trim();
-    if (!yesTokenId || !noTokenId) {
+    if (!yesTokenId || !noTokenId || yesTokenId === noTokenId) {
       this.logger.warn(
         {
           marketId: params.marketId,
@@ -2003,7 +2026,7 @@ export class PolymarketEngine {
     if (!closed) return;
     this.paperStopLossTicksByTradeId.delete(tradeId);
     const closeSummary = this.paperLedger.getSummary(nowTs);
-    const result = mtm.pnlUsd > 0 ? "WIN" : mtm.pnlUsd < 0 ? "LOSS" : "FLAT";
+    const result = classifyPaperResult(mtm.pnlUsd);
 
     this.writePaperTradeLog({
       ts: new Date(nowTs).toISOString(),
@@ -2079,7 +2102,7 @@ export class PolymarketEngine {
   }): { heldSide: "YES" | "NO"; heldTokenId: string; yesTokenId: string; noTokenId: string } | null {
     const yesTokenId = String(trade.yesTokenId || "").trim();
     const noTokenId = String(trade.noTokenId || "").trim();
-    if (!yesTokenId || !noTokenId) {
+    if (!yesTokenId || !noTokenId || yesTokenId === noTokenId) {
       return null;
     }
     const fallbackHeld = trade.side === "YES" ? yesTokenId : noTokenId;
@@ -2232,7 +2255,10 @@ export class PolymarketEngine {
         qty: trade.qty,
         entryCostUsd: trade.entryCostUsd,
         feesUsd: trade.feesUsd,
+        heldSide: tokenMapping.heldSide,
         heldTokenId: tokenMapping.heldTokenId,
+        yesTokenId: tokenMapping.yesTokenId,
+        noTokenId: tokenMapping.noTokenId,
         winningTokenId
       });
       const resolved = this.paperLedger.resolveTrade({
@@ -2248,7 +2274,7 @@ export class PolymarketEngine {
       });
       if (!resolved) continue;
       const resolveSummary = this.paperLedger.getSummary(nowTs);
-      const result = settlement.pnlUsd > 0 ? "WIN" : settlement.pnlUsd < 0 ? "LOSS" : "FLAT";
+      const result = classifyPaperResult(settlement.pnlUsd);
 
       this.logger.info(
         {
@@ -2273,6 +2299,7 @@ export class PolymarketEngine {
         event: "TRADE_RESOLVED",
         tradeId: resolved.id,
         marketId: resolved.marketId,
+        slug: resolved.marketSlug || null,
         marketSlug: resolved.marketSlug || null,
         side: resolved.side,
         heldSide: tokenMapping.heldSide,
@@ -2389,9 +2416,7 @@ export class PolymarketEngine {
     if (this.tradingPaused) return { fired: false, mode: "none" };
     if (this.isDeterministicBtc5mMode()) return { fired: false, mode: "none" };
     if (!this.config.polymarket.paper.forceTrade) return { fired: false, mode: "none" };
-    const allowSmokeForceTrade =
-      parseBooleanEnv(process.env.POLY_FORCE_TRADE, false) ||
-      parseBooleanEnv(process.env.POLYMARKET_PAPER_FORCE_TRADE_SMOKE, false);
+    const allowSmokeForceTrade = false;
     const intervalMs = this.config.polymarket.paper.forceIntervalSec * 1000;
     if (context.nowTs - this.lastForceTradeTs < intervalMs) return { fired: false, mode: "none" };
     const candidate =
@@ -2820,6 +2845,35 @@ export class PolymarketEngine {
     return Math.floor(ts / cadenceMs) * cadenceMs;
   }
 
+  private isInsidePaperEntryWindow(remainingSec: number): boolean {
+    if (!Number.isFinite(remainingSec)) return false;
+    return (
+      remainingSec >= this.config.polymarket.paper.entryMinRemainingSec &&
+      remainingSec <= this.config.polymarket.paper.entryMaxRemainingSec
+    );
+  }
+
+  private getCachedYesBookSnapshot(marketId: string, nowTs: number): YesBookSnapshot | null {
+    const cached = this.latestYesBookByMarketId.get(marketId);
+    if (!cached) return null;
+    const maxAgeMs = Math.max(30_000, this.config.polymarket.risk.staleMs * 4);
+    if (cached.bookTs <= 0 || nowTs - cached.bookTs > maxAgeMs) {
+      this.latestYesBookByMarketId.delete(marketId);
+      return null;
+    }
+    return cached;
+  }
+
+  private cacheYesBookSnapshot(marketId: string, snapshot: YesBookSnapshot): void {
+    this.latestYesBookByMarketId.set(marketId, snapshot);
+    const maxEntries = 200;
+    if (this.latestYesBookByMarketId.size <= maxEntries) return;
+    const oldest = this.latestYesBookByMarketId.keys().next().value;
+    if (typeof oldest === "string") {
+      this.latestYesBookByMarketId.delete(oldest);
+    }
+  }
+
   private async getImpliedYesBook(market: {
     marketId: string;
     yesTokenId: string;
@@ -2828,7 +2882,12 @@ export class PolymarketEngine {
     yesMidHint?: number;
     yesLastTradeHint?: number;
     outcomePricesHint?: number[];
-  }): Promise<{
+  },
+  options: {
+    isSelectedMarket?: boolean;
+    remainingSec?: number;
+  } = {}
+  ): Promise<{
     yesBid: number;
     yesAsk: number;
     yesMid: number;
@@ -2837,29 +2896,55 @@ export class PolymarketEngine {
     topAskSize: number;
     bookTs: number;
   }> {
+    const nowTs = Date.now();
+    const remainingSec = Number(options.remainingSec);
+    const shouldPreferCachedSnapshot =
+      Boolean(options.isSelectedMarket) && this.isInsidePaperEntryWindow(remainingSec);
+    const cachedSnapshot = shouldPreferCachedSnapshot
+      ? this.getCachedYesBookSnapshot(market.marketId, nowTs)
+      : null;
     try {
       const orderBook = await this.client.getYesOrderBook(market.marketId, market.yesTokenId);
       if (orderBook.yesAsk >= orderBook.yesBid && orderBook.yesAsk > 0 && orderBook.yesBid >= 0) {
-        return {
+        const snapshot = {
           yesBid: clamp(orderBook.yesBid, 0, 1),
           yesAsk: clamp(orderBook.yesAsk, Math.max(0, orderBook.yesBid), 1),
           yesMid: clamp(orderBook.yesMid, 0, 1),
           spread: Math.max(0, orderBook.yesAsk - orderBook.yesBid),
           topBidSize: Math.max(0, Number(orderBook.bids?.[0]?.size || 0)),
           topAskSize: Math.max(0, Number(orderBook.asks?.[0]?.size || 0)),
-          bookTs: toMs(orderBook.ts || Date.now())
-        };
+          bookTs: toMs(orderBook.ts || nowTs)
+        } satisfies YesBookSnapshot;
+        this.cacheYesBookSnapshot(market.marketId, snapshot);
+        return snapshot;
+      }
+      if (cachedSnapshot) {
+        return cachedSnapshot;
       }
     } catch (error) {
-      this.setTradingPaused(true, "NETWORK_ERROR", Date.now());
+      const transient = isTransientPolymarketError(error);
+      if (!transient || !cachedSnapshot) {
+        this.setTradingPaused(true, "NETWORK_ERROR", nowTs);
+      }
       this.logger.warn(
         {
           marketId: market.marketId,
           tokenId: market.yesTokenId,
+          remainingSec: Number.isFinite(remainingSec) ? remainingSec : null,
+          selectedMarket: Boolean(options.isSelectedMarket),
+          usedCachedSnapshot: Boolean(cachedSnapshot),
+          transient,
           error: error instanceof Error ? error.message : String(error)
         },
         "Failed to fetch YES orderbook; using fallback implied prices"
       );
+      if (cachedSnapshot) {
+        return cachedSnapshot;
+      }
+    }
+
+    if (cachedSnapshot) {
+      return cachedSnapshot;
     }
 
     const hintedMid =
@@ -2881,7 +2966,7 @@ export class PolymarketEngine {
       spread: Math.max(0, yesAsk - yesBid),
       topBidSize: 0,
       topAskSize: 0,
-      bookTs: toMs(Date.now())
+      bookTs: toMs(nowTs)
     };
   }
 
@@ -2900,10 +2985,14 @@ export class PolymarketEngine {
         topAskSize: Math.max(0, Number(noBook.asks?.[0]?.size || 0))
       };
     } catch (error) {
-      this.setTradingPaused(true, "NETWORK_ERROR", Date.now());
+      const transient = isTransientPolymarketError(error);
+      if (!transient) {
+        this.setTradingPaused(true, "NETWORK_ERROR", Date.now());
+      }
       this.logger.warn(
         {
           tokenId,
+          transient,
           error: error instanceof Error ? error.message : String(error)
         },
         "Failed to fetch NO orderbook; using inferred NO prices"
@@ -3434,6 +3523,11 @@ export class PolymarketEngine {
     const threshold = Number(line.threshold);
     if (Number.isFinite(chosenEdge) && Number.isFinite(threshold) && chosenEdge <= threshold) {
       return "EDGE_BELOW_THRESHOLD";
+    }
+
+    const normalizedDetail = normalizeHoldReason(line.holdDetailReason);
+    if (normalizedDetail && normalizedDetail !== "HOLD_GENERIC") {
+      return normalizedDetail;
     }
 
     return "HOLD_GENERIC";
@@ -5112,7 +5206,7 @@ function parseRawMarketToBtcWindow(
   const clobTokenIds = parseRawStringArray(row.clobTokenIds);
   const yesTokenId = clobTokenIds[0];
   const noTokenId = clobTokenIds[1];
-  if (!yesTokenId || !noTokenId) return null;
+  if (!yesTokenId || !noTokenId || yesTokenId === noTokenId) return null;
   const tickSize = normalizeTickSize(
     pickRawString(row, ["minimum_tick_size", "tickSize", "tick_size"])
   );
