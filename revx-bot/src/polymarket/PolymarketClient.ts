@@ -106,6 +106,18 @@ export type PolymarketIngestionTelemetry = {
   lastHttpStatus: number;
 };
 
+export type PolymarketMarketResolution = {
+  yesTokenId: string | null;
+  noTokenId: string | null;
+  winningTokenId: string | null;
+  winningSide: "YES" | "NO" | null;
+  winningOutcome: "UP" | "DOWN" | null;
+  winningOutcomeText: string | null;
+  yesOutcomeMapped: "UP" | "DOWN" | null;
+  noOutcomeMapped: "UP" | "DOWN" | null;
+  resolved: boolean;
+};
+
 export class PolymarketClient {
   private readonly gammaBaseUrl: string;
   private readonly dataBaseUrl: string;
@@ -455,6 +467,7 @@ export class PolymarketClient {
 
   async listMarketsPage(input: {
     limit: number;
+    slug?: string;
     search?: string;
     query?: string;
     cursor?: string;
@@ -475,6 +488,9 @@ export class PolymarketClient {
     }
     if (typeof input.archived === "boolean") {
       params.set("archived", String(input.archived));
+    }
+    if (input.slug && input.slug.trim().length > 0) {
+      params.set("slug", input.slug.trim());
     }
     if (input.search && input.search.trim().length > 0) {
       params.set("search", input.search.trim());
@@ -497,6 +513,47 @@ export class PolymarketClient {
 
     const payload = await this.requestJson("GET", this.gammaBaseUrl, `/markets?${params.toString()}`);
     return parseMarketsPage(payload);
+  }
+
+  async getActiveMarketBySlug(slug: string): Promise<RawPolymarketMarket | null> {
+    const needle = String(slug || "").trim().toLowerCase();
+    if (!needle) return null;
+    const findExact = (rows: RawPolymarketMarket[]): RawPolymarketMarket | null => {
+      for (const row of rows) {
+        if (extractMarketSlug(row).toLowerCase() === needle) {
+          return row;
+        }
+      }
+      return null;
+    };
+
+    try {
+      const direct = await this.listMarketsPage({
+        limit: 25,
+        slug: needle,
+        active: true,
+        closed: false,
+        archived: false
+      });
+      const exact = findExact(direct.rows);
+      if (exact) return exact;
+    } catch (error) {
+      this.logger.warn(
+        {
+          slug: needle,
+          error: serializeError(error)
+        },
+        "Polymarket direct slug lookup failed; falling back to active markets scan"
+      );
+    }
+
+    const page = await this.listMarketsPage({
+      limit: 200,
+      active: true,
+      closed: false,
+      archived: false
+    });
+    return findExact(page.rows);
   }
 
   async listMarketsPaginated(input: {
@@ -625,16 +682,21 @@ export class PolymarketClient {
     };
   }
 
-  async getMarketOutcome(marketId: string): Promise<"UP" | "DOWN" | null> {
+  async getMarketResolution(marketId: string): Promise<PolymarketMarketResolution | null> {
     if (!marketId.trim()) return null;
     try {
       const payload = await this.requestJson("GET", this.gammaBaseUrl, `/markets/${encodeURIComponent(marketId)}`);
       const row = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
       if (!row) return null;
-      return parseMarketOutcome(row);
+      return parseMarketResolution(row);
     } catch {
       return null;
     }
+  }
+
+  async getMarketOutcome(marketId: string): Promise<"UP" | "DOWN" | null> {
+    const resolution = await this.getMarketResolution(marketId);
+    return resolution?.winningOutcome ?? null;
   }
 
   async getYesOrderBook(marketId: string, tokenId: string): Promise<YesOrderBook> {
@@ -831,7 +893,7 @@ export class PolymarketClient {
           this.requestScheduler.schedule(() =>
             withTimeout(
               fn(),
-              this.config.polymarket.http.timeoutMs,
+              this.getHttpTimeoutMs(),
               `Polymarket CLOB call timeout (${label})`
             )
           ),
@@ -1098,6 +1160,10 @@ export class PolymarketClient {
     return "POLY_CLOB";
   }
 
+  private getHttpTimeoutMs(): number {
+    return Math.max(10_000, Math.floor(this.config.polymarket.http.timeoutMs));
+  }
+
   private async probePublicEndpoint(
     service: HttpService,
     baseUrl: string,
@@ -1120,7 +1186,7 @@ export class PolymarketClient {
         const controller = new AbortController();
         const timeoutHandle = setTimeout(() => {
           controller.abort();
-        }, Math.max(500, this.config.polymarket.http.timeoutMs));
+        }, this.getHttpTimeoutMs());
         try {
           const response = await fetch(url, {
             method: "GET",
@@ -1182,7 +1248,7 @@ export class PolymarketClient {
             const controller = new AbortController();
             const timeoutHandle = setTimeout(() => {
               controller.abort();
-            }, this.config.polymarket.http.timeoutMs);
+            }, this.getHttpTimeoutMs());
             const trace = beginHttpRequestTrace({
               logger: this.logger,
               service,
@@ -1558,6 +1624,10 @@ function marketUniqueKey(row: RawPolymarketMarket, fallbackSeed: number): string
   return `fallback:${fallbackSeed}:${JSON.stringify(row).slice(0, 96)}`;
 }
 
+function extractMarketSlug(row: RawPolymarketMarket): string {
+  return pickString(row, ["slug", "market_slug", "eventSlug", "event_slug", "id"]).trim();
+}
+
 function normalizeOpenOrder(row: unknown): OpenOrderRow | null {
   const obj = row && typeof row === "object" ? (row as Record<string, unknown>) : {};
   const id = pickString(obj, ["id", "order_id"]);
@@ -1653,34 +1723,200 @@ function pickBoolean(input: unknown, keys: string[]): boolean | undefined {
   return undefined;
 }
 
-function parseMarketOutcome(row: Record<string, unknown>): "UP" | "DOWN" | null {
-  const closed = pickBoolean(row, ["closed", "resolved", "is_closed", "isResolved"]);
-  const direct = pickString(row, ["outcome", "winning_outcome", "resolved_outcome", "winner", "result"]).toLowerCase();
-  const mappedDirect = mapOutcomeText(direct);
-  if (mappedDirect) return mappedDirect;
+function parseMarketResolution(row: Record<string, unknown>): PolymarketMarketResolution {
+  const resolvedFlag = pickBoolean(row, ["closed", "resolved", "is_closed", "isResolved"]);
+  const clobTokenIds = parseStringArray(row.clobTokenIds);
+  const yesTokenId = clobTokenIds[0] || null;
+  const noTokenId = clobTokenIds[1] || null;
+  const outcomeNames = parseOutcomeNames(row);
+  let yesOutcomeText = outcomeNames[0] || "";
+  let noOutcomeText = outcomeNames[1] || "";
+
+  const directWinnerTokenId = pickString(row, [
+    "winningTokenId",
+    "winning_token_id",
+    "winnerTokenId",
+    "winner_token_id",
+    "resolvedTokenId",
+    "resolved_token_id"
+  ]);
+  let winningTokenId: string | null = directWinnerTokenId || null;
+  let winningOutcomeText =
+    pickString(row, ["outcome", "winning_outcome", "resolved_outcome", "winner", "result"]) || null;
 
   const tokens = Array.isArray(row.tokens) ? row.tokens : [];
   for (const token of tokens) {
     if (!token || typeof token !== "object") continue;
-    const winner = pickBoolean(token, ["winner", "is_winner", "won"]);
-    if (!winner) continue;
-    const outcome = pickString(token, ["outcome", "name", "label"]).toLowerCase();
-    const mapped = mapOutcomeText(outcome);
-    if (mapped) return mapped;
+    const obj = token as Record<string, unknown>;
+    const tokenId = pickString(obj, ["token_id", "tokenId", "id", "clob_token_id"]);
+    const outcomeLabel = pickString(obj, ["outcome", "name", "label"]);
+    if (tokenId && tokenId === yesTokenId && outcomeLabel && !yesOutcomeText) {
+      yesOutcomeText = outcomeLabel;
+    }
+    if (tokenId && tokenId === noTokenId && outcomeLabel && !noOutcomeText) {
+      noOutcomeText = outcomeLabel;
+    }
+    const winner = pickBoolean(obj, ["winner", "is_winner", "won"]);
+    if (winner) {
+      if (!winningTokenId && tokenId) {
+        winningTokenId = tokenId;
+      }
+      if (!winningOutcomeText && outcomeLabel) {
+        winningOutcomeText = outcomeLabel;
+      }
+    }
   }
 
-  if (closed === false) {
-    return null;
+  let winningSide: "YES" | "NO" | null = null;
+  if (winningTokenId && yesTokenId && winningTokenId === yesTokenId) {
+    winningSide = "YES";
+  } else if (winningTokenId && noTokenId && winningTokenId === noTokenId) {
+    winningSide = "NO";
+  }
+
+  if (!winningSide) {
+    winningSide = mapSideFromOutcomeText(winningOutcomeText, yesOutcomeText, noOutcomeText);
+  }
+  if (!winningTokenId) {
+    if (winningSide === "YES") {
+      winningTokenId = yesTokenId;
+    } else if (winningSide === "NO") {
+      winningTokenId = noTokenId;
+    }
+  }
+  if (!winningOutcomeText) {
+    winningOutcomeText = winningSide === "YES" ? yesOutcomeText || null : winningSide === "NO" ? noOutcomeText || null : null;
+  }
+
+  const yesOutcomeMapped = mapOutcomeText(yesOutcomeText);
+  const noOutcomeMapped = mapOutcomeText(noOutcomeText);
+  let winningOutcome = mapOutcomeText(winningOutcomeText);
+  if (!winningOutcome && winningSide === "YES") {
+    winningOutcome = yesOutcomeMapped;
+  } else if (!winningOutcome && winningSide === "NO") {
+    winningOutcome = noOutcomeMapped;
+  }
+
+  return {
+    yesTokenId,
+    noTokenId,
+    winningTokenId,
+    winningSide,
+    winningOutcome,
+    winningOutcomeText,
+    yesOutcomeMapped,
+    noOutcomeMapped,
+    resolved: Boolean(resolvedFlag || winningTokenId || winningSide || winningOutcome)
+  };
+}
+
+function mapSideFromOutcomeText(
+  value: string | null,
+  yesOutcomeText: string,
+  noOutcomeText: string
+): "YES" | "NO" | null {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  const normalizedYes = normalizeText(yesOutcomeText);
+  const normalizedNo = normalizeText(noOutcomeText);
+  if (normalizedYes && normalized.includes(normalizedYes)) return "YES";
+  if (normalizedNo && normalized.includes(normalizedNo)) return "NO";
+  if (
+    normalized.includes("yes") ||
+    normalized.includes("up") ||
+    normalized.includes("higher") ||
+    normalized.includes("above") ||
+    normalized.includes("increase") ||
+    normalized.includes("rise")
+  ) {
+    return "YES";
+  }
+  if (
+    normalized.includes("no") ||
+    normalized.includes("down") ||
+    normalized.includes("lower") ||
+    normalized.includes("below") ||
+    normalized.includes("decrease") ||
+    normalized.includes("fall")
+  ) {
+    return "NO";
   }
   return null;
 }
 
-function mapOutcomeText(value: string): "UP" | "DOWN" | null {
-  const normalized = String(value || "").trim().toLowerCase();
+function mapOutcomeText(value: string | null): "UP" | "DOWN" | null {
+  const normalized = normalizeText(value);
   if (!normalized) return null;
-  if (normalized.includes("yes") || normalized.includes("up")) return "UP";
-  if (normalized.includes("no") || normalized.includes("down")) return "DOWN";
+  if (
+    normalized.includes("yes") ||
+    normalized.includes("up") ||
+    normalized.includes("higher") ||
+    normalized.includes("above") ||
+    normalized.includes("increase") ||
+    normalized.includes("rise")
+  ) {
+    return "UP";
+  }
+  if (
+    normalized.includes("no") ||
+    normalized.includes("down") ||
+    normalized.includes("lower") ||
+    normalized.includes("below") ||
+    normalized.includes("decrease") ||
+    normalized.includes("fall")
+  ) {
+    return "DOWN";
+  }
   return null;
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((row) => String(row || "").trim())
+      .filter((row) => row.length > 0);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .map((row) => String(row || "").trim())
+            .filter((row) => row.length > 0);
+        }
+      } catch {
+        return [];
+      }
+    }
+  }
+  return [];
+}
+
+function parseOutcomeNames(row: Record<string, unknown>): string[] {
+  if (Array.isArray(row.outcomes)) {
+    return row.outcomes.map((value) => String(value || "").trim()).filter((value) => value.length > 0);
+  }
+  if (typeof row.outcomes === "string" && row.outcomes.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(row.outcomes);
+      if (Array.isArray(parsed)) {
+        return parsed.map((value) => String(value || "").trim()).filter((value) => value.length > 0);
+      }
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeText(value: string | null | undefined): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ");
 }
 
 function clamp(value: number, min: number, max: number): number {

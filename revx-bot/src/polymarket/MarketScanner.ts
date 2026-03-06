@@ -1226,7 +1226,7 @@ export class MarketScanner {
     if (!(priceToBeat > 0) && !options?.allowMissingPriceToBeat) return null;
 
     const tokens = parseTokens(row);
-    const yesToken = tokens.find((t) => t.outcome === "yes") ?? tokens[0];
+    const yesToken = tokens.find((t) => t.outcome === "yes");
     if (!yesToken?.tokenId) return null;
 
     const noToken = tokens.find((t) => t.outcome === "no");
@@ -1257,6 +1257,17 @@ export class MarketScanner {
 function parseTokens(row: RawPolymarketMarket): Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> {
   const raw = row.tokens;
   const outcomeNames = parseOutcomeNames(row);
+  const clobTokenIds = parseStringArray((row as Record<string, unknown>).clobTokenIds);
+  if (clobTokenIds.length >= 2) {
+    const mapped: Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> = [
+      { outcome: "yes", tokenId: clobTokenIds[0] },
+      { outcome: "no", tokenId: clobTokenIds[1] }
+    ];
+    for (let idx = 2; idx < clobTokenIds.length; idx += 1) {
+      mapped.push({ outcome: "other", tokenId: clobTokenIds[idx] });
+    }
+    return mapped;
+  }
   if (Array.isArray(raw) && raw.every((item) => typeof item === "string" || typeof item === "number")) {
     return raw
       .map((item, idx) => {
@@ -1274,7 +1285,6 @@ function parseTokens(row: RawPolymarketMarket): Array<{ outcome: "yes" | "no" | 
       .filter((row): row is { outcome: "yes" | "no" | "other"; tokenId: string } => row !== null);
   }
   if (!Array.isArray(raw)) {
-    const clobTokenIds = parseStringArray((row as Record<string, unknown>).clobTokenIds);
     if (clobTokenIds.length > 0) {
       return clobTokenIds.map((tokenId, idx) => {
         const outcomeRaw = String(outcomeNames[idx] || "").trim().toLowerCase();

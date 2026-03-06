@@ -5,7 +5,12 @@ import { Logger } from "../logger";
 import { Store } from "../store/Store";
 import { CrossVenueFetcher } from "../signals/CrossVenueFetcher";
 import { sleep } from "../util/time";
-import { PolymarketClient, RawPolymarketEvent, RawPolymarketMarket } from "./PolymarketClient";
+import {
+  PolymarketClient,
+  PolymarketMarketResolution,
+  RawPolymarketEvent,
+  RawPolymarketMarket
+} from "./PolymarketClient";
 import { PolymarketExecution } from "./Execution";
 import { MarketScanner } from "./MarketScanner";
 import type { MarketScanDiagnostics, MarketScanWindowRejection, MarketScanWindowSample } from "./MarketScanner";
@@ -16,8 +21,7 @@ import { ProbModel } from "./ProbModel";
 import { PolymarketRisk } from "./Risk";
 import { Sizing } from "./Sizing";
 import { Strategy } from "./Strategy";
-import { currentSlug, previousSlug } from "./btc5m";
-import { fetchEventBySlug, parseClobTokenIds, pickFirstMarket } from "./gamma";
+import { FIVE_MIN_SEC, slugForTs, windowTs } from "./btc5m";
 import { BtcWindowMarket, DecisionLogLine, SpotFeed, SpotVenueTick } from "./types";
 import { VolEstimator } from "./VolEstimator";
 import { PaperLedger } from "./paper/PaperLedger";
@@ -25,8 +29,8 @@ import { getTradingTruthReporter } from "../logging/truth";
 import {
   applySellSlippage,
   applyTakerSlippage,
+  computePaperBinarySettlementPnl,
   computePaperClosePnl,
-  computePaperPnl,
   estimateNoBidFromYesBook,
   estimateNoAskFromYesBook,
   inferOutcomeFromOracle
@@ -290,7 +294,13 @@ export class PolymarketEngine {
 
     this.paperFatalLogged = false;
     this.ensureOutputFilesAndWriteStartupMarkers();
-    const windowCfg = this.scanner.getPrimaryWindowConfig();
+    this.assertPaperSettlementSanityAtStartup();
+    const windowCfg = this.isDeterministicBtc5mMode()
+      ? {
+          minWindowSec: this.config.polymarket.paper.entryMinRemainingSec,
+          maxWindowSec: this.config.polymarket.paper.entryMaxRemainingSec
+        }
+      : this.scanner.getPrimaryWindowConfig();
     this.logger.info(
       { minRemainingSec: windowCfg.minWindowSec, maxRemainingSec: windowCfg.maxWindowSec },
       `POLY_WINDOW_CFG minRemainingSec=${windowCfg.minWindowSec} maxRemainingSec=${windowCfg.maxWindowSec}`
@@ -599,6 +609,17 @@ export class PolymarketEngine {
     }
   }
 
+  private isDeterministicBtc5mMode(): boolean {
+    if (process.argv.includes("--btc5m")) {
+      return true;
+    }
+    const cadence = Math.max(1, Math.floor(Number(this.config.polymarket.marketQuery.cadenceMinutes || 0)));
+    const symbol = String(this.config.polymarket.marketQuery.symbol || "")
+      .trim()
+      .toUpperCase();
+    return cadence === 5 && symbol === "BTC-USD";
+  }
+
   private async runOnce(_tickStartedTs: number): Promise<void> {
     const nowTs = Date.now();
     await this.execution.refreshLiveState();
@@ -645,20 +666,29 @@ export class PolymarketEngine {
     }
 
     const paperMode = this.config.polymarket.mode === "paper";
-    const slugNow = currentSlug(nowTs);
-    const slugPrev = previousSlug(nowTs);
+    const deterministicBtc5mMode = this.isDeterministicBtc5mMode();
+    const nowSec = Math.floor(nowTs / 1000);
+    const epochStartSec = Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
+    const slugNow = slugForTs(epochStartSec);
+    const slugPrev = slugForTs(epochStartSec - FIVE_MIN_SEC);
     const attemptedSlugs = [slugNow, slugPrev];
-    let resolvedEvent: any | null = null;
+    const sniperMinRemainingSec = Math.max(1, this.config.polymarket.paper.entryMinRemainingSec);
+    const sniperMaxRemainingSec = Math.max(
+      sniperMinRemainingSec,
+      this.config.polymarket.paper.entryMaxRemainingSec
+    );
+    let selectedRawMarket: Record<string, unknown> | null = null;
     let resolvedSlug: string | null = null;
-    for (const slug of attemptedSlugs) {
-      const event = await fetchEventBySlug(slug);
-      if (event && pickFirstMarket(event)) {
-        resolvedEvent = event;
-        resolvedSlug = slug;
-        break;
+    if (deterministicBtc5mMode) {
+      for (const slug of attemptedSlugs) {
+        const row = await this.client.getActiveMarketBySlug(slug);
+        if (row) {
+          selectedRawMarket = row;
+          resolvedSlug = slug;
+          break;
+        }
       }
     }
-    const selectedRawMarket = resolvedEvent ? pickFirstMarket(resolvedEvent) : null;
     let markets: BtcWindowMarket[] = [];
     let selectedMarket: BtcWindowMarket | null = null;
     let selectedSlug: string | null = resolvedSlug;
@@ -668,53 +698,76 @@ export class PolymarketEngine {
     let selectedEnableOrderBook: boolean | null = null;
     let selectedReason: string | null = "btc5m_slug_event";
     let selectedScore: number | null = null;
-    let dominantReject: string | null = "OK";
+    let dominantReject: string | null = deterministicBtc5mMode ? "BTC5M_NOT_FOUND" : "OK";
     if (!selectedRawMarket) {
       this.selectedTokenIds = [];
-      dominantReject = "BTC5M_NOT_FOUND";
-      selectedReason = "btc5m_not_found";
+      selectedReason = deterministicBtc5mMode ? "btc5m_not_found" : "no_market_selected";
       selectedSlug = null;
-      this.logger.warn({ tried: attemptedSlugs }, "POLY_BTC5M_NOT_FOUND");
+      if (deterministicBtc5mMode) {
+        this.logger.warn({ tried: attemptedSlugs }, "POLY_BTC5M_NOT_FOUND");
+      }
     } else {
-      const tokenIds = parseClobTokenIds(selectedRawMarket);
+      const tokenIds = parseRawStringArray(selectedRawMarket.clobTokenIds);
       this.selectedTokenIds = tokenIds;
-      const fallbackRemainingSec = Math.max(1, 300 - (Math.floor(nowTs / 1000) % 300));
-      const fallbackEndTs = nowTs + fallbackRemainingSec * 1000;
+      const resolvedWindowStartSec = parseBtc5mWindowStartSec(resolvedSlug) ?? windowTs(nowTs);
+      const resolvedWindowEndSec = resolvedWindowStartSec + FIVE_MIN_SEC;
+      const resolvedWindowStartMs = resolvedWindowStartSec * 1000;
+      const resolvedWindowEndMs = resolvedWindowEndSec * 1000;
+      const remainingSec = Math.floor((resolvedWindowEndMs - nowTs) / 1000);
       const parsed = parseRawMarketToBtcWindow(
         selectedRawMarket,
         nowTs,
-        fallbackEndTs,
+        resolvedWindowEndMs,
         this.lastOracleSnapshot?.price ?? null
       );
       if (!parsed) {
-        dominantReject = "BTC5M_NOT_FOUND";
+        dominantReject = deterministicBtc5mMode ? "BTC5M_NOT_FOUND" : "market_parse_failed";
         selectedReason = "btc5m_parse_failed";
         selectedSlug = null;
-        this.logger.warn(
-          {
-            tried: attemptedSlugs,
-            marketId:
-              pickRawString(selectedRawMarket, ["id", "market_id", "conditionId", "condition_id"]) || null
-          },
-          "POLY_BTC5M_NOT_FOUND"
-        );
+        if (deterministicBtc5mMode) {
+          this.logger.warn(
+            {
+              tried: attemptedSlugs,
+              marketId:
+                pickRawString(selectedRawMarket, ["id", "market_id", "conditionId", "condition_id"]) || null
+            },
+            "POLY_BTC5M_NOT_FOUND"
+          );
+        }
       } else {
-        selectedMarket = this.applyWindowState(parsed, nowTs);
-        markets = [selectedMarket];
         selectedSlug = resolvedSlug;
-        if (!selectedSlug || !selectedSlug.startsWith("btc-updown-5m-")) {
+        const normalized = {
+          ...parsed,
+          startTs: resolvedWindowStartMs,
+          endTs: resolvedWindowEndMs
+        };
+        selectedMarket = this.applyWindowState(normalized, nowTs);
+        markets = [selectedMarket];
+        selectedWindowStart = resolvedWindowStartMs;
+        selectedWindowEnd = resolvedWindowEndMs;
+        selectedAcceptingOrders = selectedMarket.acceptingOrders ?? null;
+        selectedEnableOrderBook = selectedMarket.enableOrderBook ?? null;
+        const slugGuardFailed = deterministicBtc5mMode && (!selectedSlug || !selectedSlug.startsWith("btc-updown-5m-"));
+        const outsideSniperRange =
+          deterministicBtc5mMode &&
+          (remainingSec <= 0 ||
+            remainingSec < sniperMinRemainingSec ||
+            remainingSec > sniperMaxRemainingSec);
+        if (slugGuardFailed) {
           dominantReject = "BTC5M_NOT_FOUND";
           selectedReason = "btc5m_slug_guard";
           this.selectedTokenIds = [];
           selectedMarket = null;
           markets = [];
           selectedSlug = null;
+        } else if (outsideSniperRange) {
+          dominantReject = "window_outside_sniper_range";
+          selectedReason = "btc5m_window_out_of_range";
+          selectedMarket = null;
+          markets = [];
         } else {
-          selectedWindowStart = toMsOrNull(selectedMarket.startTs);
-          selectedWindowEnd = toMsOrNull(selectedMarket.endTs);
-          selectedAcceptingOrders = selectedMarket.acceptingOrders ?? null;
-          selectedEnableOrderBook = selectedMarket.enableOrderBook ?? null;
-          selectedReason = "btc5m_deterministic_slug";
+          dominantReject = "OK";
+          selectedReason = deterministicBtc5mMode ? "btc5m_deterministic_slug" : "market_selected";
           this.logger.info(
             { slug: selectedSlug, marketId: selectedMarket.marketId },
             "POLY_BTC5M_SELECTED"
@@ -724,21 +777,26 @@ export class PolymarketEngine {
     }
     const forceSlug = "";
     const stageCounts = {
-      fetchedCount: selectedMarket ? 1 : 0,
-      afterActiveCount: selectedMarket ? 1 : 0,
-      afterSearchCount: selectedMarket ? 1 : 0,
+      fetchedCount: selectedRawMarket ? 1 : 0,
+      afterActiveCount: selectedRawMarket ? 1 : 0,
+      afterSearchCount: selectedRawMarket ? 1 : 0,
       afterWindowCount: selectedMarket ? 1 : 0,
       afterPatternCount: selectedMarket ? 1 : 0,
       finalCandidatesCount: selectedMarket ? 1 : 0
     };
     const discoveredCandidates = stageCounts.fetchedCount;
-    const effectiveMinWindowSec = this.config.polymarket.paper.entryMinRemainingSec;
-    const effectiveMaxWindowSec = this.config.polymarket.paper.entryMaxRemainingSec;
+    const effectiveMinWindowSec = sniperMinRemainingSec;
+    const effectiveMaxWindowSec = sniperMaxRemainingSec;
     const fallbackUsed: "none" | "window" | "patterns" | "topActive" = "none";
     const windowRejectCounters = createWindowRejectCounters();
     const rejectCountsByStage = createRejectCountsByStage();
     if (!selectedMarket) {
-      addRejectCount(rejectCountsByStage, "search", "BTC5M_NOT_FOUND", 1);
+      addRejectCount(
+        rejectCountsByStage,
+        stageCounts.fetchedCount > 0 ? "window" : "search",
+        dominantReject || "BTC5M_NOT_FOUND",
+        1
+      );
     }
     const sampleRejected: RejectSample[] = [];
     const deterministicWindowSamples: MarketScanWindowSample[] = selectedMarket
@@ -969,7 +1027,9 @@ export class PolymarketEngine {
           forceTradeFired && paperMode
             ? "FORCE_TRADE"
             : hydratedMarkets.length === 0
-              ? "BTC5M_NOT_FOUND"
+              ? dominantReject === "BTC5M_NOT_FOUND"
+                ? "BTC5M_NOT_FOUND"
+                : "NO_WINDOWS"
               : normalizeHoldReason(oracleState),
         holdDetailReason: dominantReject,
         forceTradeFired,
@@ -1499,6 +1559,8 @@ export class PolymarketEngine {
               windowEndTs: market.endTs,
               priceToBeat: market.priceToBeat,
               side: desiredSide,
+              yesTokenId: market.yesTokenId,
+              noTokenId: market.noTokenId,
               yesBid: decision.yesBid,
               yesAsk: decision.yesAsk,
               noAsk,
@@ -1708,6 +1770,8 @@ export class PolymarketEngine {
     windowEndTs: number;
     priceToBeat: number;
     side: "YES" | "NO";
+    yesTokenId: string;
+    noTokenId?: string;
     yesBid: number;
     yesAsk: number;
     noAsk?: number;
@@ -1732,6 +1796,26 @@ export class PolymarketEngine {
     );
     const notionalUsd = Math.min(params.requestedNotionalUsd, remainingWindowNotional);
     if (!(notionalUsd > 0)) {
+      return false;
+    }
+
+    const yesTokenId = String(params.yesTokenId || "").trim();
+    const noTokenId = String(params.noTokenId || "").trim();
+    if (!yesTokenId || !noTokenId) {
+      this.logger.warn(
+        {
+          marketId: params.marketId,
+          marketSlug: params.marketSlug || null,
+          side: params.side,
+          yesTokenId: yesTokenId || null,
+          noTokenId: noTokenId || null
+        },
+        "Polymarket paper trade rejected: ambiguous YES/NO token mapping"
+      );
+      return false;
+    }
+    const heldTokenId = params.side === "YES" ? yesTokenId : noTokenId;
+    if (!heldTokenId) {
       return false;
     }
 
@@ -1774,6 +1858,9 @@ export class PolymarketEngine {
       feesUsd,
       entryCostUsd,
       priceToBeat: params.priceToBeat,
+      yesTokenId,
+      noTokenId,
+      heldTokenId,
       createdTs: params.ts
     });
     const openSummary = this.paperLedger.getSummary(params.ts);
@@ -1916,7 +2003,7 @@ export class PolymarketEngine {
     if (!closed) return;
     this.paperStopLossTicksByTradeId.delete(tradeId);
     const closeSummary = this.paperLedger.getSummary(nowTs);
-    const result = mtm.pnlUsd > 0 ? "WIN" : "LOSS";
+    const result = mtm.pnlUsd > 0 ? "WIN" : mtm.pnlUsd < 0 ? "LOSS" : "FLAT";
 
     this.writePaperTradeLog({
       ts: new Date(nowTs).toISOString(),
@@ -1960,6 +2047,90 @@ export class PolymarketEngine {
     );
   }
 
+  private assertPaperSettlementSanityAtStartup(): void {
+    if (this.config.polymarket.mode !== "paper") return;
+    const ambiguousOpenTrades = this.paperLedger
+      .getOpenTrades()
+      .filter((trade) => !this.getPaperTradeTokenMapping(trade));
+    if (ambiguousOpenTrades.length === 0) return;
+    this.logger.error(
+      {
+        count: ambiguousOpenTrades.length,
+        samples: ambiguousOpenTrades.slice(0, 5).map((trade) => ({
+          tradeId: trade.id,
+          marketId: trade.marketId,
+          marketSlug: trade.marketSlug || null,
+          side: trade.side,
+          heldTokenId: trade.heldTokenId || null,
+          yesTokenId: trade.yesTokenId || null,
+          noTokenId: trade.noTokenId || null
+        }))
+      },
+      "PAPER settlement startup sanity failed: ambiguous side/token mapping"
+    );
+    throw new Error("POLY_PAPER_SETTLEMENT_MAPPING_AMBIGUOUS");
+  }
+
+  private getPaperTradeTokenMapping(trade: {
+    side: "YES" | "NO";
+    heldTokenId?: string;
+    yesTokenId?: string;
+    noTokenId?: string;
+  }): { heldSide: "YES" | "NO"; heldTokenId: string; yesTokenId: string; noTokenId: string } | null {
+    const yesTokenId = String(trade.yesTokenId || "").trim();
+    const noTokenId = String(trade.noTokenId || "").trim();
+    if (!yesTokenId || !noTokenId) {
+      return null;
+    }
+    const fallbackHeld = trade.side === "YES" ? yesTokenId : noTokenId;
+    const heldTokenId = String(trade.heldTokenId || fallbackHeld).trim();
+    if (!heldTokenId) {
+      return null;
+    }
+    if (trade.side === "YES" && heldTokenId !== yesTokenId) {
+      return null;
+    }
+    if (trade.side === "NO" && heldTokenId !== noTokenId) {
+      return null;
+    }
+    return {
+      heldSide: trade.side,
+      heldTokenId,
+      yesTokenId,
+      noTokenId
+    };
+  }
+
+  private mapOutcomeToWinningTokenId(
+    outcome: "UP" | "DOWN",
+    tradeMapping: { yesTokenId: string; noTokenId: string },
+    marketResolution: PolymarketMarketResolution | null
+  ): string {
+    const yesOutcome = marketResolution?.yesOutcomeMapped ?? null;
+    const noOutcome = marketResolution?.noOutcomeMapped ?? null;
+    if (yesOutcome && outcome === yesOutcome) {
+      return tradeMapping.yesTokenId;
+    }
+    if (noOutcome && outcome === noOutcome) {
+      return tradeMapping.noTokenId;
+    }
+    return outcome === "UP" ? tradeMapping.yesTokenId : tradeMapping.noTokenId;
+  }
+
+  private deriveOutcomeFromWinningTokenId(
+    winningTokenId: string,
+    tradeMapping: { yesTokenId: string; noTokenId: string },
+    marketResolution: PolymarketMarketResolution | null
+  ): "UP" | "DOWN" {
+    if (winningTokenId === tradeMapping.yesTokenId) {
+      return marketResolution?.yesOutcomeMapped ?? "UP";
+    }
+    if (winningTokenId === tradeMapping.noTokenId) {
+      return marketResolution?.noOutcomeMapped ?? "DOWN";
+    }
+    return "UP";
+  }
+
   private async resolvePaperTrades(nowTs: number): Promise<void> {
     if (this.config.polymarket.mode !== "paper") {
       return;
@@ -1970,51 +2141,132 @@ export class PolymarketEngine {
       const targetTs = trade.windowEndTs + this.config.polymarket.paper.resolveGraceMs;
       if (targetTs > nowTs) continue;
 
-      const oracleSample = this.pickOracleAtOrAfter(targetTs);
-      if (!oracleSample || !(oracleSample.px > 0)) {
-        if (nowTs - targetTs >= 30_000) {
-          const lastLogged = this.resolutionPendingLogByTradeId.get(trade.id) || 0;
-          if (nowTs - lastLogged >= 10_000) {
-            this.resolutionPendingLogByTradeId.set(trade.id, nowTs);
-            this.logger.warn(
-              {
-                tradeId: trade.id,
-                marketId: trade.marketId,
-                marketSlug: trade.marketSlug || null,
-                targetTs,
-                nowTs
-              },
-              "PAPER RESOLUTION PENDING: awaiting oracle snapshot at/after window end"
-            );
-          }
-        }
+      const tokenMapping = this.getPaperTradeTokenMapping(trade);
+      if (!tokenMapping) {
+        this.logger.error(
+          {
+            tradeId: trade.id,
+            marketId: trade.marketId,
+            marketSlug: trade.marketSlug || null,
+            heldSide: trade.side,
+            heldTokenId: trade.heldTokenId || null,
+            yesTokenId: trade.yesTokenId || null,
+            noTokenId: trade.noTokenId || null
+          },
+          "PAPER settlement skipped: ambiguous side/token mapping"
+        );
         continue;
       }
 
-      const oracleAtEnd = oracleSample.px;
-      const outcome = inferOutcomeFromOracle(oracleAtEnd, trade.priceToBeat);
-      const resolutionSource: "oracle_proxy" | "internal_fair_mid" =
-        oracleSample.source === "internal_fair_mid" ? "internal_fair_mid" : "oracle_proxy";
+      let marketResolution: PolymarketMarketResolution | null = null;
+      try {
+        marketResolution = await this.client.getMarketResolution(trade.marketId);
+      } catch {
+        marketResolution = null;
+      }
 
-      const pnl = computePaperPnl({
-        side: trade.side,
-        outcome,
+      let winningTokenId =
+        marketResolution?.winningTokenId &&
+        (marketResolution.winningTokenId === tokenMapping.yesTokenId ||
+          marketResolution.winningTokenId === tokenMapping.noTokenId)
+          ? marketResolution.winningTokenId
+          : null;
+      let winningOutcome = marketResolution?.winningOutcome ?? null;
+      let winningOutcomeText = marketResolution?.winningOutcomeText ?? null;
+      let oracleAtEnd: number | undefined;
+      let resolutionSource: "market_api" | "oracle_proxy" | "internal_fair_mid" = "market_api";
+
+      if (!winningTokenId) {
+        const oracleSample = this.pickOracleAtOrAfter(targetTs);
+        if (!oracleSample || !(oracleSample.px > 0)) {
+          if (nowTs - targetTs >= 30_000) {
+            const lastLogged = this.resolutionPendingLogByTradeId.get(trade.id) || 0;
+            if (nowTs - lastLogged >= 10_000) {
+              this.resolutionPendingLogByTradeId.set(trade.id, nowTs);
+              this.logger.warn(
+                {
+                  tradeId: trade.id,
+                  marketId: trade.marketId,
+                  marketSlug: trade.marketSlug || null,
+                  targetTs,
+                  nowTs
+                },
+                "PAPER RESOLUTION PENDING: awaiting market outcome or oracle snapshot"
+              );
+            }
+          }
+          continue;
+        }
+        oracleAtEnd = oracleSample.px;
+        const oracleOutcome = inferOutcomeFromOracle(oracleAtEnd, trade.priceToBeat);
+        winningTokenId = this.mapOutcomeToWinningTokenId(oracleOutcome, tokenMapping, marketResolution);
+        winningOutcome = oracleOutcome;
+        if (!winningOutcomeText) {
+          winningOutcomeText = oracleOutcome;
+        }
+        resolutionSource = oracleSample.source === "internal_fair_mid" ? "internal_fair_mid" : "oracle_proxy";
+      }
+
+      if (!winningTokenId) {
+        this.logger.warn(
+          {
+            tradeId: trade.id,
+            marketId: trade.marketId,
+            marketSlug: trade.marketSlug || null,
+            heldTokenId: tokenMapping.heldTokenId,
+            yesTokenId: tokenMapping.yesTokenId,
+            noTokenId: tokenMapping.noTokenId,
+            winningOutcome: winningOutcome || null,
+            winningOutcomeText: winningOutcomeText || null
+          },
+          "PAPER settlement skipped: winning token unresolved"
+        );
+        continue;
+      }
+
+      if (!winningOutcome) {
+        winningOutcome = this.deriveOutcomeFromWinningTokenId(winningTokenId, tokenMapping, marketResolution);
+      }
+
+      const settlement = computePaperBinarySettlementPnl({
         qty: trade.qty,
-        entryPrice: trade.entryPrice,
-        feeBps: trade.feeBps
+        entryCostUsd: trade.entryCostUsd,
+        feesUsd: trade.feesUsd,
+        heldTokenId: tokenMapping.heldTokenId,
+        winningTokenId
       });
       const resolved = this.paperLedger.resolveTrade({
         tradeId: trade.id,
         resolvedAt: nowTs,
-        outcome,
-        payoutUsd: pnl.payoutUsd,
-        pnlUsd: pnl.pnlUsd,
-        oracleAtEnd: oracleAtEnd > 0 ? oracleAtEnd : undefined,
+        outcome: winningOutcome,
+        payoutUsd: settlement.exitPayoutUsd,
+        pnlUsd: settlement.pnlUsd,
+        winningTokenId,
+        winningOutcomeText: winningOutcomeText || undefined,
+        oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
         resolutionSource
       });
       if (!resolved) continue;
       const resolveSummary = this.paperLedger.getSummary(nowTs);
-      const result = pnl.pnlUsd > 0 ? "WIN" : "LOSS";
+      const result = settlement.pnlUsd > 0 ? "WIN" : settlement.pnlUsd < 0 ? "LOSS" : "FLAT";
+
+      this.logger.info(
+        {
+          tradeId: resolved.id,
+          slug: resolved.marketSlug || null,
+          heldSide: tokenMapping.heldSide,
+          heldTokenId: tokenMapping.heldTokenId,
+          winningOutcome: winningOutcomeText || winningOutcome,
+          winningTokenId,
+          qty: resolved.qty,
+          entryCostUsd: resolved.entryCostUsd,
+          exitPayoutUsd: settlement.exitPayoutUsd,
+          feesUsd: resolved.feesUsd,
+          pnlUsd: settlement.pnlUsd,
+          result
+        },
+        "POLY_PAPER_RESOLUTION"
+      );
 
       this.writePaperTradeLog({
         ts: new Date(nowTs).toISOString(),
@@ -2023,11 +2275,18 @@ export class PolymarketEngine {
         marketId: resolved.marketId,
         marketSlug: resolved.marketSlug || null,
         side: resolved.side,
-        winner: outcome,
-        finalOraclePrice: oracleAtEnd > 0 ? oracleAtEnd : null,
-        exitPayoutUsd: pnl.payoutUsd,
-        pnlUsd: pnl.pnlUsd,
-        oracleAtEnd: oracleAtEnd > 0 ? oracleAtEnd : undefined,
+        heldSide: tokenMapping.heldSide,
+        heldTokenId: tokenMapping.heldTokenId,
+        winner: winningOutcome,
+        winningOutcome: winningOutcomeText || winningOutcome,
+        winningTokenId,
+        finalOraclePrice: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : null,
+        qty: resolved.qty,
+        entryCostUsd: resolved.entryCostUsd,
+        exitPayoutUsd: settlement.exitPayoutUsd,
+        feesUsd: resolved.feesUsd,
+        pnlUsd: settlement.pnlUsd,
+        oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
         resolutionSource,
         result,
         cumulativePnlUsd: resolveSummary.totalPnlUsd,
@@ -2052,14 +2311,15 @@ export class PolymarketEngine {
           marketId: resolved.marketId,
           marketSlug: resolved.marketSlug || null,
           side: resolved.side,
-          outcome,
-          payoutUsd: pnl.payoutUsd,
+          outcome: winningOutcome,
+          winningTokenId,
+          payoutUsd: settlement.exitPayoutUsd,
           notionalUsd: resolved.notionalUsd,
-          pnlUsd: pnl.pnlUsd,
-          oracleAtEnd: oracleAtEnd > 0 ? oracleAtEnd : undefined,
+          pnlUsd: settlement.pnlUsd,
+          oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
           resolutionSource
         },
-        `POLY_TRADE event=RESOLVED mode=PAPER tradeId=${resolved.id} slug=${String(resolved.marketSlug || "-")} side=${resolved.side} notionalUsd=${resolved.notionalUsd.toFixed(2)} pnlUsd=${pnl.pnlUsd.toFixed(2)} reason=${outcome}`
+        `POLY_TRADE event=RESOLVED mode=PAPER tradeId=${resolved.id} slug=${String(resolved.marketSlug || "-")} side=${resolved.side} notionalUsd=${resolved.notionalUsd.toFixed(2)} pnlUsd=${settlement.pnlUsd.toFixed(2)} reason=${winningOutcome}`
       );
     }
   }
@@ -2127,6 +2387,7 @@ export class PolymarketEngine {
     if (this.config.polymarket.mode !== "paper") return { fired: false, mode: "none" };
     if (this.config.polymarket.killSwitch) return { fired: false, mode: "none" };
     if (this.tradingPaused) return { fired: false, mode: "none" };
+    if (this.isDeterministicBtc5mMode()) return { fired: false, mode: "none" };
     if (!this.config.polymarket.paper.forceTrade) return { fired: false, mode: "none" };
     const allowSmokeForceTrade =
       parseBooleanEnv(process.env.POLY_FORCE_TRADE, false) ||
@@ -2175,6 +2436,8 @@ export class PolymarketEngine {
       const windowEndTs = context.nowTs + forcedRemainingSec * 1000;
       const configuredSide = this.config.polymarket.paper.forceSide;
       const side: "YES" | "NO" = configuredSide === "NO" ? "NO" : "YES";
+      const yesTokenId = `${fallbackMarketId}:YES`;
+      const noTokenId = `${fallbackMarketId}:NO`;
       const entryPrice = 0.5;
       const requestedNotionalUsd = Math.max(0.5, this.config.polymarket.paper.forceNotional || 1);
       const tradesLastHour = this.paperLedger.countTradesSince(context.nowTs - 60 * 60 * 1000);
@@ -2197,6 +2460,9 @@ export class PolymarketEngine {
         feesUsd,
         entryCostUsd: requestedNotionalUsd,
         priceToBeat: 0.5,
+        yesTokenId,
+        noTokenId,
+        heldTokenId: side === "YES" ? yesTokenId : noTokenId,
         createdTs: context.nowTs
       });
       const openSummary = this.paperLedger.getSummary(context.nowTs);
@@ -2405,6 +2671,8 @@ export class PolymarketEngine {
       windowEndTs: marketEndMs,
       priceToBeat: market.priceToBeat,
       side,
+      yesTokenId: market.yesTokenId,
+      noTokenId: market.noTokenId,
       yesBid: implied.yesBid,
       yesAsk: implied.yesAsk,
       noAsk,
@@ -4841,10 +5109,10 @@ function parseRawMarketToBtcWindow(
   if (!(priceToBeat > 0)) {
     priceToBeat = oracleReferencePrice && oracleReferencePrice > 0 ? oracleReferencePrice : 50_000;
   }
-  const tokens = parseRawTokens(row);
-  const yesToken = tokens.find((t) => t.outcome === "yes") ?? tokens[0];
-  if (!yesToken?.tokenId) return null;
-  const noToken = tokens.find((t) => t.outcome === "no");
+  const clobTokenIds = parseRawStringArray(row.clobTokenIds);
+  const yesTokenId = clobTokenIds[0];
+  const noTokenId = clobTokenIds[1];
+  if (!yesTokenId || !noTokenId) return null;
   const tickSize = normalizeTickSize(
     pickRawString(row, ["minimum_tick_size", "tickSize", "tick_size"])
   );
@@ -4856,8 +5124,8 @@ function parseRawMarketToBtcWindow(
     priceToBeat,
     endTs: normalizedEndTs,
     startTs: startTs > 0 ? startTs : undefined,
-    yesTokenId: yesToken.tokenId,
-    noTokenId: noToken?.tokenId,
+    yesTokenId,
+    noTokenId,
     tickSize: tickSize ?? undefined,
     negRisk,
     acceptingOrders,
@@ -5147,6 +5415,15 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
     .replace(/^_+|_+$/g, "")
     .toUpperCase();
   return normalized.length > 0 ? normalized : null;
+}
+
+function parseBtc5mWindowStartSec(slug: string | null | undefined): number | null {
+  const text = String(slug || "").trim();
+  const match = text.match(/^btc-updown-5m-(\d{9,12})$/i);
+  if (!match) return null;
+  const startSec = Number(match[1]);
+  if (!Number.isFinite(startSec) || startSec <= 0) return null;
+  return Math.floor(startSec);
 }
 
 class ExistingSpotFeedAdapter implements SpotFeed {

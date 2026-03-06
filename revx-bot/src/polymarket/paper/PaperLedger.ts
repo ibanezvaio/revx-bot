@@ -18,11 +18,16 @@ export type PaperTrade = {
   feesUsd: number;
   entryCostUsd: number;
   priceToBeat: number;
+  yesTokenId?: string;
+  noTokenId?: string;
+  heldTokenId?: string;
   createdTs: number;
   resolvedAt?: number;
   outcome?: PaperOutcome;
   payoutUsd?: number;
   pnlUsd?: number;
+  winningTokenId?: string;
+  winningOutcomeText?: string;
   oracleAtEnd?: number;
   resolutionSource?: "market_api" | "oracle_proxy" | "internal_fair_mid" | "paper_exit";
   closeReason?: "STOP_LOSS" | "TAKE_PROFIT" | "TIME_EXIT_PROFIT" | "MANUAL";
@@ -48,6 +53,8 @@ type TradeResolvedEvent = {
   finalOraclePrice?: number;
   exitPayoutUsd: number;
   outcome: PaperOutcome;
+  winningTokenId?: string;
+  winningOutcomeText?: string;
   payoutUsd: number;
   pnlUsd: number;
   oracleAtEnd?: number;
@@ -85,6 +92,7 @@ export type PaperSummary = {
   winRate: number;
   wins: number;
   losses: number;
+  flats: number;
   lastResolved?: PaperTrade;
 };
 
@@ -130,6 +138,8 @@ export class PaperLedger {
         trade.outcome = event.outcome;
         trade.payoutUsd = event.payoutUsd;
         trade.pnlUsd = event.pnlUsd;
+        trade.winningTokenId = event.winningTokenId;
+        trade.winningOutcomeText = event.winningOutcomeText;
         trade.oracleAtEnd = event.oracleAtEnd;
         trade.resolutionSource = event.resolutionSource;
       } else if ("kind" in event && event.kind === "trade_closed") {
@@ -169,6 +179,9 @@ export class PaperLedger {
     feesUsd: number;
     entryCostUsd: number;
     priceToBeat: number;
+    yesTokenId?: string;
+    noTokenId?: string;
+    heldTokenId?: string;
     createdTs?: number;
   }): PaperTrade {
     this.assertWritable();
@@ -187,6 +200,9 @@ export class PaperLedger {
       feesUsd: input.feesUsd,
       entryCostUsd: input.entryCostUsd,
       priceToBeat: input.priceToBeat,
+      yesTokenId: input.yesTokenId,
+      noTokenId: input.noTokenId,
+      heldTokenId: input.heldTokenId,
       createdTs: input.createdTs ?? Date.now()
     };
     this.trades.set(trade.id, trade);
@@ -204,6 +220,8 @@ export class PaperLedger {
     outcome: PaperOutcome;
     payoutUsd: number;
     pnlUsd: number;
+    winningTokenId?: string;
+    winningOutcomeText?: string;
     oracleAtEnd?: number;
     resolutionSource: "market_api" | "oracle_proxy" | "internal_fair_mid";
   }): PaperTrade | null {
@@ -216,6 +234,8 @@ export class PaperLedger {
     trade.outcome = input.outcome;
     trade.payoutUsd = input.payoutUsd;
     trade.pnlUsd = input.pnlUsd;
+    trade.winningTokenId = input.winningTokenId;
+    trade.winningOutcomeText = input.winningOutcomeText;
     trade.oracleAtEnd = input.oracleAtEnd;
     trade.resolutionSource = input.resolutionSource;
 
@@ -230,6 +250,8 @@ export class PaperLedger {
       finalOraclePrice: input.oracleAtEnd,
       exitPayoutUsd: input.payoutUsd,
       outcome: input.outcome,
+      winningTokenId: input.winningTokenId,
+      winningOutcomeText: input.winningOutcomeText,
       payoutUsd: input.payoutUsd,
       pnlUsd: input.pnlUsd,
       oracleAtEnd: input.oracleAtEnd,
@@ -351,6 +373,7 @@ export class PaperLedger {
       .reduce((sum, row) => sum + Number(row.pnlUsd || 0), 0);
     const wins = resolved.filter((row) => Number(row.pnlUsd || 0) > 0).length;
     const losses = resolved.filter((row) => Number(row.pnlUsd || 0) < 0).length;
+    const flats = resolved.filter((row) => Number(row.pnlUsd || 0) === 0).length;
     const winRate = resolved.length > 0 ? wins / resolved.length : 0;
     const lastResolved = resolved
       .slice()
@@ -366,6 +389,7 @@ export class PaperLedger {
       winRate,
       wins,
       losses,
+      flats,
       lastResolved
     };
   }
@@ -446,6 +470,8 @@ function parseEvent(line: string): PaperLedgerEvent | null {
         finalOraclePrice: Number.isFinite(finalOraclePrice) ? finalOraclePrice : undefined,
         exitPayoutUsd: Number.isFinite(exitPayoutUsd) ? exitPayoutUsd : Number(obj.payoutUsd || 0),
         outcome: outcome as PaperOutcome,
+        winningTokenId: typeof obj.winningTokenId === "string" ? obj.winningTokenId : undefined,
+        winningOutcomeText: typeof obj.winningOutcomeText === "string" ? obj.winningOutcomeText : undefined,
         payoutUsd: Number(obj.payoutUsd || 0),
         pnlUsd: Number(obj.pnlUsd || 0),
         oracleAtEnd: Number.isFinite(Number(obj.oracleAtEnd)) ? Number(obj.oracleAtEnd) : undefined,

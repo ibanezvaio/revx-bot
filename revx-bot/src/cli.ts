@@ -194,6 +194,11 @@ async function run(): Promise<void> {
           ...config.polymarket,
           enabled: true,
           mode,
+          marketQuery: {
+            ...config.polymarket.marketQuery,
+            symbol: btc5m ? "BTC-USD" : config.polymarket.marketQuery.symbol,
+            cadenceMinutes: btc5m ? 5 : config.polymarket.marketQuery.cadenceMinutes
+          },
           execution: {
             ...config.polymarket.execution,
             cancelAllOnStart:

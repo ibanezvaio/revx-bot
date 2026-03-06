@@ -1166,7 +1166,7 @@ export function loadConfig(): BotConfig {
   );
   const polymarketHttpJitterMs = clampInt(numberWithDefault("POLYMARKET_HTTP_JITTER_MS", 120), 0, 10_000);
   const polymarketHttpTimeoutMs = clampInt(
-    numberWithDefault("POLYMARKET_HTTP_TIMEOUT_MS", 8_000),
+    numberWithDefault("POLYMARKET_HTTP_TIMEOUT_MS", 12_000),
     500,
     120_000
   );

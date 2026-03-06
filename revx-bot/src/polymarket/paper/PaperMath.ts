@@ -31,6 +31,20 @@ export type PaperClosePnlOutput = {
   pnlUsd: number;
 };
 
+export type PaperBinarySettlementInput = {
+  qty: number;
+  entryCostUsd: number;
+  feesUsd: number;
+  heldTokenId: string;
+  winningTokenId: string;
+};
+
+export type PaperBinarySettlementOutput = {
+  payoutPerShare: number;
+  exitPayoutUsd: number;
+  pnlUsd: number;
+};
+
 export function applyTakerSlippage(price: number, slippageBps: number): number {
   const base = clamp(price, 0.0001, 0.9999);
   const bumped = base * (1 + Math.max(0, slippageBps) / 10_000);
@@ -85,6 +99,26 @@ export function computePaperClosePnl(input: PaperClosePnlInput): PaperClosePnlOu
   return {
     exitProceedsUsd,
     exitFeesUsd,
+    pnlUsd
+  };
+}
+
+export function computePaperBinarySettlementPnl(
+  input: PaperBinarySettlementInput
+): PaperBinarySettlementOutput {
+  const qty = Math.max(0, input.qty);
+  const entryCostUsd = Math.max(0, input.entryCostUsd);
+  const feesUsd = Math.max(0, input.feesUsd);
+  const payoutPerShare =
+    String(input.heldTokenId || "").trim() !== "" &&
+    String(input.heldTokenId || "").trim() === String(input.winningTokenId || "").trim()
+      ? 1
+      : 0;
+  const exitPayoutUsd = qty * payoutPerShare;
+  const pnlUsd = exitPayoutUsd - entryCostUsd - feesUsd;
+  return {
+    payoutPerShare,
+    exitPayoutUsd,
     pnlUsd
   };
 }
