@@ -63,6 +63,7 @@
     "test:polymarket-paper-lifecycle": "npm run build && node dist/scripts/testPolymarketPaperWindowLifecycle.js",
     "test:polymarket-oracle-stale": "npm run build && node dist/scripts/testPolymarketOracleStaleHandling.js",
     "test:polymarket-integration": "npm run build && node dist/scripts/testPolymarketIntegration.js",
+    "test:polymarket-live-parity": "npm run build && node dist/scripts/testPolymarketLiveParity.js",
     "test": "npm run build && node dist/scripts/testPolymarketOracleEstimator.js && node dist/scripts/testPolymarketProbModel.js && node dist/polymarket/__tests__/ProbModelCalibrated.test.js && node dist/scripts/testPolymarketStrategy.js && node dist/scripts/testPolymarketSizing.js && node dist/polymarket/__tests__/LagProfiler.test.js && node dist/scripts/testPolymarketAuthSigning.js && node dist/scripts/testPolymarketRequestBuilding.js && node dist/scripts/testPolymarketRetry.js && node dist/scripts/testPolymarketEnvMapping.js && node dist/scripts/testPolymarketClobClientFactory.js && node dist/scripts/testPolymarketPaperPnl.js && node dist/scripts/testPolymarketPaperLedger.js && node dist/scripts/testPolymarketPaperWindowLifecycle.js && node dist/scripts/testPolymarketOracleStaleHandling.js"
   },
   "dependencies": {

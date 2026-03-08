@@ -13,6 +13,7 @@ import {
   RawPolymarketMarket
 } from "./PolymarketClient";
 import { PolymarketExecution } from "./Execution";
+import { LiveExecutionAdapter, PaperExecutionAdapter } from "./ExecutionAdapters";
 import { MarketScanner } from "./MarketScanner";
 import type { MarketScanDiagnostics, MarketScanWindowRejection, MarketScanWindowSample } from "./MarketScanner";
 import { LagProfiler, LagProfilerStats, LagSample } from "./LagProfiler";
@@ -187,6 +188,8 @@ export class PolymarketEngine {
   private readonly strategy: Strategy;
   private readonly sizing: Sizing;
   private readonly execution: PolymarketExecution;
+  private readonly paperExecutionAdapter: PaperExecutionAdapter;
+  private readonly liveExecutionAdapter: LiveExecutionAdapter;
   private readonly risk: PolymarketRisk;
   private readonly paperLedger: PaperLedger;
   private readonly truthReporter: ReturnType<typeof getTradingTruthReporter>;
@@ -344,6 +347,8 @@ export class PolymarketEngine {
     this.strategy = new Strategy(config);
     this.sizing = new Sizing(config);
     this.execution = new PolymarketExecution(config, logger, this.client);
+    this.paperExecutionAdapter = new PaperExecutionAdapter();
+    this.liveExecutionAdapter = new LiveExecutionAdapter(this.execution);
     this.risk = new PolymarketRisk(config, logger);
 
     this.logsDirPath = path.resolve(process.cwd(), "logs");
@@ -392,11 +397,25 @@ export class PolymarketEngine {
       !this.canMutateVenueState()
     ) {
       this.logger.warn(
-        { killSwitch: this.config.polymarket.killSwitch },
-        "Skipping startup cancel-all due to POLYMARKET_KILL_SWITCH"
+        {
+          killSwitch: this.config.polymarket.killSwitch,
+          liveConfirmed: this.config.polymarket.liveConfirmed,
+          liveExecutionEnabled: this.config.polymarket.liveExecutionEnabled
+        },
+        "Skipping startup cancel-all because live venue mutation is not armed"
       );
     }
     this.loopPromise = this.runLoopWithRestart();
+    if (this.config.polymarket.mode === "live" && !this.canMutateVenueState()) {
+      this.logger.warn(
+        {
+          killSwitch: this.config.polymarket.killSwitch,
+          liveConfirmed: this.config.polymarket.liveConfirmed,
+          liveExecutionEnabled: this.config.polymarket.liveExecutionEnabled
+        },
+        "Polymarket live mode running in shadow auth-only mode (no place/cancel mutations)"
+      );
+    }
     this.logger.warn(
       {
         mode: this.config.polymarket.mode,
@@ -424,8 +443,13 @@ export class PolymarketEngine {
       await this.execution.cancelAll(reason);
     } else {
       this.logger.warn(
-        { reason, killSwitch: this.config.polymarket.killSwitch },
-        "Skipping cancel-all on stop due to POLYMARKET_KILL_SWITCH"
+        {
+          reason,
+          killSwitch: this.config.polymarket.killSwitch,
+          liveConfirmed: this.config.polymarket.liveConfirmed,
+          liveExecutionEnabled: this.config.polymarket.liveExecutionEnabled
+        },
+        "Skipping cancel-all on stop because live venue mutation is not armed"
       );
     }
     this.paperLedger.flush();
@@ -668,7 +692,8 @@ export class PolymarketEngine {
       polyMoney:
         this.config.polymarket.mode !== "paper" &&
         !this.config.polymarket.killSwitch &&
-        this.config.polymarket.liveConfirmed,
+        this.config.polymarket.liveConfirmed &&
+        this.config.polymarket.liveExecutionEnabled,
       lastAction: effectiveLastAction,
       holdReason: currentWindowHoldReason,
       currentWindowHoldReason,
@@ -2729,8 +2754,8 @@ export class PolymarketEngine {
       }
       const yesEntryPrice = decision.yesAsk > 0 ? decision.yesAsk : decision.yesMid;
       const noEntryPrice = noAsk > 0 ? noAsk : estimateNoAskFromYesBook(decision.yesBid);
-      const feeBps = paperMode ? this.config.polymarket.paper.feeBps : this.config.takerFeeBps;
-      const slippageBps = paperMode ? this.config.polymarket.paper.slippageBps : this.config.takerSlipBps;
+      const feeBps = this.config.polymarket.paper.feeBps;
+      const slippageBps = this.config.polymarket.paper.slippageBps;
       const spreadProxy = Math.max(0, decision.spread) / 2;
       const costPenaltyProb = Math.max(0, feeBps + slippageBps) / 10_000 + spreadProxy;
       const edgeYes = prob.pUpModel - yesEntryPrice;
@@ -2840,10 +2865,12 @@ export class PolymarketEngine {
         : this.execution.getConcurrentWindows();
       const paperOpenNotional = this.paperLedger.getOpenNotionalForMarket(market.marketId);
       const livePositions = this.execution.getPositions();
-      const liveExistingPosition = livePositions.find((row) => row.marketId === market.marketId);
+      const liveExistingPositionCost = livePositions
+        .filter((row) => row.marketId === market.marketId)
+        .reduce((sum, row) => sum + Math.max(0, row.costUsd), 0);
       const liveWindowBudget = Math.max(
         0,
-        this.config.polymarket.sizing.maxNotionalPerWindow - (liveExistingPosition?.costUsd ?? 0)
+        this.config.polymarket.sizing.maxNotionalPerWindow - liveExistingPositionCost
       );
       const paperWindowBudget = Math.max(
         0,
@@ -3023,48 +3050,120 @@ export class PolymarketEngine {
             }
             blockReason = check.reason || "RISK_BLOCKED";
           } else if (paperMode) {
-            const accepted = this.executePaperTrade({
-              marketId: market.marketId,
-              marketSlug: market.eventSlug || market.slug,
-              windowStartTs,
-              windowEndTs: market.endTs,
-              priceToBeat: market.priceToBeat,
+            const result = await this.paperExecutionAdapter.executeEntry({
               side: desiredSide,
-              yesTokenId: market.yesTokenId,
-              noTokenId: market.noTokenId,
-              yesBid: decision.yesBid,
-              yesAsk: decision.yesAsk,
-              noAsk,
-              edge: netEdgeAfterCosts,
-              pBase: calibrated.pBase,
-              pBoosted: calibrated.pBoosted,
-              boostApplied: calibrated.boostApplied,
-              boostReason: calibrated.boostReason,
-              requestedNotionalUsd: size.notionalUsd,
-              ts: nowTs
+              execute: () =>
+                this.executePaperTrade({
+                  marketId: market.marketId,
+                  marketSlug: market.eventSlug || market.slug,
+                  windowStartTs,
+                  windowEndTs: market.endTs,
+                  priceToBeat: market.priceToBeat,
+                  side: desiredSide,
+                  yesTokenId: market.yesTokenId,
+                  noTokenId: market.noTokenId,
+                  yesBid: decision.yesBid,
+                  yesAsk: decision.yesAsk,
+                  noAsk,
+                  edge: netEdgeAfterCosts,
+                  pBase: calibrated.pBase,
+                  pBoosted: calibrated.pBoosted,
+                  boostApplied: calibrated.boostApplied,
+                  boostReason: calibrated.boostReason,
+                  requestedNotionalUsd: size.notionalUsd,
+                  ts: nowTs
+                })
             });
-            action = accepted ? (decisionAction === "BUY_NO" ? "BUY_NO" : "BUY_YES") : "HOLD";
-            executedSize = accepted ? size.notionalUsd : 0;
-            if (!accepted) {
-              blockReason = "PAPER_TRADE_REJECTED";
-            }
-          } else if (decisionAction === "BUY_NO") {
-            action = "HOLD";
-            executedSize = 0;
-            blockReason = "LIVE_NO_SIDE_DISABLED";
-          } else {
-            const result = await this.execution.executeBuyYes({
-              marketId: market.marketId,
-              tokenId: market.yesTokenId,
-              yesAsk: decision.yesAsk,
-              notionalUsd: size.notionalUsd,
-              tickSize: market.tickSize,
-              negRisk: market.negRisk
-            });
-            action = result.accepted ? "BUY_YES" : "HOLD";
+            action = result.accepted ? (decisionAction === "BUY_NO" ? "BUY_NO" : "BUY_YES") : "HOLD";
             executedSize = result.accepted ? size.notionalUsd : 0;
             if (!result.accepted) {
-              blockReason = result.reason || "LIVE_REJECTED";
+              blockReason = "PAPER_TRADE_REJECTED";
+            }
+          } else {
+            const liveTradeId = `live-${nowTs}-${market.marketId}-${desiredSide.toLowerCase()}`;
+            const liveTokenId =
+              desiredSide === "YES" ? market.yesTokenId : String(market.noTokenId || "").trim();
+            const direction = this.getPaperDirectionLabel({
+              side: desiredSide,
+              marketQuestion: market.question
+            });
+            const liveOrderIntent = {
+              tradeId: liveTradeId,
+              marketId: market.marketId,
+              marketSlug: market.eventSlug || market.slug || null,
+              side: desiredSide,
+              direction,
+              tokenId: liveTokenId || null,
+              contractPrice: sidePrice,
+              btcReferencePrice: fastMidNow > 0 ? fastMidNow : oracleEst,
+              notionalUsd: size.notionalUsd,
+              shares: sidePrice > 0 ? size.notionalUsd / Math.max(0.0001, sidePrice) : 0
+            };
+            this.logger.info(
+              {
+                ...liveOrderIntent,
+                reason: "ENTRY_SIGNAL"
+              },
+              "POLY_LIVE_INTENT"
+            );
+            if (!liveTokenId) {
+              action = "HOLD";
+              executedSize = 0;
+              blockReason = "LIVE_TOKEN_UNAVAILABLE";
+              this.logger.warn({ ...liveOrderIntent, reason: blockReason }, "POLY_LIVE_REJECT");
+            } else if (!this.canMutateVenueState()) {
+              action = "HOLD";
+              executedSize = 0;
+              blockReason = "LIVE_EXECUTION_NOT_ARMED";
+              this.logger.warn(
+                {
+                  ...liveOrderIntent,
+                  killSwitch: this.config.polymarket.killSwitch,
+                  liveConfirmed: this.config.polymarket.liveConfirmed,
+                  liveExecutionEnabled: this.config.polymarket.liveExecutionEnabled,
+                  reason: blockReason
+                },
+                "POLY_LIVE_REJECT"
+              );
+            } else {
+              const result = await this.liveExecutionAdapter.executeEntry({
+                marketId: market.marketId,
+                tokenId: liveTokenId,
+                side: desiredSide,
+                contractPrice: sidePrice,
+                notionalUsd: size.notionalUsd,
+                tickSize: market.tickSize,
+                negRisk: market.negRisk
+              });
+              action = result.accepted ? decisionAction : "HOLD";
+              executedSize = result.accepted ? size.notionalUsd : 0;
+              if (!result.accepted) {
+                blockReason = result.reason || "LIVE_REJECTED";
+                this.logger.warn(
+                  {
+                    ...liveOrderIntent,
+                    reason: blockReason
+                  },
+                  "POLY_LIVE_REJECT"
+                );
+              } else {
+                this.logger.info(
+                  {
+                    ...liveOrderIntent,
+                    orderId: result.orderId || null,
+                    fillPrice: result.fillPrice ?? sidePrice,
+                    filledShares: result.filledShares,
+                    reason: result.reason || "LIVE_FILLED_OR_PARTIAL"
+                  },
+                  "POLY_LIVE_ORDER_OPEN"
+                );
+                this.emitPolymarketTruth({
+                  ts: nowTs,
+                  action: "OPEN",
+                  tradeId: liveTradeId,
+                  slug: market.eventSlug || market.slug || null
+                });
+              }
             }
           }
         }
@@ -5132,7 +5231,9 @@ export class PolymarketEngine {
   }
 
   private canMutateVenueState(): boolean {
-    return !this.config.polymarket.killSwitch;
+    if (this.config.polymarket.killSwitch) return false;
+    if (this.config.polymarket.mode !== "live") return true;
+    return this.config.polymarket.liveConfirmed && this.config.polymarket.liveExecutionEnabled;
   }
 
   private async fetchAttempt(nowTs: number): Promise<void> {
@@ -5986,6 +6087,7 @@ export class PolymarketEngine {
       force: params.force ?? false,
       mode: this.config.polymarket.mode === "paper" ? "PAPER" : "LIVE",
       liveConfirmed: this.config.polymarket.liveConfirmed,
+      liveExecutionEnabled: this.config.polymarket.liveExecutionEnabled,
       killSwitch: this.config.polymarket.killSwitch,
       enabled: this.config.polymarket.enabled,
       polyEngineRunning: this.polyState.lastFetchAttemptTs > 0,

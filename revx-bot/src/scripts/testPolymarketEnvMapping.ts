@@ -37,6 +37,7 @@ function run(): void {
     POLYMARKET_ENABLED: "true",
     POLYMARKET_MODE: "live",
     POLYMARKET_LIVE_CONFIRMED: "true",
+    POLYMARKET_LIVE_EXECUTION_ENABLED: "false",
     POLYMARKET_PRIVATE_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111",
     POLYMARKET_FUNDER: "0x2222222222222222222222222222222222222222",
     POLYMARKET_API_KEY: "test_api_key",
@@ -53,6 +54,7 @@ function run(): void {
     () => {
       const config = loadConfig();
       assert(config.polymarket.auth.apiSecret === "legacy_secret", "expected legacy POLYMARKET_SECRET fallback");
+      assert(config.polymarket.liveExecutionEnabled === false, "expected live execution arming default false");
     }
   );
 

@@ -15,6 +15,7 @@ export type PolymarketConfig = {
   mode: PolymarketMode;
   fetchEnabled: boolean;
   liveConfirmed: boolean;
+  liveExecutionEnabled: boolean;
   killSwitch: boolean;
   loopMs: number;
   marketQuery: {
@@ -1034,6 +1035,7 @@ export function loadConfig(): BotConfig {
     true
   );
   const polymarketLiveConfirmed = boolWithDefault("POLYMARKET_LIVE_CONFIRMED", false);
+  const polymarketLiveExecutionEnabled = boolWithDefault("POLYMARKET_LIVE_EXECUTION_ENABLED", false);
   const polymarketKillSwitch = boolWithDefault("POLYMARKET_KILL_SWITCH", false);
   const polymarketLoopMs = clampInt(numberWithDefault("POLYMARKET_LOOP_MS", 2_000), 250, 60_000);
   const polymarketMarketSymbol = withDefault("POLYMARKET_MARKET_SYMBOL", "BTC-USD")
@@ -1773,6 +1775,7 @@ export function loadConfig(): BotConfig {
       mode: polymarketMode,
       fetchEnabled: polymarketFetchEnabled,
       liveConfirmed: polymarketLiveConfirmed,
+      liveExecutionEnabled: polymarketLiveExecutionEnabled,
       killSwitch: polymarketKillSwitch,
       loopMs: polymarketLoopMs,
       marketQuery: {

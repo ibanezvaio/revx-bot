@@ -766,8 +766,9 @@ export class PolymarketClient {
     return this.parseOrderBookPayload(book, tokenId);
   }
 
-  async placeMarketableBuyYes(params: {
+  async placeMarketableOrder(params: {
     tokenId: string;
+    side: "BUY" | "SELL";
     limitPrice: number;
     size: number;
     ttlMs: number;
@@ -787,7 +788,7 @@ export class PolymarketClient {
 
     const { userOrder, options } = buildCreateOrderInput({
       tokenId: params.tokenId,
-      side: "BUY",
+      side: params.side,
       price: params.limitPrice,
       size: params.size,
       expirationSec,
@@ -804,6 +805,20 @@ export class PolymarketClient {
       throw new Error(`Polymarket order placement did not return orderID: ${JSON.stringify(response)}`);
     }
     return { orderId };
+  }
+
+  async placeMarketableBuyYes(params: {
+    tokenId: string;
+    limitPrice: number;
+    size: number;
+    ttlMs: number;
+    tickSize?: TickSize;
+    negRisk?: boolean;
+  }): Promise<{ orderId: string }> {
+    return this.placeMarketableOrder({
+      ...params,
+      side: "BUY"
+    });
   }
 
   async cancelOrder(orderId: string): Promise<void> {

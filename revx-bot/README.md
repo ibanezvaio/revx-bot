@@ -146,6 +146,7 @@ node dist/cli.js polymarket --btc5m --live --cancel-all-on-start
 
 Required env vars for live mode:
 - `POLYMARKET_LIVE_CONFIRMED=true` (required guard for any live Polymarket mode)
+- `POLYMARKET_LIVE_EXECUTION_ENABLED=true` (second arming guard; required before any real place/cancel mutation)
 - `POLYMARKET_API_KEY` (or your mapped name via `POLYMARKET_API_KEY_ENV`)
 - `POLYMARKET_API_SECRET` (or legacy fallback `POLYMARKET_SECRET`)
 - `POLYMARKET_PASSPHRASE`
@@ -169,7 +170,14 @@ Auth wiring notes:
 - `.polymarket-creds.json` contains secret material; it is gitignored by default.
 - combined runtime (`npm run live`) runs RevX and Polymarket in one process when enabled:
   - `POLYMARKET_ENABLED=true POLYMARKET_MODE=paper POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m- npm run live`
-  - `POLYMARKET_ENABLED=true POLYMARKET_MODE=live POLYMARKET_LIVE_CONFIRMED=true npm run live`
+  - `POLYMARKET_ENABLED=true POLYMARKET_MODE=live POLYMARKET_LIVE_CONFIRMED=true POLYMARKET_LIVE_EXECUTION_ENABLED=false npm run live` (live shadow/auth mode)
+  - `POLYMARKET_ENABLED=true POLYMARKET_MODE=live POLYMARKET_LIVE_CONFIRMED=true POLYMARKET_LIVE_EXECUTION_ENABLED=true npm run live` (armed real-money mode)
+
+Safe activation sequence:
+1. paper mode (`POLYMARKET_MODE=paper`)
+2. live shadow auth-only mode (`POLYMARKET_MODE=live`, `POLYMARKET_LIVE_CONFIRMED=true`, `POLYMARKET_LIVE_EXECUTION_ENABLED=false`)
+3. tiny-size live execution (`POLYMARKET_LIVE_EXECUTION_ENABLED=true`, `POLYMARKET_MAX_NOTIONAL_PER_WINDOW=0.25`, `POLYMARKET_MAX_DAILY_LOSS=2`)
+4. increase only after validating fills/position tracking
 
 Extreme-sniping profile (paper 1h, then live micro) with `npm run live` only:
 
@@ -191,6 +199,7 @@ npm run live
 POLYMARKET_ENABLED=true \
 POLYMARKET_MODE=live \
 POLYMARKET_LIVE_CONFIRMED=true \
+POLYMARKET_LIVE_EXECUTION_ENABLED=true \
 POLYMARKET_SEED_SERIES_PREFIX=btc-updown-5m- \
 POLYMARKET_MAX_NOTIONAL_PER_WINDOW=0.25 \
 POLYMARKET_MAX_DAILY_LOSS=2 \
@@ -212,6 +221,9 @@ Safety notes:
   - `POLYMARKET_MAX_NOTIONAL_PER_WINDOW` capped to `0.25`
   - `POLYMARKET_MAX_DAILY_LOSS` capped to `2`
   - `POLYMARKET_CANCEL_ALL_ON_START=true`
+- real-money place/cancel requires both:
+  - `POLYMARKET_LIVE_CONFIRMED=true`
+  - `POLYMARKET_LIVE_EXECUTION_ENABLED=true`
 - kill-switch + cancel-all is automatic on severe risk breaches
 - `POLYMARKET_KILL_SWITCH=true` runs HOLD-only (no place/cancel mutations)
 - no new orders are allowed in the final `POLYMARKET_NO_NEW_ORDERS_LAST_SEC` seconds (default 30s)

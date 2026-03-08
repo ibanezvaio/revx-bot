@@ -30,6 +30,7 @@ type RevxTruthState = {
 type PolymarketTruthState = {
   mode: "PAPER" | "LIVE";
   liveConfirmed: boolean;
+  liveExecutionEnabled: boolean;
   killSwitch: boolean;
   enabled: boolean;
   polyEngineRunning: boolean;
@@ -144,6 +145,7 @@ export type TradingTruthSnapshot = {
     };
     enabled: boolean;
     liveConfirmed: boolean;
+    liveExecutionEnabled: boolean;
     killSwitch: boolean;
     polyEngineRunning: boolean;
     fetchOk: boolean;
@@ -197,6 +199,7 @@ class TradingTruthReporter {
     this.poly = {
       mode: config.polymarket.mode === "paper" ? "PAPER" : "LIVE",
       liveConfirmed: config.polymarket.liveConfirmed,
+      liveExecutionEnabled: config.polymarket.liveExecutionEnabled,
       killSwitch: config.polymarket.killSwitch,
       enabled: config.polymarket.enabled,
       polyEngineRunning: false,
@@ -282,7 +285,8 @@ class TradingTruthReporter {
         this.poly.enabled &&
         this.poly.mode !== "PAPER" &&
         !this.poly.killSwitch &&
-        this.poly.liveConfirmed
+        this.poly.liveConfirmed &&
+        this.poly.liveExecutionEnabled
     };
     const lastFillExists =
       this.revx.lastFillTs !== null ||
@@ -381,6 +385,7 @@ class TradingTruthReporter {
         },
         enabled: this.poly.enabled,
         liveConfirmed: this.poly.liveConfirmed,
+        liveExecutionEnabled: this.poly.liveExecutionEnabled,
         killSwitch: this.poly.killSwitch,
         polyEngineRunning: this.poly.polyEngineRunning,
         fetchOk: this.poly.fetchOk

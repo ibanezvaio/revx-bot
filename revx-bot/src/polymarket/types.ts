@@ -127,8 +127,11 @@ export type SizeOutput = {
 };
 
 export type PositionState = {
+  key: string;
   marketId: string;
-  yesShares: number;
+  tokenId: string;
+  side: "YES" | "NO";
+  shares: number;
   costUsd: number;
   avgPrice: number;
   updatedTs: number;
@@ -150,7 +153,7 @@ export type OpenOrderState = {
 };
 
 export type ExecutionResult = {
-  action: "BUY_YES" | "HOLD";
+  action: "BUY_YES" | "BUY_NO" | "SELL_YES" | "SELL_NO" | "HOLD";
   accepted: boolean;
   filledShares: number;
   fillPrice?: number;

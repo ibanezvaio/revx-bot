@@ -643,7 +643,8 @@ export class DashboardServer {
         runtime?.polyMoney ??
         (this.config.polymarket.mode !== "paper" &&
           !this.config.polymarket.killSwitch &&
-          this.config.polymarket.liveConfirmed),
+          this.config.polymarket.liveConfirmed &&
+          this.config.polymarket.liveExecutionEnabled),
       lastAction: summaryLastAction,
       lastActionTs: summaryLastActionTs,
       holdReason: summaryHoldReason,

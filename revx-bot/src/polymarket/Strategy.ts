@@ -128,21 +128,13 @@ export class Strategy {
   }
 
   private computeCostPenaltyProb(): number {
-    const feeBps =
-      this.config.polymarket.mode === "paper"
-        ? this.config.polymarket.paper.feeBps
-        : Math.max(0, this.config.takerFeeBps);
-    const slippageBps =
-      this.config.polymarket.mode === "paper"
-        ? this.config.polymarket.paper.slippageBps
-        : Math.max(0, this.config.takerSlipBps);
+    const feeBps = Math.max(0, this.config.polymarket.paper.feeBps);
+    const slippageBps = Math.max(0, this.config.polymarket.paper.slippageBps);
     return Math.max(0, (feeBps + slippageBps) / 10_000);
   }
 
   private computeMinEdgeThreshold(): number {
-    return this.config.polymarket.mode === "paper"
-      ? this.config.polymarket.paper.minEdgeThreshold
-      : this.config.polymarket.threshold.baseEdge;
+    return this.config.polymarket.paper.minEdgeThreshold;
   }
 }
 
