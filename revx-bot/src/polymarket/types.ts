@@ -42,6 +42,8 @@ export type BtcWindowMarket = {
   startTs?: number;
   yesTokenId: string;
   noTokenId?: string;
+  yesDisplayLabel?: string;
+  noDisplayLabel?: string;
   tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
   negRisk?: boolean;
   acceptingOrders: boolean;
@@ -183,6 +185,8 @@ export type DecisionLogLine = {
   marketId: string;
   slug?: string;
   selectedSlug?: string | null;
+  candidatesCount?: number;
+  windowsCount?: number;
   tauSec: number;
   remainingSec?: number;
   priceToBeat: number;
@@ -215,6 +219,7 @@ export type DecisionLogLine = {
   threshold: number;
   action: string;
   holdReason?: string;
+  holdDetailReason?: string;
   size: number;
   mode: PolymarketConfig["mode"];
   openTrades?: number;

@@ -43,7 +43,16 @@ import { AdaptiveStatus, AnalysisSummary, AnalysisWindowKey } from "../performan
 import { renderEquityChartScript } from "../ui/components/EquityChart";
 import { renderDrawdownChartScript } from "../ui/components/DrawdownChart";
 import { renderUseEquitySeriesScript } from "../ui/hooks/useEquitySeries";
-import { PaperLedger, PaperTrade } from "../polymarket/paper/PaperLedger";
+import {
+  EquityPoint,
+  PaperLedger,
+  PaperTrade,
+  getPaperTradeExitPricePerShare,
+  getPaperTradeExitValueUsd,
+  getPaperTradePnlUsd,
+  getPaperTradeResult,
+  getPaperTradeStatus
+} from "../polymarket/paper/PaperLedger";
 
 type PnlWindowKey = "24h" | "12h" | "4h" | "1h" | "15m";
 
@@ -93,18 +102,32 @@ type PolymarketRuntimeSnapshot = {
   };
   tradingPaused: boolean;
   pauseReason: string | null;
+  warningState: string | null;
   mode: "paper" | "live";
   polyMoney: boolean;
   lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
   holdReason: string | null;
+  currentWindowHoldReason?: string | null;
+  openTradesCount?: number;
+  awaitingResolutionCount?: number;
+  resolutionErrorCount?: number;
+  resolutionQueueCount?: number;
+  lastActionTs?: number;
+  serverNowTs?: number;
   selection: {
     finalCandidatesCount: number | null;
     discoveredCandidatesCount: number | null;
     windowsCount: number | null;
     selectedSlug: string | null;
     selectedMarketId: string | null;
+    windowStartTs?: number | null;
     windowEndTs: number | null;
     remainingSec: number | null;
+    chosenDirection: string | null;
+    entriesInWindow: number | null;
+    realizedPnlUsd: number | null;
+    resolutionSource: string | null;
+    lifecycleStatus?: string | null;
   };
   dataHealth: {
     oracleSource: string | null;
@@ -132,6 +155,41 @@ type PolymarketRuntimeSnapshot = {
     slug: string | null;
     ts: number | null;
   };
+  openTrade: {
+    tradeId: string;
+    marketId: string;
+    marketSlug: string | null;
+    windowStartTs: number;
+    windowEndTs: number;
+    side: "YES" | "NO";
+    direction: string;
+    heldTokenId: string | null;
+    strikePrice: number | null;
+    btcStartPrice: number | null;
+    entryBtcReferencePrice: number | null;
+    btcReferencePrice: number | null;
+    btcReferenceTs: number | null;
+    btcReferenceAgeMs: number | null;
+    btcReferenceStale: boolean;
+    contractEntryPrice: number;
+    contractLivePrice: number | null;
+    impliedProbPct: number | null;
+    bestBid: number | null;
+    bestAsk: number | null;
+    livePrice: number | null;
+    markSource: string | null;
+    markTs: number | null;
+    markAgeMs: number | null;
+    markStale: boolean;
+    isStale: boolean;
+    qty: number;
+    shares: number;
+    entryPrice: number;
+    entryNotionalUsd: number;
+    feesUsd: number;
+    markValueUsd: number | null;
+    unrealizedPnlUsd: number | null;
+  } | null;
   polyEngineRunning: boolean;
   lastUpdateTs: number;
   lastUpdateAgeSec: number | null;
@@ -318,6 +376,7 @@ export class DashboardServer {
     ts: number | null;
     marketId: string | null;
     slug: string | null;
+    windowStart: number | null;
     windowEnd: number | null;
     countdownSec: number | null;
     pUpModel: number | null;
@@ -325,10 +384,14 @@ export class DashboardServer {
     yesAsk: number | null;
     yesMid: number | null;
     chosenSide: string | null;
+    chosenDirection: string | null;
     chosenEdge: number | null;
     netEdgeAfterCosts: number | null;
     openTrades: number | null;
     resolvedTrades: number | null;
+    entriesInWindow: number | null;
+    windowRealizedPnlUsd: number | null;
+    resolutionSource: string | null;
     lastAction: string | null;
     holdReason: string | null;
     holdDetailReason: string | null;
@@ -338,6 +401,7 @@ export class DashboardServer {
     windowsCount: number | null;
     tradingPaused: boolean;
     pauseReason: string | null;
+    warningState: string | null;
   } | null {
     const logPath = this.getPolymarketDecisionLogPath();
     if (!existsSync(logPath)) return null;
@@ -358,18 +422,25 @@ export class DashboardServer {
           ts: tickTs,
           marketId: toOptionalString(row.marketId),
           slug: toOptionalString(row.selectedSlug) ?? toOptionalString(row.slug),
+          windowStart: toFiniteNumber(row.windowStart),
           windowEnd,
           countdownSec:
-            typeof windowEnd === "number" ? Math.max(0, Math.floor((windowEnd - now) / 1000)) : null,
+            typeof windowEnd === "number"
+              ? Math.max(0, Math.floor((windowEnd - now) / 1000))
+              : toFiniteNumber(row.tauSec),
           pUpModel: toFiniteNumber(row.pUpModel) ?? toFiniteNumber(row.pUp),
           yesBid: toFiniteNumber(row.yesBid),
           yesAsk: toFiniteNumber(row.yesAsk),
           yesMid: toFiniteNumber(row.yesMid),
           chosenSide: toOptionalString(row.chosenSide),
+          chosenDirection: toOptionalString(row.chosenDirection),
           chosenEdge: toFiniteNumber(row.chosenEdge),
           netEdgeAfterCosts: toFiniteNumber(row.netEdgeAfterCosts),
           openTrades: toFiniteNumber(row.openTrades),
           resolvedTrades: toFiniteNumber(row.resolvedTrades),
+          entriesInWindow: toFiniteNumber(row.entriesInWindow),
+          windowRealizedPnlUsd: toFiniteNumber(row.windowRealizedPnlUsd),
+          resolutionSource: toOptionalString(row.resolutionSource),
           lastAction: actionRaw,
           holdReason:
             toOptionalString(row.holdReason) ??
@@ -385,13 +456,359 @@ export class DashboardServer {
             toFiniteNumber(row.afterWindowCount) ??
             toFiniteNumber(row.activeWindows),
           tradingPaused: parseBoolean(row.tradingPaused) ?? false,
-          pauseReason: toOptionalString(row.pauseReason)
+          pauseReason: toOptionalString(row.pauseReason),
+          warningState: toOptionalString(row.warningState)
         };
       } catch {
         // ignore malformed rows and continue scanning backward
       }
     }
     return null;
+  }
+
+  private getCanonicalPolymarketSelection(
+    nowTs: number,
+    runtime: PolymarketRuntimeSnapshot | null,
+    tick: ReturnType<DashboardServer["getLatestPolymarketTick"]>,
+    truth?: ReturnType<typeof getTradingTruthSnapshot> | null
+  ): {
+    finalCandidatesCount: number | null;
+    discoveredCandidatesCount: number | null;
+    windowsCount: number | null;
+    selectedSlug: string | null;
+    selectedMarketId: string | null;
+    windowStartTs: number | null;
+    windowEndTs: number | null;
+    remainingSec: number | null;
+    chosenDirection: string | null;
+    entriesInWindow: number | null;
+    realizedPnlUsd: number | null;
+    resolutionSource: string | null;
+    lifecycleStatus: string | null;
+  } {
+    const rawWindowEndTs =
+      toFiniteNumber(runtime?.selection?.windowEndTs) ??
+      toFiniteNumber(truth?.poly.selection.windowEndTs) ??
+      toFiniteNumber(tick?.windowEnd);
+    const rawWindowStartTs =
+      toFiniteNumber(runtime?.selection?.windowStartTs) ??
+      toFiniteNumber((truth?.poly.selection as { windowStartTs?: number | null } | undefined)?.windowStartTs) ??
+      toFiniteNumber(tick?.windowStart) ??
+      (rawWindowEndTs !== null ? Math.max(0, rawWindowEndTs - 5 * 60 * 1000) : null);
+    const isActiveSelection = rawWindowEndTs !== null && rawWindowEndTs > nowTs;
+    const selectedSlug = isActiveSelection
+      ? toOptionalString(runtime?.selection?.selectedSlug) ??
+        toOptionalString(truth?.poly.selection.selectedSlug) ??
+        toOptionalString(tick?.slug)
+      : null;
+    const selectedMarketId = isActiveSelection
+      ? toOptionalString(runtime?.selection?.selectedMarketId) ??
+        toOptionalString(truth?.poly.selection.selectedMarketId) ??
+        toOptionalString(tick?.marketId)
+      : null;
+    const remainingSec = isActiveSelection && rawWindowEndTs !== null
+      ? Math.max(0, Math.floor((rawWindowEndTs - nowTs) / 1000))
+      : null;
+    const runtimeLifecycleStatus = toOptionalString(runtime?.selection?.lifecycleStatus);
+    return {
+      finalCandidatesCount:
+        toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
+        toFiniteNumber(truth?.poly.selection.finalCandidatesCount) ??
+        toFiniteNumber(tick?.finalCandidatesCount),
+      discoveredCandidatesCount:
+        toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+        toFiniteNumber(truth?.poly.selection.discoveredCandidatesCount) ??
+        toFiniteNumber(tick?.discoveredCandidatesCount),
+      windowsCount:
+        toFiniteNumber(runtime?.selection?.windowsCount) ??
+        toFiniteNumber(truth?.poly.selection.windowsCount) ??
+        toFiniteNumber(tick?.windowsCount),
+      selectedSlug,
+      selectedMarketId,
+      windowStartTs: isActiveSelection ? rawWindowStartTs : null,
+      windowEndTs: isActiveSelection ? rawWindowEndTs : null,
+      remainingSec,
+      chosenDirection:
+        toOptionalString(runtime?.selection?.chosenDirection) ??
+        toOptionalString(truth?.poly.selection.chosenDirection) ??
+        toOptionalString(tick?.chosenDirection),
+      entriesInWindow:
+        toFiniteNumber(runtime?.selection?.entriesInWindow) ??
+        toFiniteNumber(truth?.poly.selection.entriesInWindow) ??
+        toFiniteNumber(tick?.entriesInWindow),
+      realizedPnlUsd:
+        toFiniteNumber(runtime?.selection?.realizedPnlUsd) ??
+        toFiniteNumber(truth?.poly.selection.windowRealizedPnlUsd) ??
+        toFiniteNumber(tick?.windowRealizedPnlUsd),
+      resolutionSource:
+        toOptionalString(runtime?.selection?.resolutionSource) ??
+        toOptionalString(truth?.poly.selection.resolutionSource) ??
+        toOptionalString(tick?.resolutionSource),
+      lifecycleStatus:
+        runtimeLifecycleStatus ??
+        (!isActiveSelection && rawWindowEndTs !== null ? "AWAITING_RESOLUTION" : null)
+    };
+  }
+
+  private getPolymarketLastActionTs(
+    runtime: PolymarketRuntimeSnapshot | null,
+    tick: ReturnType<DashboardServer["getLatestPolymarketTick"]>,
+    ledger: PaperLedger
+  ): number {
+    const latestTradeTs = ledger
+      .getAllTrades()
+      .reduce(
+        (best, trade) => Math.max(best, Number(trade.statusUpdatedAt || trade.resolvedAt || trade.createdTs || 0)),
+        0
+      );
+    return Math.max(
+      0,
+      toFiniteNumber(runtime?.lastActionTs) ?? 0,
+      toFiniteNumber(runtime?.lastTrade?.ts) ?? 0,
+      toFiniteNumber(tick?.ts) ?? 0,
+      latestTradeTs
+    );
+  }
+
+  private buildPolymarketSummaryPayload(nowTs = Date.now()): Record<string, unknown> {
+    const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
+    const summary = ledger.getSummary(nowTs);
+    const tick = this.getLatestPolymarketTick();
+    const runtime = this.getPolymarketRuntimeSnapshot();
+    const truth = getTradingTruthSnapshot(this.config, this.logger);
+    const latestPolymarket = runtime?.latestPolymarket ?? null;
+    const latestModel = runtime?.latestModel ?? null;
+    const latestLag = runtime?.latestLag ?? null;
+    const summarySelection = this.getCanonicalPolymarketSelection(nowTs, runtime, tick, truth);
+    const summaryDataHealth = runtime?.dataHealth ?? {
+      oracleSource: null,
+      oracleState: null,
+      latestPolymarketTs: latestPolymarket?.ts ?? null,
+      latestModelTs: latestModel?.ts ?? null,
+      lastFetchAttemptTs: 0,
+      lastFetchOkTs: 0,
+      lastFetchErr: null,
+      lastHttpStatus: 0,
+      lastBookTsMs: 0,
+      lastYesBid: null,
+      lastYesAsk: null,
+      lastYesMid: null,
+      lastModelTs: 0
+    };
+    const pausePresentation = this.getPolymarketPausePresentation(
+      runtime?.mode ?? this.config.polymarket.mode,
+      runtime?.tradingPaused ?? tick?.tradingPaused ?? false,
+      runtime?.pauseReason ?? tick?.pauseReason ?? null,
+      runtime?.warningState ?? tick?.warningState ?? null
+    );
+    const statusBanner = this.buildPolymarketStatusBanner(runtime, tick);
+    const lastTickTs = toFiniteNumber(tick?.ts);
+    const lastTickAgeSec = lastTickTs ? Math.max(0, Math.floor((nowTs - lastTickTs) / 1000)) : null;
+    const summaryLastAction = runtime?.lastAction ?? tick?.lastAction ?? "HOLD";
+    const summaryLastActionTs = this.getPolymarketLastActionTs(runtime, tick, ledger);
+    const summaryLifecycleStatus =
+      summarySelection.lifecycleStatus ??
+      (summary.awaitingResolutionTrades > 0
+        ? "AWAITING_RESOLUTION"
+        : summary.resolutionErrorTrades > 0
+          ? "RESOLUTION_ERROR"
+          : summary.openPositions > 0
+            ? "OPEN"
+            : summaryLastAction === "RESOLVE" || summaryLastAction === "CLOSE"
+              ? "RESOLVED"
+              : "IDLE");
+    const summaryHoldReason =
+      runtime && summaryLastAction !== "HOLD"
+        ? null
+        : runtime?.currentWindowHoldReason ?? runtime?.holdReason ?? tick?.holdReason ?? null;
+    const summaryHoldDetailReason =
+      runtime && summaryLastAction !== "HOLD"
+        ? null
+        : runtime?.state?.holdDetailReason ?? tick?.holdDetailReason ?? null;
+    const resolutionQueueCount = summary.awaitingResolutionTrades + summary.resolutionErrorTrades;
+    const currentWindowEntryBlocked = Boolean(
+      summarySelection.selectedSlug &&
+      summaryLastAction === "HOLD" &&
+      summaryHoldReason
+    );
+    const effectiveLastTrade =
+      summary.totalTrades > 0 ? runtime?.lastTrade ?? null : null;
+
+    return {
+      ts: nowTs,
+      serverNowTs: nowTs,
+      polyEngineRunning: runtime?.polyEngineRunning ?? false,
+      mode: runtime?.mode ?? this.config.polymarket.mode,
+      polyMoney:
+        runtime?.polyMoney ??
+        (this.config.polymarket.mode !== "paper" &&
+          !this.config.polymarket.killSwitch &&
+          this.config.polymarket.liveConfirmed),
+      lastAction: summaryLastAction,
+      lastActionTs: summaryLastActionTs,
+      holdReason: summaryHoldReason,
+      currentWindowHoldReason: summaryHoldReason,
+      holdDetailReason: summaryHoldDetailReason,
+      lifecycleStatus: summaryLifecycleStatus,
+      dominantReject: runtime?.state?.dominantReject ?? tick?.dominantReject ?? null,
+      lastTickTs,
+      lastTickAgeSec,
+      totalTrades: summary.totalTrades,
+      openTrades: summary.openPositions,
+      openTradesCount: summary.openPositions,
+      resolvedTrades: summary.resolvedTrades,
+      awaitingResolutionTrades: summary.awaitingResolutionTrades,
+      awaitingResolutionCount: summary.awaitingResolutionTrades,
+      resolutionErrorTrades: summary.resolutionErrorTrades,
+      resolutionErrorCount: summary.resolutionErrorTrades,
+      resolutionQueueCount,
+      voidTrades: summary.voidTrades,
+      exitedEarlyTrades: summary.exitedEarlyTrades,
+      cancelledTrades: summary.cancelledTrades,
+      pnlTotalUsd: summary.totalPnlUsd,
+      pnl24hUsd: summary.pnl24hUsd,
+      winRate: summary.winRate,
+      wins: summary.wins,
+      losses: summary.losses,
+      lastResolved: summary.lastResolved ?? null,
+      equityCurve: ledger.getEquitySeries(),
+      currentMarketId: tick?.marketId ?? null,
+      currentSlug: tick?.slug ?? null,
+      currentWindowEnd: tick?.windowEnd ?? null,
+      countdownSec: summarySelection.remainingSec,
+      pUpModel: tick?.pUpModel ?? null,
+      yesBid: tick?.yesBid ?? null,
+      yesAsk: tick?.yesAsk ?? null,
+      yesMid: tick?.yesMid ?? null,
+      chosenSide: tick?.chosenSide ?? null,
+      chosenDirection: summarySelection.chosenDirection ?? tick?.chosenDirection ?? null,
+      chosenEdge: tick?.chosenEdge ?? null,
+      netEdgeAfterCosts: tick?.netEdgeAfterCosts ?? null,
+      entriesInWindow: summarySelection.entriesInWindow ?? tick?.entriesInWindow ?? null,
+      windowRealizedPnlUsd: summarySelection.realizedPnlUsd ?? tick?.windowRealizedPnlUsd ?? null,
+      resolutionSource: summarySelection.resolutionSource ?? tick?.resolutionSource ?? null,
+      currentWindowEntryBlocked,
+      currentWindowEntryBlockReason: currentWindowEntryBlocked ? summaryHoldReason : null,
+      tradingPaused: pausePresentation.tradingPaused,
+      pauseReason: pausePresentation.pauseReason,
+      warningState: pausePresentation.warningState,
+      latestPolymarket,
+      latestModel,
+      latestLag,
+      finalCandidatesCount: summarySelection.finalCandidatesCount ?? null,
+      candidatesCount:
+        toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
+        toFiniteNumber(tick?.discoveredCandidatesCount) ??
+        null,
+      windowsCount:
+        toFiniteNumber(runtime?.selection?.windowsCount) ??
+        toFiniteNumber(tick?.windowsCount) ??
+        null,
+      selectedSlug: summarySelection.selectedSlug ?? null,
+      selectedMarketId: summarySelection.selectedMarketId ?? null,
+      windowStartTs: summarySelection.windowStartTs ?? null,
+      windowEndTs: summarySelection.windowEndTs ?? null,
+      remainingSec: summarySelection.remainingSec,
+      minWindowSec:
+        toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ??
+        this.config.polymarket.paper.entryMinRemainingSec,
+      maxWindowSec:
+        toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ??
+        this.config.polymarket.paper.entryMaxRemainingSec,
+      lastUpdateTs: toFiniteNumber(runtime?.lastUpdateTs) ?? 0,
+      lastUpdateAgeSec:
+        toFiniteNumber(runtime?.lastUpdateAgeSec) ??
+        ((toFiniteNumber(runtime?.lastUpdateTs) ?? 0) > 0
+          ? Math.max(0, Math.floor((nowTs - (toFiniteNumber(runtime?.lastUpdateTs) ?? 0)) / 1000))
+          : null),
+      status: runtime?.status ?? "STARTING",
+      dataHealth: summaryDataHealth,
+      statusBanner,
+      rejectCountsByStage: runtime?.state?.rejectCountsByStage ?? null,
+      sampleRejected: runtime?.state?.sampleRejected ?? [],
+      lastTrade: effectiveLastTrade,
+      openTrade: runtime?.openTrade ?? null,
+      lastTradeTs: toFiniteNumber(effectiveLastTrade?.ts) ?? null,
+      sniperWindow: runtime?.sniperWindow ?? {
+        minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
+        maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
+      }
+    };
+  }
+
+  private buildPolymarketDashboardPayload(limit = 200): Record<string, unknown> {
+    const ts = Date.now();
+    const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
+    const tradesPayload = buildPolymarketTradesPayload(ledger, limit);
+    const summary = this.buildPolymarketSummaryPayload(ts);
+    const openRows = mergePolymarketOpenTradeLiveMetrics(
+      buildPolymarketOpenRows(tradesPayload.rows),
+      summary.openTrade && typeof summary.openTrade === "object" ? (summary.openTrade as Record<string, unknown>) : null
+    );
+    const recentRows = buildPolymarketRecentRows(tradesPayload.rows, limit);
+    const equityPoints = ledger.getEquitySeries();
+    const activityEvent = buildPolymarketActivityEvent(summary);
+    const summaryOpenTrade =
+      summary.openTrade && typeof summary.openTrade === "object"
+        ? (summary.openTrade as Record<string, unknown>)
+        : null;
+    const liveStrip = {
+      serverNowTs: summary.serverNowTs ?? ts,
+      selectedWindow: summary.selectedSlug ?? null,
+      direction: summary.chosenDirection ?? summary.chosenSide ?? null,
+      windowStartTs: summary.windowStartTs ?? null,
+      windowEndTs: summary.windowEndTs ?? summary.currentWindowEnd ?? null,
+      remainingSec: summary.remainingSec ?? summary.countdownSec ?? null,
+      hasOpenTrade: openRows.length > 0,
+      strikePrice: summaryOpenTrade?.strikePrice ?? null,
+      btcStartPrice: summaryOpenTrade?.btcStartPrice ?? summaryOpenTrade?.entryBtcReferencePrice ?? null,
+      entryBtcReferencePrice: summaryOpenTrade?.entryBtcReferencePrice ?? null,
+      btcReferencePrice: summaryOpenTrade?.btcReferencePrice ?? null,
+      btcReferenceTs: summaryOpenTrade?.btcReferenceTs ?? null,
+      btcReferenceAgeMs: summaryOpenTrade?.btcReferenceAgeMs ?? null,
+      btcReferenceStale: Boolean(summaryOpenTrade?.btcReferenceStale),
+      contractEntryPrice: summaryOpenTrade?.contractEntryPrice ?? summaryOpenTrade?.entryPrice ?? null,
+      contractLivePrice: summaryOpenTrade?.contractLivePrice ?? summaryOpenTrade?.livePrice ?? null,
+      impliedProbPct: summaryOpenTrade?.impliedProbPct ?? null,
+      livePrice: summaryOpenTrade?.livePrice ?? null,
+      unrealizedPnlUsd: summaryOpenTrade?.unrealizedPnlUsd ?? null,
+      markStale: Boolean(summaryOpenTrade?.markStale ?? summaryOpenTrade?.isStale),
+      isStale: Boolean(summaryOpenTrade?.isStale ?? summaryOpenTrade?.markStale),
+      markSource: summaryOpenTrade?.markSource ?? null,
+      markTs: summaryOpenTrade?.markTs ?? null,
+      markAgeMs: summaryOpenTrade?.markAgeMs ?? null,
+      realizedPnlWindowUsd: Number(summary.windowRealizedPnlUsd || 0),
+      entriesInWindow: Number(summary.entriesInWindow || 0),
+      action: summary.lastAction ?? "HOLD",
+      holdReason: summary.holdReason ?? null,
+      lifecycleStatus: summary.lifecycleStatus ?? null,
+      connectionState: "LIVE"
+    };
+    const fingerprint = createPolymarketDashboardFingerprint({
+      summary,
+      openRows,
+      recentRows,
+      equityPoints
+    });
+    return {
+      ts,
+      serverNowTs: ts,
+      mechanism: "SSE",
+      fingerprint,
+      snapshotVersionTs: Math.max(
+        Number(summary.lastActionTs || 0),
+        Number(summary.lastUpdateTs || 0),
+        Number(summary.serverNowTs || 0),
+        ts
+      ),
+      summary,
+      liveStrip,
+      activityEvent,
+      openTrades: openRows,
+      recentTrades: recentRows,
+      recentEvents: buildPolymarketRecentEvents(recentRows, 12),
+      equityPoints
+    };
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -411,120 +828,73 @@ export class DashboardServer {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/polymarket/dashboard") {
+      writeJson(res, 200, this.buildPolymarketDashboardPayload(200));
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/polymarket/stream") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      let closed = false;
+      let lastFingerprint = "";
+      let lastActivityKey = "";
+      const sendSnapshot = (force: boolean): void => {
+        if (closed) return;
+        const payload = this.buildPolymarketDashboardPayload(200);
+        const fingerprint = String(payload.fingerprint || "");
+        if (!force && fingerprint === lastFingerprint) {
+          return;
+        }
+        lastFingerprint = fingerprint;
+        res.write(`id: ${String(payload.ts || Date.now())}\n`);
+        res.write("event: snapshot\n");
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        const activityEvent =
+          payload.activityEvent && typeof payload.activityEvent === "object"
+            ? (payload.activityEvent as Record<string, unknown>)
+            : null;
+        const activityKey = activityEvent ? JSON.stringify(activityEvent) : "";
+        if (activityEvent && (force || activityKey !== lastActivityKey)) {
+          lastActivityKey = activityKey;
+          res.write(`id: ${String(activityEvent.ts || payload.ts || Date.now())}\n`);
+          res.write("event: activity\n");
+          res.write(`data: ${JSON.stringify(activityEvent)}\n\n`);
+        }
+      };
+      const snapshotTimer = setInterval(() => sendSnapshot(false), 1000);
+      const heartbeatTimer = setInterval(() => {
+        if (!closed) {
+          res.write(`: ping ${Date.now()}\n\n`);
+        }
+      }, 15000);
+      const cleanup = (): void => {
+        if (closed) return;
+        closed = true;
+        clearInterval(snapshotTimer);
+        clearInterval(heartbeatTimer);
+        try {
+          res.end();
+        } catch {
+          // ignore close races
+        }
+      };
+      sendSnapshot(true);
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/status/health") {
       writeJson(res, 200, this.buildHealthStatus());
       return;
     }
 
     if (method === "GET" && url.pathname === "/api/polymarket/summary") {
-      const ledger = PaperLedger.loadSnapshot(this.getPolymarketLedgerPath());
-      const summary = ledger.getSummary();
-      const tick = this.getLatestPolymarketTick();
-      const runtime = this.getPolymarketRuntimeSnapshot();
-      const latestPolymarket = runtime?.latestPolymarket ?? null;
-      const latestModel = runtime?.latestModel ?? null;
-      const latestLag = runtime?.latestLag ?? null;
-      const summarySelection = runtime?.selection ?? {
-        finalCandidatesCount: tick?.finalCandidatesCount ?? null,
-        selectedSlug: tick?.slug ?? null,
-        selectedMarketId: tick?.marketId ?? null,
-        windowEndTs: tick?.windowEnd ?? null
-      };
-      const summaryDataHealth = runtime?.dataHealth ?? {
-        oracleSource: null,
-        oracleState: null,
-        latestPolymarketTs: latestPolymarket?.ts ?? null,
-        latestModelTs: latestModel?.ts ?? null,
-        lastFetchAttemptTs: 0,
-        lastFetchOkTs: 0,
-        lastFetchErr: null,
-        lastHttpStatus: 0,
-        lastBookTsMs: 0,
-        lastYesBid: null,
-        lastYesAsk: null,
-        lastYesMid: null,
-        lastModelTs: 0
-      };
-      const statusBanner = this.buildPolymarketStatusBanner(runtime, tick);
-      const lastTickTs = toFiniteNumber(tick?.ts);
-      const lastTickAgeSec = lastTickTs ? Math.max(0, Math.floor((Date.now() - lastTickTs) / 1000)) : null;
-      const summaryRemainingSec =
-        toFiniteNumber(runtime?.selection?.remainingSec) ??
-        toFiniteNumber(tick?.countdownSec) ??
-        null;
-      writeJson(res, 200, {
-        ts: Date.now(),
-        polyEngineRunning: runtime?.polyEngineRunning ?? false,
-        mode: runtime?.mode ?? this.config.polymarket.mode,
-        polyMoney:
-          runtime?.polyMoney ??
-          (this.config.polymarket.mode !== "paper" &&
-            !this.config.polymarket.killSwitch &&
-            this.config.polymarket.liveConfirmed),
-        lastAction: runtime?.lastAction ?? tick?.lastAction ?? "HOLD",
-        holdReason: runtime?.holdReason ?? tick?.holdReason ?? null,
-        holdDetailReason: runtime?.state?.holdDetailReason ?? tick?.holdDetailReason ?? null,
-        dominantReject: runtime?.state?.dominantReject ?? tick?.dominantReject ?? null,
-        lastTickTs,
-        lastTickAgeSec,
-        totalTrades: summary.totalTrades,
-        openTrades: summary.openPositions,
-        resolvedTrades: summary.resolvedTrades,
-        pnlTotalUsd: summary.totalPnlUsd,
-        pnl24hUsd: summary.pnl24hUsd,
-        winRate: summary.winRate,
-        wins: summary.wins,
-        losses: summary.losses,
-        lastResolved: summary.lastResolved ?? null,
-        equityCurve: ledger.getEquitySeries(),
-        currentMarketId: tick?.marketId ?? null,
-        currentSlug: tick?.slug ?? null,
-        currentWindowEnd: tick?.windowEnd ?? null,
-        countdownSec: summaryRemainingSec,
-        pUpModel: tick?.pUpModel ?? null,
-        yesBid: tick?.yesBid ?? null,
-        yesAsk: tick?.yesAsk ?? null,
-        yesMid: tick?.yesMid ?? null,
-        chosenSide: tick?.chosenSide ?? null,
-        chosenEdge: tick?.chosenEdge ?? null,
-        netEdgeAfterCosts: tick?.netEdgeAfterCosts ?? null,
-        tradingPaused: runtime?.tradingPaused ?? tick?.tradingPaused ?? false,
-        pauseReason: runtime?.pauseReason ?? tick?.pauseReason ?? null,
-        latestPolymarket,
-        latestModel,
-        latestLag,
-        finalCandidatesCount: summarySelection.finalCandidatesCount ?? null,
-        candidatesCount:
-          toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
-          toFiniteNumber(tick?.discoveredCandidatesCount) ??
-          null,
-        windowsCount:
-          toFiniteNumber(runtime?.selection?.windowsCount) ??
-          toFiniteNumber(tick?.windowsCount) ??
-          null,
-        selectedSlug: summarySelection.selectedSlug ?? tick?.slug ?? null,
-        selectedMarketId: summarySelection.selectedMarketId ?? tick?.marketId ?? null,
-        windowEndTs: summarySelection.windowEndTs ?? tick?.windowEnd ?? null,
-        remainingSec: summaryRemainingSec,
-        minWindowSec: toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
-        maxWindowSec: toFiniteNumber(runtime?.sniperWindow?.maxRemainingSec) ?? this.config.polymarket.paper.entryMaxRemainingSec,
-        lastUpdateTs: toFiniteNumber(runtime?.lastUpdateTs) ?? 0,
-        lastUpdateAgeSec:
-          toFiniteNumber(runtime?.lastUpdateAgeSec) ??
-          ((toFiniteNumber(runtime?.lastUpdateTs) ?? 0) > 0
-            ? Math.max(0, Math.floor((Date.now() - (toFiniteNumber(runtime?.lastUpdateTs) ?? 0)) / 1000))
-            : null),
-        status: runtime?.status ?? "STARTING",
-        dataHealth: summaryDataHealth,
-        statusBanner,
-        rejectCountsByStage: runtime?.state?.rejectCountsByStage ?? null,
-        sampleRejected: runtime?.state?.sampleRejected ?? [],
-        lastTrade: runtime?.lastTrade ?? null,
-        sniperWindow: runtime?.sniperWindow ?? {
-          minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
-          maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
-        }
-      });
+      writeJson(res, 200, this.buildPolymarketSummaryPayload());
       return;
     }
 
@@ -557,9 +927,17 @@ export class DashboardServer {
         count: payload.rows.length,
         wins: payload.wins,
         losses: payload.losses,
+        flats: payload.flats,
+        openTrades: payload.openTrades,
+        awaitingResolutionTrades: payload.awaitingResolutionTrades,
+        resolutionErrorTrades: payload.resolutionErrorTrades,
+        voidTrades: payload.voidTrades,
+        exitedEarlyTrades: payload.exitedEarlyTrades,
+        cancelledTrades: payload.cancelledTrades,
         resolvedTrades: payload.resolvedTrades,
         winRate: payload.winRate,
         totalPnlUsd: payload.totalPnlUsd,
+        statusCounts: payload.statusCounts,
         statusBanner: this.buildPolymarketStatusBanner(runtime, tick),
         rows: payload.rows
       });
@@ -2629,37 +3007,12 @@ export class DashboardServer {
     const truth = getTradingTruthSnapshot(this.config, this.logger);
     const runtime = this.getPolymarketRuntimeSnapshot();
     const tick = this.getLatestPolymarketTick();
+    const paperSummary =
+      this.config.polymarket.mode === "paper"
+        ? PaperLedger.loadSnapshot(this.getPolymarketLedgerPath()).getSummary(ts)
+        : null;
 
-    const selection = {
-      finalCandidatesCount:
-        toFiniteNumber(runtime?.selection?.finalCandidatesCount) ??
-        toFiniteNumber(truth.poly.selection.finalCandidatesCount) ??
-        toFiniteNumber(tick?.finalCandidatesCount),
-      discoveredCandidatesCount:
-        toFiniteNumber(runtime?.selection?.discoveredCandidatesCount) ??
-        toFiniteNumber(truth.poly.selection.discoveredCandidatesCount) ??
-        toFiniteNumber(tick?.discoveredCandidatesCount),
-      windowsCount:
-        toFiniteNumber(runtime?.selection?.windowsCount) ??
-        toFiniteNumber(truth.poly.selection.windowsCount) ??
-        toFiniteNumber(tick?.windowsCount),
-      selectedSlug:
-        toOptionalString(runtime?.selection?.selectedSlug) ??
-        toOptionalString(truth.poly.selection.selectedSlug) ??
-        toOptionalString(tick?.slug),
-      selectedMarketId:
-        toOptionalString(runtime?.selection?.selectedMarketId) ??
-        toOptionalString(truth.poly.selection.selectedMarketId) ??
-        toOptionalString(tick?.marketId),
-      windowEndTs:
-        toFiniteNumber(runtime?.selection?.windowEndTs) ??
-        toFiniteNumber(truth.poly.selection.windowEndTs) ??
-        toFiniteNumber(tick?.windowEnd),
-      remainingSec:
-        toFiniteNumber(runtime?.selection?.remainingSec) ??
-        toFiniteNumber(truth.poly.selection.remainingSec) ??
-        toFiniteNumber(tick?.countdownSec)
-    };
+    const selection = this.getCanonicalPolymarketSelection(ts, runtime, tick, truth);
 
     const dataHealth = {
       oracleSource:
@@ -2712,9 +3065,60 @@ export class DashboardServer {
         toFiniteNumber(runtime?.lastTrade?.ts) ??
         toFiniteNumber(truth.poly.lastTrade?.ts)
     };
+    const effectivePolyLastTrade =
+      paperSummary && paperSummary.totalTrades === 0 ? null : polyLastTrade;
+    const pausePresentation = this.getPolymarketPausePresentation(
+      runtime?.mode ?? this.config.polymarket.mode,
+      runtime?.tradingPaused ?? tick?.tradingPaused ?? false,
+      runtime?.pauseReason ?? tick?.pauseReason ?? null,
+      runtime?.warningState ?? tick?.warningState ?? null
+    );
+    const truthLastAction =
+      runtime?.lastAction ??
+      truth.poly.lastAction ??
+      (toOptionalString(tick?.lastAction) as "OPEN" | "CLOSE" | "RESOLVE" | "HOLD" | null) ??
+      "HOLD";
+    const truthLastActionTs = this.getPolymarketLastActionTs(runtime, tick, PaperLedger.loadSnapshot(this.getPolymarketLedgerPath()));
+    const truthHoldReason = runtime
+      ? truthLastAction !== "HOLD"
+        ? null
+        : toOptionalString(runtime.currentWindowHoldReason) ??
+          toOptionalString(runtime.holdReason) ??
+          null
+      : truthLastAction !== "HOLD"
+        ? null
+        : toOptionalString(truth.poly.holdReason) ??
+          toOptionalString(tick?.holdReason);
+    const truthHoldDetailReason = runtime
+      ? truthLastAction !== "HOLD"
+        ? null
+        : toOptionalString(runtime.state?.holdDetailReason) ??
+          toOptionalString(runtime.state?.dominantReject) ??
+          toOptionalString(tick?.holdDetailReason) ??
+          toOptionalString(tick?.dominantReject)
+      : truthLastAction !== "HOLD"
+        ? null
+        : toOptionalString(tick?.holdDetailReason) ??
+          toOptionalString(tick?.dominantReject);
+    const openTradesCount =
+      toFiniteNumber(runtime?.openTradesCount) ??
+      (paperSummary ? paperSummary.openPositions : null) ??
+      truth.poly.openTrades;
+    const awaitingResolutionCount =
+      toFiniteNumber(runtime?.awaitingResolutionCount) ??
+      (paperSummary ? paperSummary.awaitingResolutionTrades : null) ??
+      0;
+    const resolutionErrorCount =
+      toFiniteNumber(runtime?.resolutionErrorCount) ??
+      (paperSummary ? paperSummary.resolutionErrorTrades : null) ??
+      0;
+    const resolutionQueueCount =
+      toFiniteNumber(runtime?.resolutionQueueCount) ??
+      (awaitingResolutionCount + resolutionErrorCount);
 
     return {
       ts,
+      serverNowTs: ts,
       revx: {
         mode: truth.revx.mode,
         symbol: truth.revx.symbol,
@@ -2758,24 +3162,24 @@ export class DashboardServer {
           toFiniteNumber(truth.poly.lastUpdateAgeSec) ??
           null,
         mode: runtime?.mode === "live" ? "LIVE" : runtime?.mode === "paper" ? "PAPER" : truth.poly.mode,
-        lastAction:
-          runtime?.lastAction ??
-          truth.poly.lastAction ??
-          (toOptionalString(tick?.lastAction) as "OPEN" | "CLOSE" | "RESOLVE" | "HOLD" | null) ??
-          "HOLD",
-        holdReason:
-          toOptionalString(runtime?.holdReason) ??
-          toOptionalString(truth.poly.holdReason) ??
-          toOptionalString(tick?.holdReason),
-        holdDetailReason:
-          toOptionalString(runtime?.state?.holdDetailReason) ??
-          toOptionalString(tick?.holdDetailReason) ??
-          toOptionalString(runtime?.state?.dominantReject) ??
-          toOptionalString(tick?.dominantReject),
-        openTrades: truth.poly.openTrades,
-        resolvedTrades: truth.poly.resolvedTrades,
-        pnlTotalUsd: truth.poly.pnlTotalUsd,
-        lastTrade: polyLastTrade,
+        lastAction: truthLastAction,
+        lastActionTs: truthLastActionTs,
+        holdReason: truthHoldReason,
+        holdDetailReason: truthHoldDetailReason,
+        chosenDirection: selection.chosenDirection,
+        entriesInWindow: selection.entriesInWindow,
+        windowRealizedPnlUsd: selection.realizedPnlUsd,
+        resolutionSource: selection.resolutionSource,
+        lifecycleStatus: selection.lifecycleStatus,
+        warningState: pausePresentation.warningState,
+        openTrades: openTradesCount,
+        openTradesCount,
+        awaitingResolutionCount,
+        resolutionErrorCount,
+        resolutionQueueCount,
+        resolvedTrades: paperSummary?.resolvedTrades ?? truth.poly.resolvedTrades,
+        pnlTotalUsd: paperSummary?.totalPnlUsd ?? truth.poly.pnlTotalUsd,
+        lastTrade: effectivePolyLastTrade,
         selection,
         dataHealth,
         polyEngineRunning: runtime?.polyEngineRunning ?? truth.poly.polyEngineRunning ?? false,
@@ -2901,6 +3305,20 @@ export class DashboardServer {
         toFiniteNumber(runtime?.selection?.remainingSec) ??
         toFiniteNumber(tick?.countdownSec) ??
         null,
+      chosenDirection:
+        toOptionalString(runtime?.selection?.chosenDirection) ??
+        toOptionalString(tick?.chosenDirection),
+      entriesInWindow:
+        toFiniteNumber(runtime?.selection?.entriesInWindow) ??
+        toFiniteNumber(tick?.entriesInWindow) ??
+        null,
+      realizedPnlUsd:
+        toFiniteNumber(runtime?.selection?.realizedPnlUsd) ??
+        toFiniteNumber(tick?.windowRealizedPnlUsd) ??
+        null,
+      resolutionSource:
+        toOptionalString(runtime?.selection?.resolutionSource) ??
+        toOptionalString(tick?.resolutionSource),
       minWindowSec:
         toFiniteNumber(runtime?.sniperWindow?.minRemainingSec) ?? this.config.polymarket.paper.entryMinRemainingSec,
       maxWindowSec:
@@ -3001,6 +3419,45 @@ export class DashboardServer {
         selectedSlug,
         selectedMarketId
       }
+    };
+  }
+
+  private getPolymarketPausePresentation(
+    mode: "paper" | "live" | string,
+    tradingPaused: boolean,
+    pauseReason: string | null,
+    warningState: string | null
+  ): {
+    tradingPaused: boolean;
+    pauseReason: string | null;
+    warningState: string | null;
+  } {
+    const explicitWarning = toOptionalString(warningState);
+    if (explicitWarning) {
+      return {
+        tradingPaused: false,
+        pauseReason: null,
+        warningState: explicitWarning
+      };
+    }
+    const normalizedPauseReason = toOptionalString(pauseReason);
+    if (
+      String(mode || "").toLowerCase() === "paper" &&
+      tradingPaused &&
+      String(normalizedPauseReason || "")
+        .toUpperCase()
+        .includes("NETWORK")
+    ) {
+      return {
+        tradingPaused: false,
+        pauseReason: null,
+        warningState: "NETWORK_ERROR"
+      };
+    }
+    return {
+      tradingPaused: Boolean(tradingPaused),
+      pauseReason: tradingPaused ? normalizedPauseReason : null,
+      warningState: null
     };
   }
 
@@ -9556,6 +10013,26 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     .title { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.03em; }
     .muted { color: var(--muted); font-size: 0.85rem; }
     .row { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .live-strip {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+      padding: 10px;
+      border: 1px solid rgba(90, 180, 255, 0.22);
+      border-radius: 12px;
+      background:
+        linear-gradient(135deg, rgba(22, 38, 58, 0.94), rgba(11, 19, 30, 0.98)),
+        radial-gradient(circle at top right, rgba(44, 230, 160, 0.08), transparent 45%);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+    .strip-item {
+      min-width: 0;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(7, 12, 20, 0.55);
+      border: 1px solid rgba(153, 181, 214, 0.12);
+    }
     .card, .panel {
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -9568,6 +10045,28 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     .bad { color: var(--bad); }
     .panel { padding: 12px; margin-bottom: 12px; }
     .panel h3 { margin: 0 0 10px 0; font-size: 0.95rem; }
+    details.panel { padding: 0; overflow: hidden; }
+    details.panel > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    details.panel > summary::-webkit-details-marker { display: none; }
+    details.panel > summary::after {
+      content: "Expand";
+      color: var(--muted);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    details.panel[open] > summary::after { content: "Collapse"; }
+    .panel-body { padding: 0 12px 12px 12px; }
     .kv-grid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .kv { border: 1px solid rgba(153, 181, 214, 0.14); border-radius: 8px; padding: 8px; background: rgba(9,15,24,0.6); }
     .kv .k { font-size: 0.72rem; }
@@ -9591,6 +10090,42 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     .badge { padding: 2px 6px; border-radius: 999px; font-size: 0.68rem; font-weight: 700; }
     .badge-win { color: #102019; background: rgba(44,230,160,0.85); }
     .badge-loss { color: #2a1018; background: rgba(255,122,144,0.85); }
+    .badge-stale { color: #2d1a08; background: rgba(255, 196, 96, 0.92); }
+    .trade-direction {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .trade-signal-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(139, 164, 194, 0.38);
+      box-shadow: 0 0 0 1px rgba(139, 164, 194, 0.18);
+      flex: 0 0 auto;
+    }
+    .trade-signal-good .trade-signal-dot {
+      background: rgba(44, 230, 160, 0.92);
+      box-shadow: 0 0 0 1px rgba(44, 230, 160, 0.24), 0 0 14px rgba(44, 230, 160, 0.26);
+      animation: tradePulseGood 1.8s ease-in-out infinite;
+    }
+    .trade-signal-bad .trade-signal-dot {
+      background: rgba(255, 122, 144, 0.92);
+      box-shadow: 0 0 0 1px rgba(255, 122, 144, 0.24), 0 0 14px rgba(255, 122, 144, 0.24);
+      animation: tradePulseBad 1.8s ease-in-out infinite;
+    }
+    .trade-signal-neutral .trade-signal-dot {
+      background: rgba(139, 164, 194, 0.46);
+      box-shadow: 0 0 0 1px rgba(139, 164, 194, 0.2);
+    }
+    @keyframes tradePulseGood {
+      0%, 100% { box-shadow: 0 0 0 1px rgba(44, 230, 160, 0.22), 0 0 12px rgba(44, 230, 160, 0.18); }
+      50% { box-shadow: 0 0 0 1px rgba(44, 230, 160, 0.34), 0 0 18px rgba(44, 230, 160, 0.34); }
+    }
+    @keyframes tradePulseBad {
+      0%, 100% { box-shadow: 0 0 0 1px rgba(255, 122, 144, 0.2), 0 0 12px rgba(255, 122, 144, 0.16); }
+      50% { box-shadow: 0 0 0 1px rgba(255, 122, 144, 0.34), 0 0 18px rgba(255, 122, 144, 0.3); }
+    }
     .debug-strip {
       margin: 8px 0;
       padding: 8px;
@@ -9627,6 +10162,7 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       color: var(--muted);
     }
     @media (max-width: 980px) {
+      .live-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .split { grid-template-columns: 1fr; }
@@ -9647,9 +10183,27 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     </div>
     <div id="pmModeBanner" class="empty-state soft">POLY PAPER (no real money)</div>
 
+    <section id="pmLiveStrip" class="live-strip">
+      <article class="strip-item"><div class="k">Selected Window</div><div class="v" id="liveSelectedWindow">-</div></article>
+      <article class="strip-item"><div class="k">Direction</div><div class="v" id="liveDirection">-</div></article>
+      <article class="strip-item"><div class="k">Remaining</div><div class="v" id="liveRemaining">-</div></article>
+      <article class="strip-item"><div class="k">Entries In Window</div><div class="v" id="liveEntriesInWindow">-</div></article>
+      <article class="strip-item"><div class="k">Lifecycle</div><div class="v" id="liveLifecycle">-</div></article>
+      <article class="strip-item"><div class="k">Open Trade</div><div class="v" id="liveOpenTrade">-</div></article>
+      <article class="strip-item"><div class="k">BTC Start</div><div class="v" id="liveBtcStart">-</div></article>
+      <article class="strip-item"><div class="k">BTC Live</div><div class="v" id="liveBtcReference">-</div></article>
+      <article class="strip-item"><div class="k">Contract Entry</div><div class="v" id="liveContractEntry">-</div></article>
+      <article class="strip-item"><div class="k">Estimated Live</div><div class="v" id="livePrice">-</div></article>
+      <article class="strip-item"><div class="k">Implied Prob</div><div class="v" id="liveImpliedProb">-</div></article>
+      <article class="strip-item"><div class="k">Live Unrealized PnL</div><div class="v" id="liveUnrealizedPnl">-</div></article>
+      <article class="strip-item"><div class="k">Window Realized PnL</div><div class="v" id="liveWindowPnl">-</div></article>
+      <article class="strip-item"><div class="k">Live Feed</div><div class="v" id="liveConnection">CONNECTING</div></article>
+    </section>
+
     <section class="row">
       <article class="card"><div class="k">Open Trades</div><div class="v" id="mOpen">-</div></article>
       <article class="card"><div class="k">Resolved Trades</div><div class="v" id="mResolved">-</div></article>
+      <article class="card"><div class="k">Recent Terminal Trades</div><div class="v" id="mRecentTerminal">-</div></article>
       <article class="card"><div class="k">Total Trades</div><div class="v" id="mTotalTrades">-</div></article>
       <article class="card"><div class="k">Win Rate</div><div class="v" id="mWinRate">-</div></article>
       <article class="card"><div class="k">Wins</div><div class="v good" id="mWins">-</div></article>
@@ -9660,29 +10214,34 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       <article class="card"><div class="k">Last Action</div><div class="v" id="mLastAction">-</div></article>
       <article class="card"><div class="k">Recent Trades Loaded</div><div class="v" id="mRowsLoaded">-</div></article>
       <article class="card"><div class="k">Last Trade Time</div><div class="v" id="mLastTradeTime">-</div></article>
-      <article class="card"><div class="k">Selected / Candidates</div><div class="v" id="mSelectedInfo">-</div></article>
     </section>
 
-    <section class="panel">
-      <h3>Current Window / Model</h3>
+    <details class="panel" id="pmCurrentPanel">
+      <summary>Current Window / Model</summary>
+      <div class="panel-body">
       <div class="kv-grid">
         <div class="kv"><div class="k">Slug</div><div class="v" id="pmSlug">-</div></div>
         <div class="kv"><div class="k">Countdown</div><div class="v" id="pmCountdown">-</div></div>
         <div class="kv"><div class="k">Model P(UP)</div><div class="v" id="pmPUp">-</div></div>
         <div class="kv"><div class="k">P Base / Boosted</div><div class="v" id="pmPBaseBoost">-</div></div>
-        <div class="kv"><div class="k">YES Mid</div><div class="v" id="pmYesMid">-</div></div>
-        <div class="kv"><div class="k">YES Bid/Ask</div><div class="v" id="pmBbo">-</div></div>
-        <div class="kv"><div class="k">Chosen Side</div><div class="v" id="pmSide">-</div></div>
+        <div class="kv"><div class="k">BTC Start</div><div class="v" id="pmBtcStart">-</div></div>
+        <div class="kv"><div class="k">BTC Live</div><div class="v" id="pmBtcRef">-</div></div>
+        <div class="kv"><div class="k">Estimated Live</div><div class="v" id="pmEstLive">-</div></div>
+        <div class="kv"><div class="k">Direction</div><div class="v" id="pmSide">-</div></div>
+        <div class="kv"><div class="k">Entries In Window</div><div class="v" id="pmEntriesInWindow">-</div></div>
+        <div class="kv"><div class="k">Window Realized PnL</div><div class="v" id="pmWindowPnl">-</div></div>
+        <div class="kv"><div class="k">Lifecycle</div><div class="v" id="pmLifecycle">-</div></div>
         <div class="kv"><div class="k">Chosen Edge</div><div class="v" id="pmChosenEdge">-</div></div>
         <div class="kv"><div class="k">Net Edge After Costs</div><div class="v" id="pmNetEdge">-</div></div>
         <div class="kv"><div class="k">Trading State</div><div class="v" id="pmTradingState">-</div></div>
         <div class="kv"><div class="k">Hold Reason</div><div class="v" id="pmHoldReason">-</div></div>
-        <div class="kv"><div class="k">Selection</div><div class="v" id="pmSelection">-</div></div>
       </div>
-    </section>
+      </div>
+    </details>
 
-    <section class="panel">
-      <h3>Lag + Lockedness</h3>
+    <details class="panel" id="pmLagPanel">
+      <summary>Lag + Lockedness</summary>
+      <div class="panel-body">
       <div class="kv-grid">
         <div class="kv"><div class="k">Book Lag p50/p90</div><div class="v" id="pmLagBook">-</div></div>
         <div class="kv"><div class="k">Oracle Age p50/p90</div><div class="v" id="pmLagOracle">-</div></div>
@@ -9693,7 +10252,8 @@ function renderPolymarketDashboardHtml(symbol: string): string {
         <div class="kv"><div class="k">Lockedness</div><div class="v" id="pmLocked">-</div></div>
         <div class="kv"><div class="k">Lag Updated</div><div class="v" id="pmLagUpdated">-</div></div>
       </div>
-    </section>
+      </div>
+    </details>
 
     <section class="panel">
       <h3>Equity Curve</h3>
@@ -9704,34 +10264,32 @@ function renderPolymarketDashboardHtml(symbol: string): string {
     </section>
 
     <section class="panel">
-      <h3>Open + Resolved Trades</h3>
-      <div class="muted" id="resolvedTotals">wins - | losses - | win rate - | total pnl -</div>
+      <h3>Paper Trade Lifecycle</h3>
+      <div class="muted" id="resolvedTotals">wins - | losses - | recent - | win rate - | total pnl -</div>
       <div id="pmTradesDebug" class="debug-strip">lastFetchTs=- | lastHttpStatus=- | lastParseError=- | payloadKeys=- | rowsLength=-</div>
       <div id="pmTradesEmptyState" class="empty-state" style="display:none;"></div>
-      <div class="split">
-        <div style="overflow:auto;">
-          <div class="muted" style="margin-bottom:6px;">Open trades</div>
-          <div id="openTradesEmpty" class="empty-state soft" style="display:none;"></div>
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th><th>Slug</th><th>Side</th><th>Entry</th><th>Notional</th><th>MTM PnL</th><th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="openTradesBody"><tr><td colspan="7" class="muted">loading...</td></tr></tbody>
-          </table>
-        </div>
-        <div style="overflow:auto;">
-          <div class="muted" style="margin-bottom:6px;">Recent Trades (resolved)</div>
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th><th>Slug</th><th>Side</th><th>Entry</th><th>Exit</th><th>Status</th><th>Result</th><th>PnL</th><th>Cum PnL</th>
-              </tr>
-            </thead>
-            <tbody id="resolvedTradesBody"><tr><td colspan="9" class="muted">loading...</td></tr></tbody>
-          </table>
-        </div>
+      <div style="overflow:auto; margin-bottom:12px;">
+        <div class="muted" style="margin-bottom:6px;">Open trades</div>
+        <div id="openTradesEmpty" class="empty-state soft" style="display:none;"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Slug</th><th>Direction</th><th>BTC Start</th><th>BTC Live</th><th>Contract Entry</th><th>Estimated Live</th><th>Implied Prob</th><th>Qty/Shares</th><th>Notional</th><th>Unrealized</th><th>Status</th><th>Status Info</th>
+            </tr>
+          </thead>
+          <tbody id="openTradesBody"><tr><td colspan="13" class="muted">loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div style="overflow:auto;">
+        <div class="muted" style="margin-bottom:6px;">Recent Trades</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Slug</th><th>Direction</th><th>Status</th><th>Result</th><th>Contract Entry</th><th>Contract Exit</th><th>PnL</th><th>Cum PnL</th><th>Status Info</th>
+            </tr>
+          </thead>
+          <tbody id="recentTradesBody"><tr><td colspan="10" class="muted">loading...</td></tr></tbody>
+        </table>
       </div>
     </section>
   </div>
@@ -9746,6 +10304,9 @@ function renderPolymarketDashboardJs(): string {
     const el = (id) => document.getElementById(id);
     const fmt2 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2, minimumFractionDigits: 2 });
     const fmtP = new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 1 });
+    const DASHBOARD_URL = "/api/polymarket/dashboard";
+    const STREAM_URL = "/api/polymarket/stream";
+    const FALLBACK_POLL_MS = 4000;
 
     async function fetchJson(url) {
       const res = await fetch(url, { cache: "no-store" });
@@ -9753,39 +10314,39 @@ function renderPolymarketDashboardJs(): string {
       return await res.json();
     }
 
-    async function fetchJsonWithMeta(url) {
-      const res = await fetch(url, { cache: "no-store" });
-      const status = Number(res.status || 0);
-      const text = await res.text();
-      let payload = null;
-      let parseError = "";
-      if (text.length > 0) {
-        try {
-          payload = JSON.parse(text);
-        } catch (error) {
-          parseError = error instanceof Error ? error.message : String(error || "parse_failed");
-        }
-      }
-      if (!res.ok) {
-        const err = new Error("HTTP " + status + " " + url);
-        err.status = status;
-        err.payload = payload;
-        err.parseError = parseError;
-        throw err;
-      }
-      return { payload, status, parseError };
-    }
-
     function setText(id, value, cls) {
       const node = el(id);
       if (!node) return;
       node.textContent = String(value);
-      if (cls) node.className = "v " + cls;
+      node.innerHTML = escapeHtml(String(value));
+      node.className = cls ? "v " + cls : "v";
+    }
+
+    function setSignalText(id, value, tone) {
+      const node = el(id);
+      if (!node) return;
+      const safeTone = tone === "good" || tone === "bad" ? tone : "neutral";
+      const text = String(value == null ? "-" : value);
+      node.textContent = text;
+      node.innerHTML =
+        '<span class="trade-direction trade-signal-' +
+        safeTone +
+        '"><span class="trade-signal-dot"></span><span>' +
+        escapeHtml(text) +
+        "</span></span>";
+      node.className = "v";
     }
 
     function money(v) {
       const n = Number(v || 0);
       return "$" + fmt2.format(n);
+    }
+
+    function priceText(v) {
+      if (v == null || v === "") return "-";
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "-";
+      return n.toFixed(4);
     }
 
     function edgeText(v) {
@@ -9800,6 +10361,25 @@ function renderPolymarketDashboardJs(): string {
       const m = Math.floor(Math.max(0, n) / 60);
       const s = Math.max(0, n) % 60;
       return String(m) + "m " + String(s).padStart(2, "0") + "s";
+    }
+
+    function toFinite(v) {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function formatMarkSource(source) {
+      const text = String(source || "").trim();
+      if (!text) return "-";
+      return text.toLowerCase().replace(/_/g, " ");
+    }
+
+    function formatMarkAge(markAgeMs) {
+      const ageMs = toFinite(markAgeMs);
+      if (!Number.isFinite(ageMs) || ageMs == null || ageMs < 0) return "";
+      if (ageMs < 1000) return "<1s";
+      return String(Math.floor(ageMs / 1000)) + "s";
     }
 
     function relTime(tsLike) {
@@ -9860,21 +10440,34 @@ function renderPolymarketDashboardJs(): string {
     }
 
     function isResolvedTrade(row) {
-      return resolveTs(row && row.resolvedAt) > 0;
+      const status = String((row && row.status) || "");
+      return status === "RESOLVED_WIN" || status === "RESOLVED_LOSS";
     }
 
     function classifyTrades(rows) {
       const source = Array.isArray(rows) ? rows : [];
       const open = [];
+      const awaiting = [];
+      const resolutionError = [];
       const resolved = [];
+      const cancelled = [];
       for (const row of source) {
-        if (isResolvedTrade(row)) {
+        const status = String((row && row.status) || "");
+        if (status === "OPEN") {
+          open.push(row);
+        } else if (status === "AWAITING_RESOLUTION") {
+          awaiting.push(row);
+        } else if (status === "RESOLUTION_ERROR") {
+          resolutionError.push(row);
+        } else if (isResolvedTrade(row)) {
           resolved.push(row);
+        } else if (status === "VOID" || status === "EXITED_EARLY") {
+          cancelled.push(row);
         } else {
           open.push(row);
         }
       }
-      return { open, resolved };
+      return { open, awaiting, resolutionError, resolved, cancelled };
     }
 
     function payloadKeysText(payload) {
@@ -9980,13 +10573,161 @@ function renderPolymarketDashboardJs(): string {
       setText("mMode", mode, polyMoney ? "good" : "");
     }
 
+    function getClientAlignedNowTs() {
+      return Date.now() + Number(state.clockOffsetMs || 0);
+    }
+
+    function getLiveRemainingSec(summary) {
+      const windowEndTs = toFinite(summary && summary.windowEndTs);
+      if (windowEndTs && windowEndTs > 0) {
+        return Math.max(0, Math.floor((windowEndTs - getClientAlignedNowTs()) / 1000));
+      }
+      return toFinite(summary && (summary.remainingSec != null ? summary.remainingSec : summary.countdownSec));
+    }
+
+    function getLiveSummary(summary) {
+      const base = summary && typeof summary === "object" ? Object.assign({}, summary) : {};
+      base.serverNowTs = toFinite(base.serverNowTs) || toFinite(state.serverNowTs) || Date.now();
+      base.remainingSec = getLiveRemainingSec(base);
+      base.countdownSec = base.remainingSec;
+      return base;
+    }
+
+    function clamp01(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return null;
+      return Math.max(0.001, Math.min(0.999, n));
+    }
+
+    function sigmoid(x) {
+      const n = Number(x);
+      if (!Number.isFinite(n)) return 0.5;
+      if (n > 12) return 0.9999;
+      if (n < -12) return 0.0001;
+      return 1 / (1 + Math.exp(-n));
+    }
+
+    function getOpenTradeBtcPrice(summary, trade) {
+      const liveBtc = toFinite(summary && summary.latestPolymarket && summary.latestPolymarket.fastMid);
+      if (Number.isFinite(liveBtc)) return liveBtc;
+      return toFinite(trade && trade.btcReferencePrice);
+    }
+
+    function getOpenTradeBtcStartPrice(trade) {
+      return toFinite(
+        trade &&
+          (trade.btcStartPrice != null
+            ? trade.btcStartPrice
+            : trade.entryBtcReferencePrice != null
+              ? trade.entryBtcReferencePrice
+              : trade.btcReferencePrice)
+      );
+    }
+
+    function getOpenTradeBtcTs(summary, trade) {
+      const latestTs = toFinite(summary && summary.latestPolymarket && summary.latestPolymarket.ts);
+      if (Number.isFinite(latestTs)) return latestTs;
+      return toFinite(trade && trade.btcReferenceTs);
+    }
+
+    function isOpenTradeBtcStale(summary, trade) {
+      const btcTs = getOpenTradeBtcTs(summary, trade);
+      if (!Number.isFinite(btcTs)) return true;
+      return Boolean(trade && trade.btcReferenceStale) || (getClientAlignedNowTs() - btcTs) > 10_000;
+    }
+
+    function computeSyntheticContractPrice(trade, summary) {
+      if (!trade || typeof trade !== "object") return null;
+      const currentBtc = getOpenTradeBtcPrice(summary, trade);
+      const entryContractPrice = toFinite(trade.contractEntryPrice != null ? trade.contractEntryPrice : trade.entryPrice);
+      if (!Number.isFinite(currentBtc) || !Number.isFinite(entryContractPrice)) {
+        return null;
+      }
+      const strikePrice =
+        toFinite(trade.strikePrice) ??
+        toFinite(trade.btcStartPrice) ??
+        toFinite(trade.entryBtcReferencePrice) ??
+        toFinite(trade.btcReferencePrice) ??
+        currentBtc;
+      if (!Number.isFinite(strikePrice) || strikePrice <= 0) {
+        return clamp01(entryContractPrice);
+      }
+      const windowStartTs = toFinite(trade.windowStartTs);
+      const windowEndTs = toFinite(trade.windowEndTs != null ? trade.windowEndTs : summary && summary.windowEndTs);
+      const remainingSec =
+        Number.isFinite(windowEndTs) ? Math.max(0, Math.floor((windowEndTs - getClientAlignedNowTs()) / 1000)) : toFinite(summary && summary.remainingSec);
+      const windowSpanSec =
+        Number.isFinite(windowStartTs) && Number.isFinite(windowEndTs) && windowEndTs > windowStartTs
+          ? (windowEndTs - windowStartTs) / 1000
+          : 300;
+      const remainingFrac =
+        Number.isFinite(remainingSec) && windowSpanSec > 0
+          ? Math.max(0, Math.min(1, remainingSec / windowSpanSec))
+          : 0.5;
+      const elapsedFrac = 1 - remainingFrac;
+      const direction = String(trade.direction || trade.displaySide || trade.side || "UP").toUpperCase();
+      const priorUpProb = direction === "DOWN"
+        ? clamp01(1 - entryContractPrice)
+        : clamp01(entryContractPrice);
+      const moveBps = ((currentBtc - strikePrice) / strikePrice) * 10000;
+      const scaleBps = Math.max(8, 26 - elapsedFrac * 10);
+      const pressure = 1 + elapsedFrac * 2.75;
+      const modelUpProb = clamp01(sigmoid((moveBps / scaleBps) * pressure));
+      if (!Number.isFinite(priorUpProb) || !Number.isFinite(modelUpProb)) {
+        return clamp01(entryContractPrice);
+      }
+      const blend = Math.max(0.2, Math.min(0.85, 0.25 + elapsedFrac * 0.55));
+      const blendedUpProb = clamp01(priorUpProb * (1 - blend) + modelUpProb * blend);
+      if (!Number.isFinite(blendedUpProb)) {
+        return clamp01(entryContractPrice);
+      }
+      return direction === "DOWN"
+        ? clamp01(1 - blendedUpProb)
+        : blendedUpProb;
+    }
+
+    function computeOpenTradeLiveMetrics(trade, summary) {
+      const shares = toFinite(trade && (trade.shares != null ? trade.shares : trade.qty));
+      const notionalUsd = toFinite(trade && (trade.notionalUsd != null ? trade.notionalUsd : trade.entryNotionalUsd));
+      const feesUsd = toFinite(trade && trade.feesUsd);
+      const btcPrice = getOpenTradeBtcPrice(summary, trade);
+      const btcStartPrice = getOpenTradeBtcStartPrice(trade);
+      const estimatedContractLivePrice = computeSyntheticContractPrice(trade, summary);
+      const impliedProbPct =
+        Number.isFinite(estimatedContractLivePrice) ? estimatedContractLivePrice * 100 : null;
+      const unrealizedPnlUsd =
+        Number.isFinite(estimatedContractLivePrice) && Number.isFinite(shares) && Number.isFinite(notionalUsd)
+          ? estimatedContractLivePrice * shares - notionalUsd - (Number.isFinite(feesUsd) ? feesUsd : 0)
+          : null;
+      let signalTone = "neutral";
+      const direction = String(trade && (trade.direction || trade.displaySide || trade.side || "-")).toUpperCase();
+      if (Number.isFinite(btcPrice) && Number.isFinite(btcStartPrice)) {
+        if (Math.abs(btcPrice - btcStartPrice) <= 1e-9) {
+          signalTone = "neutral";
+        } else if ((direction === "UP" && btcPrice > btcStartPrice) || (direction === "DOWN" && btcPrice < btcStartPrice)) {
+          signalTone = "good";
+        } else if ((direction === "UP" && btcPrice < btcStartPrice) || (direction === "DOWN" && btcPrice > btcStartPrice)) {
+          signalTone = "bad";
+        }
+      }
+      return {
+        btcStartPrice,
+        btcPrice,
+        btcStale: isOpenTradeBtcStale(summary, trade),
+        estimatedContractLivePrice,
+        impliedProbPct,
+        unrealizedPnlUsd,
+        signalTone
+      };
+    }
+
     function drawEquity(points) {
       const svg = el("eqSvg");
       const meta = el("eqMeta");
       if (!svg || !meta) return;
       if (!Array.isArray(points) || points.length === 0) {
         svg.innerHTML = "";
-        meta.textContent = "No resolved trades yet.";
+        meta.textContent = "No realized paper PnL yet.";
         return;
       }
       const xs = points.map((p) => Number(p.ts || 0));
@@ -10014,70 +10755,135 @@ function renderPolymarketDashboardJs(): string {
       meta.textContent = "Points: " + points.length + " | Start " + money(ys[0]) + " | End " + money(final);
     }
 
-    function renderRows(rows, bodyId, mode) {
-      const body = el(bodyId);
-      if (!body) return;
+    function normalizeRows(rows) {
+      const byId = new Map();
       const source = Array.isArray(rows) ? rows : [];
-      const sorted = source.slice().sort((a, b) => {
-        if (mode === "resolved") {
-          return resolveTs(b && b.resolvedAt) - resolveTs(a && a.resolvedAt);
+      for (const row of source) {
+        const key = String((row && (row.tradeId || row.id)) || "");
+        if (!key) continue;
+        if (!byId.has(key)) {
+          byId.set(key, row);
         }
-        return resolveTs(b && b.createdTs) - resolveTs(a && a.createdTs);
-      });
-      const limited = sorted.slice(0, mode === "resolved" ? 10 : 20);
-      if (limited.length === 0) {
-        body.innerHTML = '<tr><td colspan="' + (mode === "open" ? "7" : "9") + '" class="muted">No rows.</td></tr>';
+      }
+      return Array.from(byId.values());
+    }
+
+    function renderOpenRows(rows, summary) {
+      const body = el("openTradesBody");
+      if (!body) return;
+      const source = normalizeRows(rows);
+      if (source.length === 0) {
+        body.innerHTML = '<tr><td colspan="13" class="muted">No open trades.</td></tr>';
         return;
       }
-      body.innerHTML = limited.map((row) => {
+      body.innerHTML = source.map((row) => {
         const ts = new Date(Number(row.createdTs || 0));
-        const pnl = Number(row.pnlUsd || 0);
-        const pnlCls = pnl > 0 ? "good" : pnl < 0 ? "bad" : "";
-        const status = row.resolvedAt ? String(row.closeReason || "RESOLVED") : "OPEN";
-        const slug = String(row.marketSlug || row.marketId || "-");
-        if (mode === "open") {
-          return "<tr>" +
-            "<td>" + ts.toLocaleString() + "</td>" +
-            "<td>" + slug + "</td>" +
-            "<td>" + String(row.side || "-") + "</td>" +
-            "<td>" + fmt2.format(Number(row.entryPrice || 0)) + "</td>" +
-            "<td>" + money(Number(row.notionalUsd || 0)) + "</td>" +
-            '<td class="' + pnlCls + '">' + money(pnl) + "</td>" +
-            "<td>" + status + "</td>" +
-          "</tr>";
-        }
-        const exitPrice = Number(row.exitPrice);
-        const payoutUsd = Number(row.payoutUsd);
-        const exitText =
-          Number.isFinite(exitPrice)
-            ? fmt2.format(exitPrice)
-            : Number.isFinite(payoutUsd)
-              ? money(payoutUsd)
-              : "-";
-        const statusResolved = String(row.closeReason || "").trim().length > 0 ? "CLOSED" : "RESOLVED";
+        const slug = escapeHtml(String(row.marketSlug || row.marketId || "-"));
+        const directionText = String(row.displaySide || row.direction || row.side || "-");
+        const liveMetrics = computeOpenTradeLiveMetrics(row, summary);
+        const btcStartPrice = liveMetrics.btcStartPrice;
+        const btcLivePrice = liveMetrics.btcPrice;
+        const contractEntryPrice = toFinite(
+          row.contractEntryPrice != null ? row.contractEntryPrice : row.entryPricePerShare != null ? row.entryPricePerShare : row.entryPrice
+        );
+        const contractLivePrice = liveMetrics.estimatedContractLivePrice;
+        const impliedProbPct = liveMetrics.impliedProbPct;
+        const shares = toFinite(row.shares != null ? row.shares : row.qty);
+        const notionalUsd = toFinite(row.notionalUsd != null ? row.notionalUsd : row.entryNotionalUsd != null ? row.entryNotionalUsd : row.notionalUsd);
+        const unrealizedPnlUsd = liveMetrics.unrealizedPnlUsd;
+        const status = escapeHtml(String(row.status || "OPEN"));
+        const btcStaleBadge = liveMetrics.btcStale
+          ? ' <span class="badge badge-stale">STALE</span>'
+          : "";
+        const statusInfo = escapeHtml(
+          truncateText(
+            String(row.statusDetail || row.statusReason || (liveMetrics.btcStale ? "BTC feed stale" : "-")),
+            120
+          )
+        );
+        const pnlCls = Number.isFinite(unrealizedPnlUsd) ? (unrealizedPnlUsd > 0 ? "good" : unrealizedPnlUsd < 0 ? "bad" : "") : "";
+        const liveCellText =
+          Number.isFinite(contractLivePrice)
+            ? priceText(contractLivePrice)
+            : "\u2014 waiting for quote";
+        const directionHtml =
+          '<span class="trade-direction trade-signal-' +
+          escapeHtml(String(liveMetrics.signalTone || "neutral")) +
+          '"><span class="trade-signal-dot"></span><span>' +
+          escapeHtml(directionText) +
+          "</span></span>";
         return "<tr>" +
-          "<td>" + ts.toLocaleString() + "</td>" +
+          "<td>" + escapeHtml(ts.toLocaleString()) + "</td>" +
           "<td>" + slug + "</td>" +
-          "<td>" + String(row.side || "-") + "</td>" +
-          "<td>" + fmt2.format(Number(row.entryPrice || 0)) + "</td>" +
-          "<td>" + exitText + "</td>" +
-          "<td>" + statusResolved + "</td>" +
-          "<td>" +
-            (String(row.result || "") === "WIN"
-              ? '<span class="badge badge-win">WIN</span>'
-              : String(row.result || "") === "LOSS"
-                ? '<span class="badge badge-loss">LOSS</span>'
-                : "-") +
-          "</td>" +
-          '<td class="' + pnlCls + '">' + money(pnl) + "</td>" +
-          '<td class="' + (Number(row.cumulativePnlUsd || 0) >= 0 ? "good" : "bad") + '">' +
-            money(Number(row.cumulativePnlUsd || 0)) +
-          "</td>" +
+          "<td>" + directionHtml + "</td>" +
+          "<td>" + (Number.isFinite(btcStartPrice) ? money(btcStartPrice) : "-") + "</td>" +
+          "<td>" + (Number.isFinite(btcLivePrice) ? money(btcLivePrice) : "-") + btcStaleBadge + "</td>" +
+          "<td>" + priceText(contractEntryPrice) + "</td>" +
+          "<td>" + escapeHtml(liveCellText) + "</td>" +
+          "<td>" + (Number.isFinite(impliedProbPct) ? fmt2.format(impliedProbPct) + "%" : "-") + "</td>" +
+          "<td>" + (Number.isFinite(shares) ? fmt2.format(shares) : "-") + "</td>" +
+          "<td>" + (Number.isFinite(notionalUsd) ? money(notionalUsd) : "-") + "</td>" +
+          '<td class="' + pnlCls + '">' + (Number.isFinite(unrealizedPnlUsd) ? money(unrealizedPnlUsd) : "-") + "</td>" +
+          "<td>" + status + "</td>" +
+          "<td>" + statusInfo + "</td>" +
+        "</tr>";
+      }).join("");
+    }
+
+    function renderRecentRows(rows) {
+      const body = el("recentTradesBody");
+      if (!body) return;
+      const source = normalizeRows(rows);
+      if (source.length === 0) {
+        body.innerHTML = '<tr><td colspan="10" class="muted">No recent terminal trades.</td></tr>';
+        return;
+      }
+      body.innerHTML = source.map((row) => {
+        const eventTs = resolveTs(row.statusUpdatedAt || row.resolvedAt || row.createdTs);
+        const ts = new Date(eventTs || Date.now());
+        const slug = escapeHtml(String(row.marketSlug || row.marketId || "-"));
+        const direction = escapeHtml(String(row.displaySide || row.direction || row.side || "-"));
+        const status = escapeHtml(String(row.status || "-"));
+        const result = String(row.result || "");
+        const resultHtml =
+          result === "WIN"
+            ? '<span class="badge badge-win">WIN</span>'
+            : result === "LOSS"
+              ? '<span class="badge badge-loss">LOSS</span>'
+              : result === "FLAT"
+                ? '<span class="badge">FLAT</span>'
+                : "-";
+        const pnlValue = Number(row.pnlUsd);
+        const pnlCls = Number.isFinite(pnlValue) ? (pnlValue > 0 ? "good" : pnlValue < 0 ? "bad" : "") : "";
+        const pnlText = Number.isFinite(pnlValue) ? money(pnlValue) : "-";
+        const cumPnl = Number(row.cumulativePnlUsd || 0);
+        const exitPrice = Number(row.exitPricePerShare ?? row.exitPrice);
+        const entryPrice = Number(row.entryPricePerShare ?? row.entryPrice);
+        const statusInfo = escapeHtml(
+          truncateText(
+            String(row.statusDetail || row.statusReason || row.closeReason || row.resolutionSource || "-"),
+            120
+          )
+        );
+        return "<tr>" +
+          "<td>" + escapeHtml(ts.toLocaleString()) + "</td>" +
+          "<td>" + slug + "</td>" +
+          "<td>" + direction + "</td>" +
+          "<td>" + status + "</td>" +
+          "<td>" + resultHtml + "</td>" +
+          "<td>" + (Number.isFinite(entryPrice) ? fmt2.format(entryPrice) : "-") + "</td>" +
+          "<td>" + (Number.isFinite(exitPrice) ? fmt2.format(exitPrice) : "-") + "</td>" +
+          '<td class="' + pnlCls + '">' + pnlText + "</td>" +
+          '<td class="' + (cumPnl >= 0 ? "good" : "bad") + '">' + money(cumPnl) + "</td>" +
+          "<td>" + statusInfo + "</td>" +
         "</tr>";
       }).join("");
     }
 
     function renderCurrent(summary) {
+      const liveSummary = getLiveSummary(summary);
+      const openTrade = liveSummary.openTrade && typeof liveSummary.openTrade === "object" ? liveSummary.openTrade : null;
+      const liveMetrics = openTrade ? computeOpenTradeLiveMetrics(openTrade, summary) : null;
       const latestPolymarket = summary.latestPolymarket && typeof summary.latestPolymarket === "object"
         ? summary.latestPolymarket
         : {};
@@ -10097,8 +10903,8 @@ function renderPolymarketDashboardJs(): string {
         ? summary.sniperWindow
         : {};
 
-      setText("pmSlug", String(latestPolymarket.windowSlug || summary.currentSlug || "-"));
-      setText("pmCountdown", secondsText(latestPolymarket.tauSec || summary.countdownSec));
+      setText("pmSlug", String(liveSummary.selectedSlug || "-"));
+      setText("pmCountdown", secondsText(liveSummary.remainingSec));
       setText(
         "pmPUp",
         Number.isFinite(Number(summary.pUpModel))
@@ -10113,36 +10919,49 @@ function renderPolymarketDashboardJs(): string {
           ? Number(latestModel.pBase).toFixed(4) + " / " + Number(latestModel.pBoosted).toFixed(4)
           : "-"
       );
+      setText("pmBtcStart", liveMetrics && Number.isFinite(liveMetrics.btcStartPrice) ? money(liveMetrics.btcStartPrice) : "-");
       setText(
-        "pmYesMid",
-        Number.isFinite(Number(latestPolymarket.yesMid || summary.yesMid))
-          ? Number(latestPolymarket.yesMid || summary.yesMid).toFixed(4)
+        "pmBtcRef",
+        liveMetrics && Number.isFinite(liveMetrics.btcPrice)
+          ? money(liveMetrics.btcPrice) + (liveMetrics.btcStale ? " STALE" : "")
           : "-"
       );
-      const bid = Number(summary.yesBid);
-      const ask = Number(summary.yesAsk);
       setText(
-        "pmBbo",
-        Number.isFinite(bid) && Number.isFinite(ask)
-          ? bid.toFixed(4) + " / " + ask.toFixed(4)
+        "pmEstLive",
+        liveMetrics && Number.isFinite(liveMetrics.estimatedContractLivePrice)
+          ? priceText(liveMetrics.estimatedContractLivePrice)
           : "-"
       );
-      setText("pmSide", String(summary.chosenSide || "-"));
-      setText("pmChosenEdge", edgeText(summary.chosenEdge), Number(summary.chosenEdge || 0) >= 0 ? "good" : "bad");
-      setText("pmNetEdge", edgeText(summary.netEdgeAfterCosts), Number(summary.netEdgeAfterCosts || 0) >= 0 ? "good" : "bad");
-      const paused = Boolean(summary.tradingPaused);
-      const pauseReason = String(summary.pauseReason || "");
+      setSignalText("pmSide", String(liveSummary.chosenDirection || liveSummary.chosenSide || "-"), liveMetrics ? liveMetrics.signalTone : "neutral");
+      setText("pmChosenEdge", edgeText(liveSummary.chosenEdge), Number(liveSummary.chosenEdge || 0) >= 0 ? "good" : "bad");
+      setText("pmNetEdge", edgeText(liveSummary.netEdgeAfterCosts), Number(liveSummary.netEdgeAfterCosts || 0) >= 0 ? "good" : "bad");
+      const paused = Boolean(liveSummary.tradingPaused);
+      const pauseReason = String(liveSummary.pauseReason || "");
+      const warningState = String(liveSummary.warningState || "");
       setText(
         "pmTradingState",
-        paused ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : "")) : "RUNNING",
-        paused ? "bad" : "good"
+        warningState
+          ? ("WARNING" + (warningState ? " (" + warningState + ")" : ""))
+          : paused
+            ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : ""))
+            : "RUNNING",
+        warningState ? "warn" : paused ? "bad" : "good"
       );
-      setText("pmHoldReason", String(summary.holdReason || "-"));
       setText(
-        "pmSelection",
-        String(summary.selectedSlug || summary.currentSlug || "-") +
-          " | cands=" + String(Number.isFinite(Number(summary.finalCandidatesCount)) ? Math.max(0, Math.floor(Number(summary.finalCandidatesCount))) : 0)
+        "pmHoldReason",
+        String(liveSummary.holdReason || "-") +
+          (liveSummary.holdDetailReason ? " / " + String(liveSummary.holdDetailReason) : "")
       );
+      setText(
+        "pmEntriesInWindow",
+        String(Number.isFinite(Number(liveSummary.entriesInWindow)) ? Math.max(0, Math.floor(Number(liveSummary.entriesInWindow))) : 0)
+      );
+      setText(
+        "pmWindowPnl",
+        money(Number(liveSummary.windowRealizedPnlUsd || 0)),
+        Number(liveSummary.windowRealizedPnlUsd || 0) >= 0 ? "good" : "bad"
+      );
+      setText("pmLifecycle", String(liveSummary.lifecycleStatus || "-"));
 
       const toMsPair = (metric) =>
         Number.isFinite(Number(metric.p50)) && Number.isFinite(Number(metric.p90))
@@ -10187,103 +11006,427 @@ function renderPolymarketDashboardJs(): string {
       setText("pmLagUpdated", relTime(latestLag.lastBookTsMs));
     }
 
-    async function refresh() {
+    function renderLiveStrip(summary, openRows) {
+      const liveSummary = getLiveSummary(summary);
+      const openTrade = liveSummary.openTrade && typeof liveSummary.openTrade === "object" ? liveSummary.openTrade : null;
+      const liveMetrics = openTrade ? computeOpenTradeLiveMetrics(openTrade, summary) : null;
+      const btcStartPrice = liveMetrics ? liveMetrics.btcStartPrice : null;
+      const btcReferencePrice = liveMetrics ? liveMetrics.btcPrice : null;
+      const contractEntryPrice = openTrade ? toFinite(openTrade.contractEntryPrice != null ? openTrade.contractEntryPrice : openTrade.entryPrice) : null;
+      const contractLivePrice = liveMetrics ? liveMetrics.estimatedContractLivePrice : null;
+      const impliedProbPct = liveMetrics ? liveMetrics.impliedProbPct : null;
+      const unrealizedPnlUsd = liveMetrics ? liveMetrics.unrealizedPnlUsd : null;
+      const staleMark = Boolean(liveMetrics && liveMetrics.btcStale);
+      const livePriceText = Number.isFinite(contractLivePrice)
+        ? priceText(contractLivePrice)
+        : openTrade
+          ? "\u2014 waiting for quote"
+          : "-";
+      setText("liveSelectedWindow", String(liveSummary.selectedSlug || "-"));
+      setSignalText("liveDirection", String(liveSummary.chosenDirection || liveSummary.chosenSide || "-"), liveMetrics ? liveMetrics.signalTone : "neutral");
+      setText("liveRemaining", secondsText(liveSummary.remainingSec));
+      setText(
+        "liveEntriesInWindow",
+        String(Number.isFinite(Number(liveSummary.entriesInWindow)) ? Math.max(0, Math.floor(Number(liveSummary.entriesInWindow))) : 0)
+      );
+      setText("liveLifecycle", String(liveSummary.lifecycleStatus || "-"));
+      setText("liveOpenTrade", openRows.length > 0 ? "YES" : "NO", openRows.length > 0 ? "good" : "");
+      setText("liveBtcStart", Number.isFinite(btcStartPrice) ? money(btcStartPrice) : "-");
+      setText("liveBtcReference", Number.isFinite(btcReferencePrice) ? money(btcReferencePrice) + (staleMark ? " STALE" : "") : "-");
+      setText("liveContractEntry", Number.isFinite(contractEntryPrice) ? priceText(contractEntryPrice) : "-");
+      setText(
+        "livePrice",
+        livePriceText,
+        ""
+      );
+      setText("liveImpliedProb", Number.isFinite(impliedProbPct) ? fmt2.format(impliedProbPct) + "%" : "-");
+      setText(
+        "liveUnrealizedPnl",
+        Number.isFinite(unrealizedPnlUsd) ? money(unrealizedPnlUsd) : "-",
+        Number.isFinite(unrealizedPnlUsd) ? (unrealizedPnlUsd >= 0 ? "good" : "bad") : ""
+      );
+      setText(
+        "liveWindowPnl",
+        money(Number(liveSummary.windowRealizedPnlUsd || 0)),
+        Number(liveSummary.windowRealizedPnlUsd || 0) >= 0 ? "good" : "bad"
+      );
+    }
+
+    const state = {
+      payload: null,
+      fingerprint: "",
+      serverNowTs: 0,
+      lastActionTs: 0,
+      snapshotVersionTs: 0,
+      clockOffsetMs: 0,
+      streamConnected: false,
+      fallbackPollingActive: false,
+      fallbackTimer: null,
+      countdownTimer: null,
+      stream: null,
+      lastFetchTs: 0,
+      lastPayloadSource: "",
+      streamUrl: STREAM_URL
+    };
+
+    function updateConnectionUi() {
+      const node = el("liveConnection");
+      if (!node) return;
+      if (state.streamConnected) {
+        setText("liveConnection", "LIVE", "good");
+        return;
+      }
+      if (state.fallbackPollingActive) {
+        setText("liveConnection", "POLLING", "warn");
+        return;
+      }
+      setText("liveConnection", "CONNECTING", "");
+    }
+
+    function refreshRealtimeFields() {
+      if (!state.payload || typeof state.payload !== "object") return;
+      const summary = state.payload.summary && typeof state.payload.summary === "object"
+        ? state.payload.summary
+        : {};
+      const openRows = normalizeRows(state.payload && Array.isArray(state.payload.openTrades) ? state.payload.openTrades : []);
+      renderLiveStrip(summary, openRows);
+      renderCurrent(summary);
+      renderOpenRows(openRows, summary);
+    }
+
+    function ensureCountdownTimer() {
+      if (state.countdownTimer) return;
+      state.countdownTimer = setInterval(function () {
+        refreshRealtimeFields();
+      }, 1000);
+    }
+
+    function isOlderPayload(payload) {
+      const nextServerNowTs = toFinite(payload && (payload.serverNowTs != null ? payload.serverNowTs : payload.ts)) || 0;
+      const nextActionTs = toFinite(payload && payload.summary && payload.summary.lastActionTs) || 0;
+      const nextVersionTs = toFinite(payload && payload.snapshotVersionTs) || Math.max(nextServerNowTs, nextActionTs);
+      if (state.snapshotVersionTs && nextVersionTs && nextVersionTs < state.snapshotVersionTs) {
+        return true;
+      }
+      if (state.lastActionTs && nextActionTs && nextActionTs < state.lastActionTs) {
+        return true;
+      }
+      return Boolean(state.serverNowTs && nextServerNowTs && nextServerNowTs < state.serverNowTs);
+    }
+
+    function renderPayload(payload, source) {
+      const summary = payload && payload.summary && typeof payload.summary === "object"
+        ? payload.summary
+        : {};
+      const openRows = normalizeRows(payload && Array.isArray(payload.openTrades) ? payload.openTrades : []);
+      const recentRows = normalizeRows(payload && Array.isArray(payload.recentTrades) ? payload.recentTrades : []);
+      const equityPoints = Array.isArray(payload && payload.equityPoints) ? payload.equityPoints : [];
+      state.payload = payload;
+      state.lastPayloadSource = source;
+      updateModeBanner(summary);
+      renderLiveStrip(summary, openRows);
+      renderCurrent(summary);
+      renderOpenRows(openRows, summary);
+      renderRecentRows(recentRows);
+      drawEquity(equityPoints);
+      setOpenTradesEmpty(openRows.length, summary.openTrades, recentRows.length + openRows.length, summary);
+      setTradesEmptyState(payload, recentRows.length + openRows.length, 200);
+      setText("mOpen", String(summary.openTrades || 0));
+      setText("mResolved", String(summary.resolvedTrades || 0));
+      setText("mRecentTerminal", String(recentRows.length || 0));
+      setText("mTotalTrades", String(summary.totalTrades || 0));
+      setText("mWinRate", fmtP.format(Number(summary.winRate || 0)));
+      setText("mWins", String(summary.wins || 0), "good");
+      setText("mLosses", String(summary.losses || 0), "bad");
+      setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
+      setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
+      setText("mLastAction", String(summary.lastAction || "HOLD"));
+      setText("mRowsLoaded", String(openRows.length + recentRows.length));
+      const lastTradeTs = Math.max(resolveLastTradeTs(openRows), resolveLastTradeTs(recentRows));
+      setText("mLastTradeTime", lastTradeTs > 0 ? new Date(lastTradeTs).toLocaleString() : "-");
+      const totalsNode = el("resolvedTotals");
+      if (totalsNode) {
+        totalsNode.textContent =
+          "wins " + String(summary.wins || 0) +
+          " | losses " + String(summary.losses || 0) +
+          " | recent " + String(recentRows.length) +
+          " | win rate " + fmtP.format(Number(summary.winRate || 0)) +
+          " | total pnl " + money(Number(summary.pnlTotalUsd || 0));
+      }
+      setTradesDebug({
+        lastFetchTs: state.lastFetchTs,
+        lastHttpStatus: 200,
+        lastParseError: "",
+        payload,
+        rowsLength: openRows.length + recentRows.length
+      });
+      updateConnectionUi();
+      refreshRealtimeFields();
+    }
+
+    function applyPayload(payload, source) {
+      if (!payload || typeof payload !== "object") return;
+      if (isOlderPayload(payload)) {
+        return;
+      }
+      const nextServerNowTs = toFinite(payload.serverNowTs != null ? payload.serverNowTs : payload.ts) || 0;
+      const nextActionTs = toFinite(payload.summary && payload.summary.lastActionTs) || 0;
+      const nextVersionTs = toFinite(payload.snapshotVersionTs) || Math.max(nextServerNowTs, nextActionTs);
+      const fingerprint = String(payload.fingerprint || "");
+      if (fingerprint && fingerprint === state.fingerprint) {
+        return;
+      }
+      if (fingerprint) {
+        state.fingerprint = fingerprint;
+      }
+      if (nextServerNowTs > 0) {
+        state.serverNowTs = nextServerNowTs;
+        state.clockOffsetMs = nextServerNowTs - Date.now();
+      }
+      if (nextActionTs > 0) {
+        state.lastActionTs = Math.max(state.lastActionTs, nextActionTs);
+      }
+      if (nextVersionTs > 0) {
+        state.snapshotVersionTs = Math.max(state.snapshotVersionTs, nextVersionTs);
+      }
+      renderPayload(payload, source || "unknown");
+    }
+
+    async function fetchDashboardSnapshot(source) {
       try {
-        const [summaryResp, tradesRespMeta, equityResp, lagResp] = await Promise.all([
-          fetchJson("/api/polymarket/summary"),
-          fetchJsonWithMeta("/api/polymarket/trades?limit=200"),
-          fetchJson("/api/polymarket/equity"),
-          fetchJson("/api/polymarket/lag")
-        ]);
-
-        const summary = summaryResp && typeof summaryResp === "object" ? summaryResp : {};
-        setText("mOpen", String(summary.openTrades || 0));
-        setText("mResolved", String(summary.resolvedTrades || 0));
-        setText("mTotalTrades", String(summary.totalTrades || 0));
-        setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
-        setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
-        setText("mWinRate", fmtP.format(Number(summary.winRate || 0)));
-        setText("mWins", String(summary.wins || 0), "good");
-        setText("mLosses", String(summary.losses || 0), "bad");
-        setText("mLastAction", String(summary.lastAction || "HOLD"));
-        updateModeBanner(summary);
-        setText(
-          "mSelectedInfo",
-          String(summary.selectedSlug || "-") +
-            " / " +
-            String(Number.isFinite(Number(summary.finalCandidatesCount)) ? Math.max(0, Math.floor(Number(summary.finalCandidatesCount))) : 0)
-        );
-
-        if ((!summary.latestLag || !summary.latestModel) && lagResp && typeof lagResp === "object") {
-          summary.latestLag = lagResp.stats || summary.latestLag || null;
-        }
-        renderCurrent(summary);
-        const payload = tradesRespMeta && Object.prototype.hasOwnProperty.call(tradesRespMeta, "payload")
-          ? tradesRespMeta.payload
-          : null;
-        const normalized = normalizeTradesPayload(payload);
-        const rows = normalized.rows;
-        const meta = normalized.meta && typeof normalized.meta === "object" ? normalized.meta : {};
-        const classified = classifyTrades(rows);
-        renderRows(classified.open, "openTradesBody", "open");
-        renderRows(classified.resolved, "resolvedTradesBody", "resolved");
-        setTradesDebug({
-          lastFetchTs: Date.now(),
-          lastHttpStatus: tradesRespMeta.status,
-          lastParseError: tradesRespMeta.parseError || "",
-          payload,
-          rowsLength: rows.length
-        });
-        setTradesEmptyState(payload, rows.length, tradesRespMeta.status);
-        setOpenTradesEmpty(classified.open.length, summary.openTrades, rows.length, summary);
-        setText("mRowsLoaded", String(rows.length));
-        const lastTradeTs = resolveLastTradeTs(rows);
-        setText("mLastTradeTime", lastTradeTs > 0 ? new Date(lastTradeTs).toLocaleString() : "-");
-        const totalsNode = el("resolvedTotals");
-        if (totalsNode) {
-          const metaCount = Number(meta.count);
-          const count = Number.isFinite(metaCount) ? metaCount : rows.length;
-          const wins = Number(meta.wins ?? summary.wins ?? 0);
-          const losses = Number(meta.losses ?? summary.losses ?? 0);
-          const winRate = Number(meta.winRate ?? summary.winRate ?? 0);
-          const totalPnlUsd = Number(meta.totalPnlUsd ?? summary.pnlTotalUsd ?? 0);
-          totalsNode.textContent =
-            "count " + String(Math.max(0, Math.floor(count))) +
-            " | wins " + String(Math.max(0, Math.floor(Number.isFinite(wins) ? wins : 0))) +
-            " | losses " + String(Math.max(0, Math.floor(Number.isFinite(losses) ? losses : 0))) +
-            " | win rate " + fmtP.format(Number.isFinite(winRate) ? winRate : 0) +
-            " | total pnl " + money(Number.isFinite(totalPnlUsd) ? totalPnlUsd : 0);
-        }
-        drawEquity(Array.isArray(equityResp.points) ? equityResp.points : []);
+        state.lastFetchTs = Date.now();
+        const payload = await fetchJson(DASHBOARD_URL);
+        applyPayload(payload, source || "poll");
       } catch (error) {
-        const status = Number(error && error.status);
         setTradesDebug({
           lastFetchTs: Date.now(),
-          lastHttpStatus: Number.isFinite(status) ? status : null,
+          lastHttpStatus: null,
           lastParseError: error instanceof Error ? error.message : String(error || "refresh_failed"),
-          payload: error && Object.prototype.hasOwnProperty.call(error, "payload") ? error.payload : null,
+          payload: null,
           rowsLength: 0
         });
-        setTradesEmptyState(
-          error && Object.prototype.hasOwnProperty.call(error, "payload") ? error.payload : null,
-          0,
-          Number.isFinite(status) ? status : null
-        );
-        setOpenTradesEmpty(0, 0, 0, {});
-        setText("mRowsLoaded", "0");
-        setText("mLastTradeTime", "-");
-        console.error("polymarket_refresh_error", error);
+        console.error("polymarket_dashboard_refresh_error", error);
       }
     }
 
+    function stopFallbackPolling() {
+      if (state.fallbackTimer) {
+        clearInterval(state.fallbackTimer);
+        state.fallbackTimer = null;
+      }
+      state.fallbackPollingActive = false;
+      updateConnectionUi();
+    }
+
+    function startFallbackPolling() {
+      if (state.fallbackPollingActive) {
+        return;
+      }
+      state.fallbackPollingActive = true;
+      state.fallbackTimer = setInterval(function () {
+        void fetchDashboardSnapshot("poll");
+      }, FALLBACK_POLL_MS);
+      updateConnectionUi();
+    }
+
+    function handleStreamOpen() {
+      state.streamConnected = true;
+      stopFallbackPolling();
+      updateConnectionUi();
+    }
+
+    function handleStreamError() {
+      state.streamConnected = false;
+      updateConnectionUi();
+      startFallbackPolling();
+    }
+
+    function handleStreamSnapshot(event) {
+      try {
+        handleStreamOpen();
+        const payload = JSON.parse(String((event && event.data) || "{}"));
+        applyPayload(payload, "stream");
+      } catch (error) {
+        console.error("polymarket_stream_parse_error", error);
+      }
+    }
+
+    function handleActivityEvent(event) {
+      try {
+        const payload = JSON.parse(String((event && event.data) || "{}"));
+        const nextActionTs = toFinite(payload && payload.ts) || Date.now();
+        if (state.lastActionTs && nextActionTs < state.lastActionTs) {
+          return;
+        }
+        state.lastActionTs = nextActionTs;
+        setText("mLastAction", String(payload.action || "HOLD"));
+        if (state.payload && state.payload.summary && typeof state.payload.summary === "object") {
+          state.payload.summary.lastAction = payload.action || state.payload.summary.lastAction || "HOLD";
+          state.payload.summary.lastActionTs = nextActionTs;
+          if (Object.prototype.hasOwnProperty.call(payload, "holdReason")) {
+            state.payload.summary.holdReason = payload.holdReason;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "lifecycleStatus")) {
+            state.payload.summary.lifecycleStatus = payload.lifecycleStatus;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedSlug")) {
+            state.payload.summary.selectedSlug = payload.selectedSlug;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "windowStartTs")) {
+            state.payload.summary.windowStartTs = payload.windowStartTs;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "windowEndTs")) {
+            state.payload.summary.windowEndTs = payload.windowEndTs;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "windowEndTs") && payload.windowEndTs === null) {
+            state.payload.summary.remainingSec = null;
+            state.payload.summary.countdownSec = null;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "chosenDirection")) {
+            state.payload.summary.chosenDirection = payload.chosenDirection;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "entriesInWindow")) {
+            state.payload.summary.entriesInWindow = payload.entriesInWindow;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "realizedPnlWindowUsd")) {
+            state.payload.summary.windowRealizedPnlUsd = payload.realizedPnlWindowUsd;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "resolutionSource")) {
+            state.payload.summary.resolutionSource = payload.resolutionSource;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "livePrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "strikePrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "btcStartPrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "entryBtcReferencePrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "btcReferencePrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "btcReferenceTs") ||
+              Object.prototype.hasOwnProperty.call(payload, "btcReferenceStale") ||
+              Object.prototype.hasOwnProperty.call(payload, "contractEntryPrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "contractLivePrice") ||
+              Object.prototype.hasOwnProperty.call(payload, "impliedProbPct") ||
+              Object.prototype.hasOwnProperty.call(payload, "bestBid") ||
+              Object.prototype.hasOwnProperty.call(payload, "bestAsk") ||
+              Object.prototype.hasOwnProperty.call(payload, "markSource") ||
+              Object.prototype.hasOwnProperty.call(payload, "markTs") ||
+              Object.prototype.hasOwnProperty.call(payload, "markAgeMs") ||
+              Object.prototype.hasOwnProperty.call(payload, "isStale") ||
+              Object.prototype.hasOwnProperty.call(payload, "unrealizedPnlUsd")) {
+            if (!state.payload.summary.openTrade || typeof state.payload.summary.openTrade !== "object") {
+              state.payload.summary.openTrade = {};
+            }
+            state.payload.summary.openTrade.strikePrice = Object.prototype.hasOwnProperty.call(payload, "strikePrice")
+              ? payload.strikePrice
+              : state.payload.summary.openTrade.strikePrice;
+            state.payload.summary.openTrade.btcStartPrice = Object.prototype.hasOwnProperty.call(payload, "btcStartPrice")
+              ? payload.btcStartPrice
+              : state.payload.summary.openTrade.btcStartPrice;
+            state.payload.summary.openTrade.entryBtcReferencePrice = Object.prototype.hasOwnProperty.call(payload, "entryBtcReferencePrice")
+              ? payload.entryBtcReferencePrice
+              : state.payload.summary.openTrade.entryBtcReferencePrice;
+            state.payload.summary.openTrade.btcReferencePrice = Object.prototype.hasOwnProperty.call(payload, "btcReferencePrice")
+              ? payload.btcReferencePrice
+              : state.payload.summary.openTrade.btcReferencePrice;
+            state.payload.summary.openTrade.btcReferenceTs = Object.prototype.hasOwnProperty.call(payload, "btcReferenceTs")
+              ? payload.btcReferenceTs
+              : state.payload.summary.openTrade.btcReferenceTs;
+            state.payload.summary.openTrade.btcReferenceStale = Object.prototype.hasOwnProperty.call(payload, "btcReferenceStale")
+              ? payload.btcReferenceStale
+              : state.payload.summary.openTrade.btcReferenceStale;
+            state.payload.summary.openTrade.contractEntryPrice = Object.prototype.hasOwnProperty.call(payload, "contractEntryPrice")
+              ? payload.contractEntryPrice
+              : state.payload.summary.openTrade.contractEntryPrice;
+            state.payload.summary.openTrade.contractLivePrice = Object.prototype.hasOwnProperty.call(payload, "contractLivePrice")
+              ? payload.contractLivePrice
+              : state.payload.summary.openTrade.contractLivePrice;
+            state.payload.summary.openTrade.impliedProbPct = Object.prototype.hasOwnProperty.call(payload, "impliedProbPct")
+              ? payload.impliedProbPct
+              : state.payload.summary.openTrade.impliedProbPct;
+            state.payload.summary.openTrade.livePrice = Object.prototype.hasOwnProperty.call(payload, "livePrice")
+              ? payload.livePrice
+              : state.payload.summary.openTrade.livePrice;
+            state.payload.summary.openTrade.bestBid = Object.prototype.hasOwnProperty.call(payload, "bestBid")
+              ? payload.bestBid
+              : state.payload.summary.openTrade.bestBid;
+            state.payload.summary.openTrade.bestAsk = Object.prototype.hasOwnProperty.call(payload, "bestAsk")
+              ? payload.bestAsk
+              : state.payload.summary.openTrade.bestAsk;
+            state.payload.summary.openTrade.markSource = Object.prototype.hasOwnProperty.call(payload, "markSource")
+              ? payload.markSource
+              : state.payload.summary.openTrade.markSource;
+            state.payload.summary.openTrade.markTs = Object.prototype.hasOwnProperty.call(payload, "markTs")
+              ? payload.markTs
+              : state.payload.summary.openTrade.markTs;
+            state.payload.summary.openTrade.markAgeMs = Object.prototype.hasOwnProperty.call(payload, "markAgeMs")
+              ? payload.markAgeMs
+              : state.payload.summary.openTrade.markAgeMs;
+            if (Object.prototype.hasOwnProperty.call(payload, "isStale")) {
+              state.payload.summary.openTrade.markStale = payload.isStale;
+              state.payload.summary.openTrade.isStale = payload.isStale;
+            }
+            state.payload.summary.openTrade.unrealizedPnlUsd = Object.prototype.hasOwnProperty.call(payload, "unrealizedPnlUsd")
+              ? payload.unrealizedPnlUsd
+              : state.payload.summary.openTrade.unrealizedPnlUsd;
+          }
+          refreshRealtimeFields();
+        }
+      } catch (error) {
+        console.error("polymarket_activity_parse_error", error);
+      }
+    }
+
+    function connectStream() {
+      if (typeof EventSource !== "function") {
+        startFallbackPolling();
+        return null;
+      }
+      if (state.stream && typeof state.stream.close === "function") {
+        state.stream.close();
+      }
+      const stream = new EventSource(STREAM_URL);
+      state.stream = stream;
+      state.streamUrl = STREAM_URL;
+      if (typeof stream.addEventListener === "function") {
+        stream.addEventListener("snapshot", handleStreamSnapshot);
+        stream.addEventListener("activity", handleActivityEvent);
+      }
+      stream.onmessage = handleStreamSnapshot;
+      stream.onopen = handleStreamOpen;
+      stream.onerror = handleStreamError;
+      updateConnectionUi();
+      return stream;
+    }
+
+    window.__REVX_POLYMARKET_HOOKS__ = {
+      renderPayload: function (payload) { applyPayload(payload, "hook"); },
+      applyPayload: function (payload) { applyPayload(payload, "hook"); },
+      connectStream: connectStream,
+      handleActivityEvent: handleActivityEvent,
+      handleStreamError: handleStreamError,
+      handleStreamOpen: handleStreamOpen,
+      getState: function () {
+        return {
+          fingerprint: state.fingerprint,
+          serverNowTs: state.serverNowTs,
+          lastActionTs: state.lastActionTs,
+          snapshotVersionTs: state.snapshotVersionTs,
+          streamConnected: state.streamConnected,
+          fallbackPollingActive: state.fallbackPollingActive,
+          streamUrl: state.streamUrl,
+          lastPayloadSource: state.lastPayloadSource
+        };
+      }
+    };
+
     const refreshBtn = el("refreshBtn");
     if (refreshBtn) {
-      refreshBtn.addEventListener("click", () => void refresh());
+      refreshBtn.addEventListener("click", function () {
+        void fetchDashboardSnapshot("manual");
+      });
     }
-    void refresh();
-    setInterval(() => {
-      void refresh();
-    }, 5000);
+    updateConnectionUi();
+    ensureCountdownTimer();
+    void fetchDashboardSnapshot("initial");
+    connectStream();
   })();`;
 }
 
@@ -10337,16 +11480,24 @@ function deriveHoldReasonFromAction(action: string | null): string | null {
   return value.length > 0 ? value : "HOLD";
 }
 
-function buildPolymarketTradesPayload(
+export function buildPolymarketTradesPayload(
   ledger: PaperLedger,
   limit: number
 ): {
   rows: Array<Record<string, unknown>>;
   wins: number;
   losses: number;
+  flats: number;
   resolvedTrades: number;
+  openTrades: number;
+  awaitingResolutionTrades: number;
+  resolutionErrorTrades: number;
+  voidTrades: number;
+  exitedEarlyTrades: number;
+  cancelledTrades: number;
   winRate: number;
   totalPnlUsd: number;
+  statusCounts: Record<string, number>;
 } {
   const allChronological = ledger
     .getAllTrades()
@@ -10356,31 +11507,63 @@ function buildPolymarketTradesPayload(
     string,
     {
       cumulativePnlUsd: number;
-      result: "WIN" | "LOSS" | null;
+      result: "WIN" | "LOSS" | "FLAT" | null;
       wins: number;
       losses: number;
+      flats: number;
       winRate: number;
       pnlUsd: number;
     }
   >();
   let wins = 0;
   let losses = 0;
+  let flats = 0;
   let resolvedTrades = 0;
+  let openTrades = 0;
+  let awaitingResolutionTrades = 0;
+  let resolutionErrorTrades = 0;
+  let voidTrades = 0;
+  let exitedEarlyTrades = 0;
+  let cancelledTrades = 0;
   let cumulativePnlUsd = 0;
+  const statusCounts: Record<string, number> = {
+    OPEN: 0,
+    AWAITING_RESOLUTION: 0,
+    RESOLUTION_ERROR: 0,
+    RESOLVED_WIN: 0,
+    RESOLVED_LOSS: 0,
+    VOID: 0,
+    EXITED_EARLY: 0
+  };
 
   for (const trade of allChronological) {
-    const isResolved = Boolean(trade.resolvedAt);
-    const pnlUsd = Number(trade.pnlUsd || 0);
-    let result: "WIN" | "LOSS" | null = null;
-    if (isResolved) {
+    const status = getPaperTradeStatus(trade);
+    const pnlUsd = getPaperTradePnlUsd(trade);
+    const result = getPaperTradeResult(trade);
+    const isResolved = status === "RESOLVED_WIN" || status === "RESOLVED_LOSS";
+    statusCounts[status] = Number(statusCounts[status] || 0) + 1;
+    if (status === "OPEN") {
+      openTrades += 1;
+    } else if (status === "AWAITING_RESOLUTION") {
+      awaitingResolutionTrades += 1;
+    } else if (status === "RESOLUTION_ERROR") {
+      resolutionErrorTrades += 1;
+    } else if (status === "VOID" || status === "EXITED_EARLY") {
+      if (status === "VOID") {
+        voidTrades += 1;
+      } else {
+        exitedEarlyTrades += 1;
+      }
+      cancelledTrades += 1;
+    } else if (isResolved) {
       resolvedTrades += 1;
       cumulativePnlUsd += pnlUsd;
-      if (pnlUsd > 0) {
+      if (result === "WIN") {
         wins += 1;
-        result = "WIN";
-      } else {
+      } else if (result === "LOSS") {
         losses += 1;
-        result = "LOSS";
+      } else if (result === "FLAT") {
+        flats += 1;
       }
     }
     byId.set(trade.id, {
@@ -10388,7 +11571,8 @@ function buildPolymarketTradesPayload(
       result,
       wins,
       losses,
-      winRate: resolvedTrades > 0 ? wins / resolvedTrades : 0,
+      flats,
+      winRate: wins + losses + flats > 0 ? wins / (wins + losses + flats) : 0,
       pnlUsd
     });
   }
@@ -10402,10 +11586,232 @@ function buildPolymarketTradesPayload(
     rows,
     wins,
     losses,
+    flats,
     resolvedTrades,
-    winRate: resolvedTrades > 0 ? wins / resolvedTrades : 0,
-    totalPnlUsd: cumulativePnlUsd
+    openTrades,
+    awaitingResolutionTrades,
+    resolutionErrorTrades,
+    voidTrades,
+    exitedEarlyTrades,
+    cancelledTrades,
+    winRate: wins + losses + flats > 0 ? wins / (wins + losses + flats) : 0,
+    totalPnlUsd: cumulativePnlUsd,
+    statusCounts
   };
+}
+
+function getPolymarketRowSortTs(row: Record<string, unknown>): number {
+  return Math.max(
+    Number(row.statusUpdatedAt || 0),
+    Number(row.resolvedAt || 0),
+    Number(row.createdTs || 0),
+    Number(row.entryTs || 0)
+  );
+}
+
+function isTerminalPolymarketRow(row: Record<string, unknown>): boolean {
+  const status = String(row.status || "").toUpperCase();
+  return (
+    status === "RESOLVED_WIN" ||
+    status === "RESOLVED_LOSS" ||
+    status === "EXITED_EARLY" ||
+    status === "VOID"
+  );
+}
+
+function buildPolymarketOpenRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return rows
+    .filter((row) => String(row.status || "").toUpperCase() === "OPEN")
+    .sort((a, b) => getPolymarketRowSortTs(b) - getPolymarketRowSortTs(a));
+}
+
+function mergePolymarketOpenTradeLiveMetrics(
+  rows: Array<Record<string, unknown>>,
+  openTrade: Record<string, unknown> | null
+): Array<Record<string, unknown>> {
+  if (!openTrade || typeof openTrade !== "object") {
+    return rows.map((row) => ({
+      ...row,
+      livePrice: null,
+      contractLivePrice: null,
+      contractEntryPrice: toFiniteNumber(row.entryPricePerShare ?? row.entryPrice),
+      impliedProbPct: null,
+      strikePrice: toFiniteNumber(row.priceToBeat),
+      btcStartPrice: toFiniteNumber(row.referencePriceAtEntry),
+      entryBtcReferencePrice: toFiniteNumber(row.referencePriceAtEntry),
+      btcReferencePrice: toFiniteNumber(row.referencePriceAtEntry),
+      btcReferenceTs: toFiniteNumber(row.entryTs ?? row.createdTs),
+      btcReferenceAgeMs: null,
+      btcReferenceStale: false,
+      bestBid: null,
+      bestAsk: null,
+      markSource: null,
+      markTs: null,
+      markAgeMs: null,
+      markStale: false,
+      isStale: false,
+      shares: Number(row.qty || 0),
+      entryNotionalUsd: Number(row.entryCostUsd || row.notionalUsd || 0),
+      unrealizedPnlUsd: null,
+      feesUsd: Number(row.feesUsd || 0)
+    }));
+  }
+  const openTradeId = String(openTrade.tradeId || "");
+  return rows.map((row) => {
+    if (String(row.tradeId || row.id || "") !== openTradeId) {
+      return {
+        ...row,
+        shares: Number(row.qty || 0),
+        entryNotionalUsd: Number(row.entryCostUsd || row.notionalUsd || 0),
+        unrealizedPnlUsd: null
+      };
+    }
+    return {
+      ...row,
+      livePrice: toFiniteNumber(openTrade.livePrice),
+      contractLivePrice: toFiniteNumber(openTrade.contractLivePrice ?? openTrade.livePrice),
+      contractEntryPrice:
+        toFiniteNumber(openTrade.contractEntryPrice ?? openTrade.entryPrice) ??
+        Number(row.entryPricePerShare || row.entryPrice || 0),
+      impliedProbPct: toFiniteNumber(openTrade.impliedProbPct),
+      strikePrice: toFiniteNumber(openTrade.strikePrice) ?? toFiniteNumber(row.priceToBeat),
+      btcStartPrice:
+        toFiniteNumber(openTrade.btcStartPrice) ??
+        toFiniteNumber(openTrade.entryBtcReferencePrice) ??
+        toFiniteNumber(row.referencePriceAtEntry),
+      entryBtcReferencePrice:
+        toFiniteNumber(openTrade.entryBtcReferencePrice) ?? toFiniteNumber(row.referencePriceAtEntry),
+      btcReferencePrice: toFiniteNumber(openTrade.btcReferencePrice) ?? toFiniteNumber(row.referencePriceAtEntry),
+      btcReferenceTs: toFiniteNumber(openTrade.btcReferenceTs) ?? toFiniteNumber(row.entryTs ?? row.createdTs),
+      btcReferenceAgeMs: toFiniteNumber(openTrade.btcReferenceAgeMs),
+      btcReferenceStale: Boolean(openTrade.btcReferenceStale),
+      bestBid: toFiniteNumber(openTrade.bestBid),
+      bestAsk: toFiniteNumber(openTrade.bestAsk),
+      markSource: toOptionalString(openTrade.markSource),
+      markTs: toFiniteNumber(openTrade.markTs),
+      markAgeMs: toFiniteNumber(openTrade.markAgeMs),
+      markStale: Boolean(openTrade.markStale ?? openTrade.isStale),
+      isStale: Boolean(openTrade.isStale ?? openTrade.markStale),
+      qty: toFiniteNumber(openTrade.qty) ?? Number(row.qty || 0),
+      shares: toFiniteNumber(openTrade.shares) ?? Number(row.qty || 0),
+      entryPricePerShare: toFiniteNumber(openTrade.entryPrice) ?? Number(row.entryPricePerShare || row.entryPrice || 0),
+      entryNotionalUsd: toFiniteNumber(openTrade.entryNotionalUsd) ?? Number(row.entryCostUsd || row.notionalUsd || 0),
+      feesUsd: toFiniteNumber(openTrade.feesUsd) ?? Number(row.feesUsd || 0),
+      markValueUsd: toFiniteNumber(openTrade.markValueUsd),
+      unrealizedPnlUsd: toFiniteNumber(openTrade.unrealizedPnlUsd),
+      heldTokenId: toOptionalString(openTrade.heldTokenId) ?? toOptionalString(row.heldTokenId)
+    };
+  });
+}
+
+function buildPolymarketRecentRows(
+  rows: Array<Record<string, unknown>>,
+  limit: number
+): Array<Record<string, unknown>> {
+  return rows
+    .filter((row) => isTerminalPolymarketRow(row))
+    .sort((a, b) => getPolymarketRowSortTs(b) - getPolymarketRowSortTs(a))
+    .slice(0, Math.max(1, Math.floor(limit)));
+}
+
+function buildPolymarketRecentEvents(
+  rows: Array<Record<string, unknown>>,
+  limit: number
+): Array<Record<string, unknown>> {
+  return rows.slice(0, Math.max(1, Math.floor(limit))).map((row) => ({
+    ts: getPolymarketRowSortTs(row),
+    tradeId: String(row.tradeId || row.id || ""),
+    slug: row.marketSlug || row.marketId || null,
+    direction: row.displaySide || row.direction || row.side || null,
+    status: row.status || null,
+    result: row.result || null,
+    pnlUsd: Number(row.pnlUsd || 0),
+    cumulativePnlUsd: Number(row.cumulativePnlUsd || 0),
+    statusInfo: row.statusDetail || row.statusReason || null,
+    resolutionSource: row.resolutionSource || null
+  }));
+}
+
+function buildPolymarketActivityEvent(summary: Record<string, unknown>): Record<string, unknown> {
+  const openTrade =
+    summary.openTrade && typeof summary.openTrade === "object"
+      ? (summary.openTrade as Record<string, unknown>)
+      : null;
+  return {
+    ts: Number(summary.lastActionTs || summary.serverNowTs || summary.ts || Date.now()),
+    action: summary.lastAction ?? "HOLD",
+    lifecycleStatus: summary.lifecycleStatus ?? null,
+    holdReason: summary.holdReason ?? null,
+    selectedSlug: summary.selectedSlug ?? null,
+    windowStartTs: summary.windowStartTs ?? null,
+    windowEndTs: summary.windowEndTs ?? null,
+    chosenDirection: summary.chosenDirection ?? summary.chosenSide ?? null,
+    entriesInWindow: summary.entriesInWindow ?? null,
+    realizedPnlWindowUsd: summary.windowRealizedPnlUsd ?? null,
+    resolutionSource: summary.resolutionSource ?? null,
+    btcStartPrice: openTrade?.btcStartPrice ?? openTrade?.entryBtcReferencePrice ?? null,
+    btcReferencePrice: openTrade?.btcReferencePrice ?? null,
+    btcReferenceTs: openTrade?.btcReferenceTs ?? null,
+    btcReferenceStale: openTrade?.btcReferenceStale ?? null,
+    strikePrice: openTrade?.strikePrice ?? null,
+    entryBtcReferencePrice: openTrade?.entryBtcReferencePrice ?? null,
+    contractEntryPrice: openTrade?.contractEntryPrice ?? openTrade?.entryPrice ?? null,
+    contractLivePrice: openTrade?.contractLivePrice ?? openTrade?.livePrice ?? null,
+    impliedProbPct: openTrade?.impliedProbPct ?? null,
+    livePrice: openTrade?.livePrice ?? null,
+    bestBid: openTrade?.bestBid ?? null,
+    bestAsk: openTrade?.bestAsk ?? null,
+    markSource: openTrade?.markSource ?? null,
+    markTs: openTrade?.markTs ?? null,
+    markAgeMs: openTrade?.markAgeMs ?? null,
+    isStale: openTrade?.isStale ?? openTrade?.markStale ?? null,
+    unrealizedPnlUsd: openTrade?.unrealizedPnlUsd ?? null,
+    openTrades: summary.openTrades ?? null,
+    resolvedTrades: summary.resolvedTrades ?? null
+  };
+}
+
+function createPolymarketDashboardFingerprint(input: {
+  summary: Record<string, unknown>;
+  openRows: Array<Record<string, unknown>>;
+  recentRows: Array<Record<string, unknown>>;
+  equityPoints: EquityPoint[];
+}): string {
+  const openTrade =
+    input.summary.openTrade && typeof input.summary.openTrade === "object"
+      ? (input.summary.openTrade as Record<string, unknown>)
+      : null;
+  return JSON.stringify({
+    lastAction: input.summary.lastAction ?? null,
+    lastActionTs: input.summary.lastActionTs ?? null,
+    holdReason: input.summary.holdReason ?? null,
+    selectedSlug: input.summary.selectedSlug ?? null,
+    windowEndTs: input.summary.windowEndTs ?? null,
+    lifecycleStatus: input.summary.lifecycleStatus ?? null,
+    chosenDirection: input.summary.chosenDirection ?? null,
+    entriesInWindow: input.summary.entriesInWindow ?? null,
+    windowRealizedPnlUsd: input.summary.windowRealizedPnlUsd ?? null,
+    latestFastMid:
+      input.summary.latestPolymarket && typeof input.summary.latestPolymarket === "object"
+        ? (input.summary.latestPolymarket as Record<string, unknown>).fastMid ?? null
+        : null,
+    openTradeId: openTrade?.tradeId ?? null,
+    openTradeBtcStartPrice: openTrade?.btcStartPrice ?? openTrade?.entryBtcReferencePrice ?? null,
+    openTradeBtcReferencePrice: openTrade?.btcReferencePrice ?? null,
+    openTradeBtcReferenceTs: openTrade?.btcReferenceTs ?? null,
+    openTradeMarkTs: openTrade?.markTs ?? null,
+    openTradeLivePrice: openTrade?.livePrice ?? null,
+    openTradeContractLivePrice: openTrade?.contractLivePrice ?? openTrade?.livePrice ?? null,
+    openTradeMarkSource: openTrade?.markSource ?? null,
+    openTradeIsStale: openTrade?.isStale ?? openTrade?.markStale ?? null,
+    openTradeUnrealizedPnlUsd: openTrade?.unrealizedPnlUsd ?? null,
+    openTrades: input.summary.openTrades ?? null,
+    resolvedTrades: input.summary.resolvedTrades ?? null,
+    pnlTotalUsd: input.summary.pnlTotalUsd ?? null,
+    openRowIds: input.openRows.map((row) => `${String(row.tradeId || row.id || "")}:${String(row.status || "")}:${getPolymarketRowSortTs(row)}`),
+    recentRowIds: input.recentRows.map((row) => `${String(row.tradeId || row.id || "")}:${String(row.status || "")}:${getPolymarketRowSortTs(row)}`),
+    equityTail: input.equityPoints.slice(-8)
+  });
 }
 
 function enrichPolymarketTradeRow(
@@ -10413,23 +11819,68 @@ function enrichPolymarketTradeRow(
   enriched:
     | {
         cumulativePnlUsd: number;
-        result: "WIN" | "LOSS" | null;
+        result: "WIN" | "LOSS" | "FLAT" | null;
         wins: number;
         losses: number;
+        flats: number;
         winRate: number;
         pnlUsd: number;
       }
     | undefined
 ): Record<string, unknown> {
+  const status = getPaperTradeStatus(trade);
+  const exitPricePerShare = getPaperTradeExitPricePerShare(trade);
+  const exitValueUsd = getPaperTradeExitValueUsd(trade);
+  const awaitingSince = Number(trade.awaitingResolutionSinceTs || 0);
+  const awaitingResolutionAgeSec = awaitingSince > 0 ? Math.max(0, Math.floor((Date.now() - awaitingSince) / 1000)) : null;
+  const sideDisplay = getPolymarketTradeDisplaySide(trade);
   return {
     ...trade,
-    result: enriched?.result ?? null,
-    pnlUsd: Number(trade.pnlUsd ?? enriched?.pnlUsd ?? 0),
+    status,
+    displaySide: sideDisplay,
+    direction: sideDisplay,
+    result: enriched?.result ?? getPaperTradeResult(trade),
+    entryPricePerShare: Number(trade.entryPrice || 0),
+    exitPricePerShare,
+    exitValueUsd,
+    payoutUsd: status === "RESOLVED_WIN" || status === "RESOLVED_LOSS" ? exitValueUsd : trade.payoutUsd ?? null,
+    pnlUsd: Number(enriched?.pnlUsd ?? getPaperTradePnlUsd(trade)),
     cumulativePnlUsd: Number(enriched?.cumulativePnlUsd ?? 0),
     wins: Number(enriched?.wins ?? 0),
     losses: Number(enriched?.losses ?? 0),
-    winRate: Number(enriched?.winRate ?? 0)
+    flats: Number(enriched?.flats ?? 0),
+    winRate: Number(enriched?.winRate ?? 0),
+    entryTs: Number(trade.entryTs || trade.createdTs || 0),
+    expectedCloseTs: Number(trade.expectedCloseTs || trade.windowEndTs || 0),
+    statusUpdatedAt: Number(trade.statusUpdatedAt || trade.resolvedAt || trade.createdTs || 0),
+    statusReason: trade.statusReason || null,
+    statusDetail: trade.statusDetail || null,
+    resolutionAttempts: Number(trade.resolutionAttempts || 0),
+    resolutionError: trade.resolutionError || null,
+    resolutionContextState: trade.resolutionContextState || null,
+    awaitingResolutionAgeSec,
+    isTerminal:
+      status === "RESOLVED_WIN" ||
+      status === "RESOLVED_LOSS" ||
+      status === "VOID" ||
+      status === "EXITED_EARLY",
+    isResolved: status === "RESOLVED_WIN" || status === "RESOLVED_LOSS"
   };
+}
+
+function getPolymarketTradeDisplaySide(trade: PaperTrade): string {
+  const yesLabel = normalizeDirectionalLabel(trade.yesDisplayLabel);
+  const noLabel = normalizeDirectionalLabel(trade.noDisplayLabel);
+  if (trade.side === "YES" && yesLabel) return yesLabel;
+  if (trade.side === "NO" && noLabel) return noLabel;
+  return String(trade.side || "-").toUpperCase();
+}
+
+function normalizeDirectionalLabel(value: unknown): string | null {
+  const text = String(value || "").trim().toUpperCase();
+  if (!text) return null;
+  if (text === "UP" || text === "DOWN") return text;
+  return null;
 }
 
 

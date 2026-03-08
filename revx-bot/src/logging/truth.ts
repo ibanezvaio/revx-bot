@@ -36,7 +36,11 @@ type PolymarketTruthState = {
   fetchOk: boolean;
   lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
   holdReason: string | null;
+  currentWindowHoldReason: string | null;
   openTrades: number;
+  awaitingResolutionTrades: number;
+  resolutionErrorTrades: number;
+  resolutionQueueCount: number;
   resolvedTrades: number;
   pnlTotalUsd: number;
   lastTradeId: string | null;
@@ -47,8 +51,13 @@ type PolymarketTruthState = {
   windowsCount: number | null;
   selectedSlug: string | null;
   selectedMarketId: string | null;
+  windowStartTs: number | null;
   windowEndTs: number | null;
   remainingSec: number | null;
+  chosenDirection: string | null;
+  entriesInWindow: number | null;
+  windowRealizedPnlUsd: number | null;
+  resolutionSource: string | null;
   oracleSource: string | null;
   oracleState: string | null;
   latestPolymarketTs: number | null;
@@ -97,7 +106,11 @@ export type TradingTruthSnapshot = {
     mode: "PAPER" | "LIVE";
     lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
     holdReason: string | null;
+    currentWindowHoldReason: string | null;
     openTrades: number;
+    awaitingResolutionTrades: number;
+    resolutionErrorTrades: number;
+    resolutionQueueCount: number;
     resolvedTrades: number;
     pnlTotalUsd: number;
     lastTrade: {
@@ -111,8 +124,13 @@ export type TradingTruthSnapshot = {
       windowsCount: number | null;
       selectedSlug: string | null;
       selectedMarketId: string | null;
+      windowStartTs: number | null;
       windowEndTs: number | null;
       remainingSec: number | null;
+      chosenDirection: string | null;
+      entriesInWindow: number | null;
+      windowRealizedPnlUsd: number | null;
+      resolutionSource: string | null;
     };
     dataHealth: {
       oracleSource: string | null;
@@ -185,7 +203,11 @@ class TradingTruthReporter {
       fetchOk: false,
       lastAction: "HOLD",
       holdReason: null,
+      currentWindowHoldReason: null,
       openTrades: 0,
+      awaitingResolutionTrades: 0,
+      resolutionErrorTrades: 0,
+      resolutionQueueCount: 0,
       resolvedTrades: 0,
       pnlTotalUsd: 0,
       lastTradeId: null,
@@ -196,8 +218,13 @@ class TradingTruthReporter {
       windowsCount: null,
       selectedSlug: null,
       selectedMarketId: null,
+      windowStartTs: null,
       windowEndTs: null,
       remainingSec: null,
+      chosenDirection: null,
+      entriesInWindow: null,
+      windowRealizedPnlUsd: null,
+      resolutionSource: null,
       oracleSource: null,
       oracleState: null,
       latestPolymarketTs: null,
@@ -314,7 +341,11 @@ class TradingTruthReporter {
         mode: this.poly.mode,
         lastAction: this.poly.lastAction,
         holdReason: this.poly.holdReason,
+        currentWindowHoldReason: this.poly.currentWindowHoldReason,
         openTrades: toNonNegativeInt(this.poly.openTrades),
+        awaitingResolutionTrades: toNonNegativeInt(this.poly.awaitingResolutionTrades),
+        resolutionErrorTrades: toNonNegativeInt(this.poly.resolutionErrorTrades),
+        resolutionQueueCount: toNonNegativeInt(this.poly.resolutionQueueCount),
         resolvedTrades: toNonNegativeInt(this.poly.resolvedTrades),
         pnlTotalUsd: toMaybeNumber(this.poly.pnlTotalUsd) ?? 0,
         lastTrade: lastTradeExists
@@ -330,8 +361,13 @@ class TradingTruthReporter {
           windowsCount: toMaybeNumber(this.poly.windowsCount),
           selectedSlug: this.poly.selectedSlug,
           selectedMarketId: this.poly.selectedMarketId,
+          windowStartTs: toMaybeNumber(this.poly.windowStartTs),
           windowEndTs: toMaybeNumber(this.poly.windowEndTs),
-          remainingSec: toMaybeNumber(this.poly.remainingSec)
+          remainingSec: toMaybeNumber(this.poly.remainingSec),
+          chosenDirection: this.poly.chosenDirection,
+          entriesInWindow: toMaybeNumber(this.poly.entriesInWindow),
+          windowRealizedPnlUsd: toMaybeNumber(this.poly.windowRealizedPnlUsd),
+          resolutionSource: this.poly.resolutionSource
         },
         dataHealth: {
           oracleSource: this.poly.oracleSource,
@@ -367,6 +403,10 @@ class TradingTruthReporter {
         : "-";
     const selected = safeText(snapshot.poly.selection.selectedSlug || snapshot.poly.selection.selectedMarketId);
     const rem = safeText(snapshot.poly.selection.remainingSec);
+    const direction = safeText(snapshot.poly.selection.chosenDirection);
+    const entriesInWindow = safeText(snapshot.poly.selection.entriesInWindow);
+    const windowPnl = moneyText(snapshot.poly.selection.windowRealizedPnlUsd);
+    const resolutionSource = safeText(snapshot.poly.selection.resolutionSource);
     return [
       `ts=${isoSeconds(snapshot.ts)}`,
       `REVX(${snapshot.revx.mode} ${safeText(snapshot.revx.symbol)} buyOpen=${intText(
@@ -380,9 +420,11 @@ class TradingTruthReporter {
         snapshot.poly.fetchOk
       )} candidates=${safeText(snapshot.poly.selection.discoveredCandidatesCount)} windows=${safeText(
         snapshot.poly.selection.windowsCount
-      )} selected=${selected} rem=${rem} action=${snapshot.poly.lastAction} hold=${safeText(
-        snapshot.poly.holdReason
-      )},openTrades=${intText(snapshot.poly.openTrades)},resolvedTrades=${intText(
+      )} selected=${selected} rem=${rem} direction=${direction} entriesInWindow=${entriesInWindow} realizedPnlWindowUsd=${windowPnl} resolutionSource=${resolutionSource} action=${snapshot.poly.lastAction} hold=${safeText(
+        snapshot.poly.currentWindowHoldReason ?? snapshot.poly.holdReason
+      )},openTrades=${intText(snapshot.poly.openTrades)},awaitingResolution=${intText(
+        snapshot.poly.awaitingResolutionTrades
+      )},resolutionQueue=${intText(snapshot.poly.resolutionQueueCount)},resolvedTrades=${intText(
         snapshot.poly.resolvedTrades
       )},pnlTotalUsd=${moneyText(snapshot.poly.pnlTotalUsd)})`,
       `FLAGS(REVX_MONEY=${String(snapshot.flags.REVX_MONEY)} POLY_MONEY=${String(snapshot.flags.POLY_MONEY)})`

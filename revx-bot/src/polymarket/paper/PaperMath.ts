@@ -33,6 +33,8 @@ export type PaperClosePnlOutput = {
 
 export type PaperBinarySettlementInput = {
   qty: number;
+  entryPrice?: number;
+  notionalUsd?: number;
   entryCostUsd: number;
   feesUsd: number;
   heldSide: PaperSide;
@@ -43,9 +45,16 @@ export type PaperBinarySettlementInput = {
 };
 
 export type PaperBinarySettlementOutput = {
+  shareCount: number;
   payoutPerShare: number;
   exitPayoutUsd: number;
   pnlUsd: number;
+};
+
+export type PaperBinarySettlementBounds = {
+  shareCount: number;
+  minPayoutUsd: number;
+  maxPayoutUsd: number;
 };
 
 export type PaperResult = "WIN" | "LOSS" | "FLAT";
@@ -71,11 +80,7 @@ export function computePaperPnl(input: PaperPnlInput): PaperPnlOutput {
   const payoutUsd = qty * payoutPerShare;
   const entryCostUsd = qty * entryPrice;
   const feesUsd = entryCostUsd * (feeBps / 10_000);
-  const pnlUsd = computeRealizedPnlUsd({
-    exitPayoutUsd: payoutUsd,
-    entryCostUsd,
-    feesUsd
-  });
+  const pnlUsd = payoutUsd - entryCostUsd - feesUsd;
 
   return {
     payoutPerShare,
@@ -121,8 +126,13 @@ export function computePaperClosePnl(input: PaperClosePnlInput): PaperClosePnlOu
 export function computePaperBinarySettlementPnl(
   input: PaperBinarySettlementInput
 ): PaperBinarySettlementOutput {
-  const qty = Math.max(0, input.qty);
-  const entryCostUsd = Math.max(0, input.entryCostUsd);
+  const shareCount = derivePaperShareCount({
+    qty: input.qty,
+    entryPrice: input.entryPrice,
+    notionalUsd: input.notionalUsd,
+    entryCostUsd: input.entryCostUsd
+  });
+  const entryCostUsd = Math.max(0, input.entryCostUsd || input.notionalUsd || 0);
   const feesUsd = Math.max(0, input.feesUsd);
   const heldTokenId = String(input.heldTokenId || "").trim();
   const yesTokenId = String(input.yesTokenId || "").trim();
@@ -144,16 +154,42 @@ export function computePaperBinarySettlementPnl(
     heldTokenId === winningTokenId
       ? 1
       : 0;
-  const exitPayoutUsd = qty * payoutPerShare;
-  const pnlUsd = computeRealizedPnlUsd({
-    exitPayoutUsd,
-    entryCostUsd,
-    feesUsd
-  });
+  const exitPayoutUsd = shareCount * payoutPerShare;
+  const pnlUsd = exitPayoutUsd - entryCostUsd - feesUsd;
   return {
+    shareCount,
     payoutPerShare,
     exitPayoutUsd,
     pnlUsd
+  };
+}
+
+export function derivePaperShareCount(input: {
+  qty?: number;
+  entryPrice?: number;
+  notionalUsd?: number;
+  entryCostUsd?: number;
+}): number {
+  const entryPrice = Number(input.entryPrice);
+  const entryCostUsd = Math.max(0, Number(input.entryCostUsd || input.notionalUsd || 0));
+  if (Number.isFinite(entryPrice) && entryPrice > 0 && entryCostUsd > 0) {
+    return entryCostUsd / entryPrice;
+  }
+  const qty = Math.max(0, Number(input.qty || 0));
+  return qty;
+}
+
+export function getPaperBinarySettlementBounds(input: {
+  qty?: number;
+  entryPrice?: number;
+  notionalUsd?: number;
+  entryCostUsd?: number;
+}): PaperBinarySettlementBounds {
+  const shareCount = derivePaperShareCount(input);
+  return {
+    shareCount,
+    minPayoutUsd: 0,
+    maxPayoutUsd: shareCount
   };
 }
 

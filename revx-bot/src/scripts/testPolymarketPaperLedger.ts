@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { PaperLedger } from "../polymarket/paper/PaperLedger";
+import { PaperLedger, getPaperTradeStatus } from "../polymarket/paper/PaperLedger";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -34,9 +34,10 @@ function run(): void {
     resolvedAt: 2_100,
     outcome: "UP",
     payoutUsd: 2,
-    pnlUsd: 0.97949,
+    pnlUsd: 999,
+    winningTokenId: "yes-token",
     oracleAtEnd: 50_010,
-    resolutionSource: "oracle_proxy"
+    resolutionSource: "OFFICIAL"
   });
   const openThenClose = ledger.recordTrade({
     marketId: "m2",
@@ -70,12 +71,26 @@ function run(): void {
   const reloaded = new PaperLedger(filePath, { readOnly: true });
   const summary = reloaded.getSummary(2_200);
   assert(summary.totalTrades === 2, `expected totalTrades 2, got ${summary.totalTrades}`);
-  assert(summary.resolvedTrades === 2, `expected resolvedTrades 2, got ${summary.resolvedTrades}`);
+  assert(summary.resolvedTrades === 1, `expected resolvedTrades 1, got ${summary.resolvedTrades}`);
+  assert(summary.cancelledTrades === 1, `expected cancelledTrades 1, got ${summary.cancelledTrades}`);
   assert(summary.openPositions === 0, `expected openPositions 0, got ${summary.openPositions}`);
-  assert(summary.totalPnlUsd > 0.70, "expected positive net pnl in reloaded summary");
+  assert(Math.abs(Number(reloaded.getTrade(trade.id)?.exitPrice || 0) - 1) < 1e-9, "binary resolved exit price must be 1/share");
+  assert(Math.abs(Number(reloaded.getTrade(trade.id)?.exitProceedsUsd || 0) - 2) < 1e-9, "binary resolved payout must stay aggregate settlement only");
+  assert(
+    Math.abs(Number(reloaded.getTrade(trade.id)?.pnlUsd || 0) - (2 - 1.02 - 0.00051)) < 1e-9,
+    "resolved binary pnl must subtract entry fees"
+  );
+  assert(
+    getPaperTradeStatus(reloaded.getTrade(openThenClose.id)!) === "EXITED_EARLY",
+    "paper exit should now be EXITED_EARLY"
+  );
+  assert(
+    Math.abs(summary.totalPnlUsd - (2 - 1.02 - 0.00051)) < 1e-9,
+    "summary total pnl should come from resolved trades only"
+  );
   assert(summary.wins === 1, `expected one win, got ${summary.wins}`);
-  assert(summary.losses === 1, `expected one loss, got ${summary.losses}`);
-  assert(reloaded.getEquitySeries().length === 2, "expected equity points after resolved and closed trades");
+  assert(summary.losses === 0, `expected zero resolved losses, got ${summary.losses}`);
+  assert(reloaded.getEquitySeries().length === 1, "equity series should use resolved trades only");
 
   rmSync(filePath, { force: true });
   // eslint-disable-next-line no-console

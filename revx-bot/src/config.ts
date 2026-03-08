@@ -120,10 +120,18 @@ export type PolymarketConfig = {
     entryMinRemainingSec: number;
     resolveGraceMs: number;
     allowMultipleTradesPerWindow: boolean;
+    reentryCooldownSec: number;
     stopLossEdge: number;
     stopLossConsecutiveTicks: number;
-    takeProfitUsd: number;
-    takeProfitDelta: number;
+    takeProfitUsdGte240: number;
+    takeProfitUsdGte180: number;
+    takeProfitUsdGte120: number;
+    takeProfitUsdGte60: number;
+    takeProfitUsdGte45: number;
+    trailingRetraceFracGt180: number;
+    trailingRetraceFracGte60: number;
+    trailingRetraceFracLt60: number;
+    trailingMinProfitUsd: number;
     forceTrade: boolean;
     forceIntervalSec: number;
     forceNotional: number;
@@ -1131,7 +1139,7 @@ export function loadConfig(): BotConfig {
     30 * 60 * 1000
   );
   const polymarketNoNewOrdersInLastSec = clampInt(
-    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", btc5mPaperModeDefaults ? 15 : 5),
+    numberWithDefault("POLYMARKET_NO_NEW_ORDERS_LAST_SEC", btc5mPaperModeDefaults ? 45 : 5),
     0,
     300
   );
@@ -1232,28 +1240,28 @@ export function loadConfig(): BotConfig {
   const polymarketPaperMinEdgeThreshold = clampNumber(
     numberWithFallback(
       ["POLYMARKET_PAPER_MIN_EDGE", "POLYMARKET_PAPER_MIN_EDGE_THRESHOLD"],
-      0.002
+      btc5mPaperModeDefaults ? 0 : 0.002
     ),
     0,
     0.5
   );
   const polymarketMinNetEdge = clampNumber(
-    numberWithDefault("POLYMARKET_MIN_NET_EDGE", 0.001),
+    numberWithDefault("POLYMARKET_MIN_NET_EDGE", btc5mPaperModeDefaults ? 0 : 0.001),
     0,
     0.5
   );
   const polymarketProbExtreme = clampNumber(
-    numberWithDefault("POLYMARKET_PROB_EXTREME", 0.9),
+    numberWithDefault("POLYMARKET_PROB_EXTREME", btc5mPaperModeDefaults ? 0.5 : 0.9),
     0.5,
     0.9999
   );
   const polymarketExtremeHighPrice = clampNumber(
-    numberWithDefault("POLYMARKET_EXTREME_HIGH_PRICE", 0.97),
+    numberWithDefault("POLYMARKET_EXTREME_HIGH_PRICE", btc5mPaperModeDefaults ? 0.5001 : 0.97),
     0.5,
     0.9999
   );
   const polymarketExtremeLowPrice = clampNumber(
-    numberWithDefault("POLYMARKET_EXTREME_LOW_PRICE", 0.1),
+    numberWithDefault("POLYMARKET_EXTREME_LOW_PRICE", btc5mPaperModeDefaults ? 0.5 : 0.1),
     0.0001,
     0.5
   );
@@ -1268,7 +1276,7 @@ export function loadConfig(): BotConfig {
     300
   );
   const defaultPolymarketEntryMaxRemainingSec = btc5mPaperModeDefaults
-    ? 240
+    ? 285
     : polymarketCadenceMinutes === 5
       ? 600
       : 180;
@@ -1281,7 +1289,10 @@ export function loadConfig(): BotConfig {
     1800
   );
   const polymarketEntryMinRemainingSec = clampInt(
-    numberWithFallback(["POLY_SNIPER_MIN_SEC", "POLYMARKET_ENTRY_MIN_REMAINING_SEC"], 20),
+    numberWithFallback(
+      ["POLY_SNIPER_MIN_SEC", "POLYMARKET_ENTRY_MIN_REMAINING_SEC"],
+      btc5mPaperModeDefaults ? 45 : 20
+    ),
     0,
     300
   );
@@ -1294,6 +1305,11 @@ export function loadConfig(): BotConfig {
     "POLYMARKET_PAPER_ALLOW_MULTIPLE_TRADES_PER_WINDOW",
     true
   );
+  const polymarketPaperReentryCooldownSec = clampInt(
+    numberWithDefault("POLYMARKET_PAPER_REENTRY_COOLDOWN_SEC", 15),
+    0,
+    300
+  );
   const polymarketPaperStopLossEdge = clampNumber(
     numberWithDefault("POLYMARKET_PAPER_STOP_LOSS_EDGE", 0.01),
     0.0001,
@@ -1304,15 +1320,50 @@ export function loadConfig(): BotConfig {
     1,
     50
   );
-  const polymarketPaperTakeProfitUsd = clampNumber(
-    numberWithDefault("POLYMARKET_PAPER_TAKE_PROFIT_USD", 0.25),
+  const polymarketPaperTakeProfitUsdGte240 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TP_USD_GTE240", 3),
     0.01,
     1_000_000
   );
-  const polymarketPaperTakeProfitDelta = clampNumber(
-    numberWithDefault("POLYMARKET_PAPER_TAKE_PROFIT_DELTA", 0.06),
-    0.0001,
+  const polymarketPaperTakeProfitUsdGte180 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TP_USD_GTE180", 2.25),
+    0.01,
+    1_000_000
+  );
+  const polymarketPaperTakeProfitUsdGte120 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TP_USD_GTE120", 1.5),
+    0.01,
+    1_000_000
+  );
+  const polymarketPaperTakeProfitUsdGte60 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TP_USD_GTE60", 0.75),
+    0.01,
+    1_000_000
+  );
+  const polymarketPaperTakeProfitUsdGte45 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TP_USD_GTE45", 0.35),
+    0.01,
+    1_000_000
+  );
+  const polymarketPaperTrailingRetraceFracGt180 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TRAIL_RETRACE_FRAC_GT180", 0.55),
+    0.01,
     0.99
+  );
+  const polymarketPaperTrailingRetraceFracGte60 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TRAIL_RETRACE_FRAC_GTE60", 0.35),
+    0.01,
+    0.99
+  );
+  const polymarketPaperTrailingRetraceFracLt60 = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TRAIL_RETRACE_FRAC_LT60", 0.2),
+    0.01,
+    0.99
+  );
+  const polymarketPaperTrailingMinProfitUsd = clampNumber(
+    numberWithDefault("POLYMARKET_PAPER_TRAIL_MIN_PROFIT_USD", 0.15),
+    0.01,
+    1_000_000
   );
   const polymarketPaperForceTrade = boolWithDefault("POLYMARKET_PAPER_FORCE_TRADE", false);
   const polymarketPaperForceIntervalSec = clampInt(
@@ -1827,10 +1878,18 @@ export function loadConfig(): BotConfig {
         entryMinRemainingSec: polymarketEntryMinRemainingSec,
         resolveGraceMs: polymarketResolveGraceMs,
         allowMultipleTradesPerWindow: polymarketPaperAllowMultipleTradesPerWindow,
+        reentryCooldownSec: polymarketPaperReentryCooldownSec,
         stopLossEdge: polymarketPaperStopLossEdge,
         stopLossConsecutiveTicks: polymarketPaperStopLossConsecutiveTicks,
-        takeProfitUsd: polymarketPaperTakeProfitUsd,
-        takeProfitDelta: polymarketPaperTakeProfitDelta,
+        takeProfitUsdGte240: polymarketPaperTakeProfitUsdGte240,
+        takeProfitUsdGte180: polymarketPaperTakeProfitUsdGte180,
+        takeProfitUsdGte120: polymarketPaperTakeProfitUsdGte120,
+        takeProfitUsdGte60: polymarketPaperTakeProfitUsdGte60,
+        takeProfitUsdGte45: polymarketPaperTakeProfitUsdGte45,
+        trailingRetraceFracGt180: polymarketPaperTrailingRetraceFracGt180,
+        trailingRetraceFracGte60: polymarketPaperTrailingRetraceFracGte60,
+        trailingRetraceFracLt60: polymarketPaperTrailingRetraceFracLt60,
+        trailingMinProfitUsd: polymarketPaperTrailingMinProfitUsd,
         forceTrade: polymarketPaperForceTrade,
         forceIntervalSec: polymarketPaperForceIntervalSec,
         forceNotional: polymarketPaperForceNotional,

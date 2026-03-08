@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { loadConfig } from "../config";
 import { buildLogger } from "../logger";
 import { PolymarketEngine } from "../polymarket/PolymarketEngine";
+import { getPaperTradeStatus } from "../polymarket/paper/PaperLedger";
 import { BtcWindowMarket } from "../polymarket/types";
 
 process.env.DRY_RUN = "true";
@@ -57,7 +58,7 @@ async function run(): Promise<void> {
         extremeLowPrice: 0.5,
         entryMinElapsedSec: 0,
         entryMaxElapsedSec: 240,
-        entryMaxRemainingSec: 90,
+        entryMaxRemainingSec: 240,
         entryMinRemainingSec: 0,
         resolveGraceMs: 2_000
       }
@@ -67,7 +68,10 @@ async function run(): Promise<void> {
   const engine = new PolymarketEngine(config, logger);
   const engineAny = engine as any;
 
-  const t0 = Date.now();
+  const fiveMinMs = 5 * 60 * 1000;
+  const realNow = Date.now();
+  const bucketStart = Math.floor(realNow / fiveMinMs) * fiveMinMs;
+  const t0 = bucketStart + fiveMinMs - 10_000;
   const market: BtcWindowMarket = {
     marketId: "test-market-1",
     slug: "btc-updown-5m-test",
@@ -110,9 +114,77 @@ async function run(): Promise<void> {
 
   engineAny.scanner = {
     scanActiveBtc5m: async () => [market],
-    getLastDiagnostics: () => diagnostics
+    getLastDiagnostics: () => diagnostics,
+    getPrimaryWindowConfig: () => ({
+      minWindowSec: config.polymarket.paper.entryMinRemainingSec,
+      maxWindowSec: config.polymarket.paper.entryMaxRemainingSec
+    })
   };
+  let lastFetchAttemptTs = 0;
+  let lastFetchOkTs = 0;
   engineAny.client = {
+    getActiveMarketBySlug: async (slug: string) => ({
+      id: market.marketId,
+      market_id: market.marketId,
+      slug,
+      eventSlug: slug,
+      question: `Will BTC be above $${market.priceToBeat} at expiry?`,
+      price_to_beat: market.priceToBeat,
+      startTs: market.startTs,
+      endTs: market.endTs,
+      clobTokenIds: [market.yesTokenId, market.noTokenId],
+      acceptingOrders: true,
+      active: true,
+      closed: false
+    }),
+    listMarketsPage: async () => {
+      const now = Date.now();
+      lastFetchAttemptTs = now;
+      lastFetchOkTs = now;
+      return { rows: [] };
+    },
+    getIngestionTelemetry: () => ({
+      lastFetchAttemptTs,
+      lastFetchOkTs,
+      lastFetchErr: null,
+      lastHttpStatus: 200
+    }),
+    recordFetchDisabled: () => {},
+    getMarketContext: async () => ({
+      marketId: market.marketId,
+      slug: market.slug,
+      active: mockedNow < t2 ? true : false,
+      closed: mockedNow >= t2,
+      acceptingOrders: mockedNow < t2 ? true : false,
+      enableOrderBook: true,
+      archived: false,
+      cancelled: false,
+      resolution:
+        mockedNow >= t3
+          ? {
+              yesTokenId: market.yesTokenId,
+              noTokenId: market.noTokenId,
+              winningTokenId: market.yesTokenId,
+              winningSide: "YES",
+              winningOutcome: "UP",
+              winningOutcomeText: "UP",
+              yesOutcomeMapped: "UP",
+              noOutcomeMapped: "DOWN",
+              resolved: true
+            }
+          : {
+              yesTokenId: market.yesTokenId,
+              noTokenId: market.noTokenId,
+              winningTokenId: null,
+              winningSide: null,
+              winningOutcome: null,
+              winningOutcomeText: null,
+              yesOutcomeMapped: "UP",
+              noOutcomeMapped: "DOWN",
+              resolved: mockedNow >= t2
+            }
+    }),
+    getMarketResolution: async () => null,
     getYesOrderBook: async () => ({
       marketId: market.marketId,
       tokenId: market.yesTokenId,
@@ -214,21 +286,40 @@ async function run(): Promise<void> {
     })
   };
 
-  await engineAny.runOnce(t0);
-  assert(killSwitchTriggers === 0, "paper mode must not trigger kill-switch on stale oracle");
-  assert(engineAny.paperLedger.getOpenTrades().length === 0, "stale oracle should block new entries");
+  const originalDateNow = Date.now;
+  let mockedNow = t0;
+  (Date as unknown as { now: () => number }).now = () => mockedNow;
+  try {
+    mockedNow = t0;
+    await engineAny.runOnce(t0);
+    assert(killSwitchTriggers === 0, "paper mode must not trigger kill-switch on stale oracle");
+    assert(engineAny.paperLedger.getOpenTrades().length === 1, "fresh BTC5m book should allow paper entry despite stale oracle");
+    assert(engineAny.tradingPaused === false, "paper mode should not pause on soft ORACLE_STALE");
+    assert(!engineAny.pauseReason, `paper mode should clear ORACLE_STALE pause, got ${String(engineAny.pauseReason)}`);
 
-  await engineAny.runOnce(t1);
-  assert(engineAny.paperLedger.getOpenTrades().length === 1, "fresh oracle should allow trade entry");
+    mockedNow = t1;
+    await engineAny.runOnce(t1);
+    assert(engineAny.paperLedger.getOpenTrades().length === 1, "duplicate protection should keep a single open trade");
+    assert(engineAny.tradingPaused === false, "fresh oracle should resume trading");
 
-  await engineAny.runOnce(t2);
-  assert(engineAny.paperLedger.getOpenTrades().length === 1, "open trade should remain pending while oracle is stale");
-  assert(engineAny.paperLedger.getResolvedTrades().length === 0, "trade must not resolve without valid oracle snapshot");
+    mockedNow = t2;
+    await engineAny.runOnce(t2);
+    assert(engineAny.paperLedger.getOpenTrades().length === 0, "stalled post-close trade should settle via derived fallback after grace");
+    assert(engineAny.paperLedger.getResolvedTrades().length === 1, "trade should resolve once fallback settlement is available");
+    assert(engineAny.tradingPaused === false, "soft ORACLE_STALE should not pause paper mode while waiting to resolve");
+    const resolvedViaFallback = engineAny.paperLedger.getResolvedTrades()[0];
+    assert(getPaperTradeStatus(resolvedViaFallback) === "RESOLVED_WIN", "fallback settlement should resolve the held YES side correctly");
+    assert(String(resolvedViaFallback.resolutionSource || "") === "DERIVED_FALLBACK", "fallback settlement should be tagged DERIVED_FALLBACK");
 
-  await engineAny.runOnce(t3);
-  assert(engineAny.paperLedger.getOpenTrades().length === 0, "trade should resolve once oracle resumes");
-  assert(engineAny.paperLedger.getResolvedTrades().length === 1, "expected resolved trade after oracle resumes");
-  assert(killSwitchTriggers === 0, "paper mode should remain without kill-switch during stall/resume");
+    mockedNow = t3;
+    await engineAny.runOnce(t3);
+    assert(engineAny.paperLedger.getOpenTrades().length === 0, "resolved trade should remain closed");
+    assert(engineAny.paperLedger.getResolvedTrades().length === 1, "expected resolved trade after official market resolution");
+    assert(killSwitchTriggers === 0, "paper mode should remain without kill-switch during stall/resume");
+    assert(engineAny.tradingPaused === false, "oracle recovery should clear paused state");
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalDateNow;
+  }
 
   rmSync(ledgerPath, { force: true });
   // eslint-disable-next-line no-console

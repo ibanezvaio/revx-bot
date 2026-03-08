@@ -24,7 +24,15 @@ export class Sizing {
     }
 
     const tierFraction =
-      conviction >= 0.4 ? 1 : conviction >= 0.25 ? 0.5 : conviction >= 0.15 ? 0.25 : 0;
+      this.config.polymarket.mode === "paper"
+        ? 1
+        : conviction >= 0.4
+          ? 1
+          : conviction >= 0.25
+            ? 0.5
+            : conviction >= 0.15
+              ? 0.25
+              : 0;
     if (!(tierFraction > 0)) {
       return {
         notionalUsd: 0,
@@ -44,9 +52,25 @@ export class Sizing {
     );
     const effectiveBudgetCap = depthCapNotionalUsd > 0 ? Math.min(budgetCap, depthCapNotionalUsd) : budgetCap;
 
-    const cappedNotional = clamp(rawNotional, 0, Math.max(0, effectiveBudgetCap));
     const minOrder = this.config.polymarket.sizing.minOrderNotional;
-    const notionalUsd = cappedNotional >= minOrder ? cappedNotional : 0;
+    let notionalUsd = 0;
+    if (this.config.polymarket.mode === "paper") {
+      const paperDefaultNotional = Math.max(
+        minOrder,
+        Math.min(
+          5,
+          this.config.polymarket.paper.maxNotionalPerWindow,
+          this.config.polymarket.sizing.maxNotionalPerWindow
+        )
+      );
+      notionalUsd =
+        effectiveBudgetCap >= minOrder
+          ? clamp(paperDefaultNotional, minOrder, Math.max(minOrder, effectiveBudgetCap))
+          : 0;
+    } else {
+      const cappedNotional = clamp(rawNotional, 0, Math.max(0, effectiveBudgetCap));
+      notionalUsd = cappedNotional >= minOrder ? cappedNotional : 0;
+    }
 
     return {
       notionalUsd,

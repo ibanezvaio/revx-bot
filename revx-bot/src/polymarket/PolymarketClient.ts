@@ -118,6 +118,18 @@ export type PolymarketMarketResolution = {
   resolved: boolean;
 };
 
+export type PolymarketMarketContext = {
+  marketId: string;
+  slug: string | null;
+  active: boolean | null;
+  closed: boolean;
+  acceptingOrders: boolean | null;
+  enableOrderBook: boolean | null;
+  archived: boolean | null;
+  cancelled: boolean;
+  resolution: PolymarketMarketResolution;
+};
+
 export class PolymarketClient {
   private readonly gammaBaseUrl: string;
   private readonly dataBaseUrl: string;
@@ -692,6 +704,14 @@ export class PolymarketClient {
     } catch {
       return null;
     }
+  }
+
+  async getMarketContext(marketId: string): Promise<PolymarketMarketContext | null> {
+    if (!marketId.trim()) return null;
+    const payload = await this.requestJson("GET", this.gammaBaseUrl, `/markets/${encodeURIComponent(marketId)}`);
+    const row = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+    if (!row) return null;
+    return parseMarketContext(row);
   }
 
   async getMarketOutcome(marketId: string): Promise<"UP" | "DOWN" | null> {
@@ -1721,6 +1741,38 @@ function pickBoolean(input: unknown, keys: string[]): boolean | undefined {
     }
   }
   return undefined;
+}
+
+function parseMarketContext(row: Record<string, unknown>): PolymarketMarketContext {
+  const resolution = parseMarketResolution(row);
+  const active = pickBoolean(row, ["active", "is_active"]);
+  const closed = Boolean(pickBoolean(row, ["closed", "resolved", "is_closed", "isResolved"]));
+  const acceptingOrders = pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"]);
+  const enableOrderBook = pickBoolean(row, ["enable_order_book", "enableOrderBook"]);
+  const archived = pickBoolean(row, ["archived", "is_archived"]);
+  const cancelledFlag = pickBoolean(row, [
+    "cancelled",
+    "canceled",
+    "is_cancelled",
+    "is_canceled",
+    "voided",
+    "void",
+    "invalid",
+    "is_invalid"
+  ]);
+  const hasOfficialWinner = Boolean(resolution.winningTokenId || resolution.winningSide || resolution.winningOutcome);
+
+  return {
+    marketId: pickString(row, ["id", "market_id", "conditionId", "condition_id"]),
+    slug: pickString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || null,
+    active: active ?? null,
+    closed,
+    acceptingOrders: acceptingOrders ?? null,
+    enableOrderBook: enableOrderBook ?? null,
+    archived: archived ?? null,
+    cancelled: Boolean(cancelledFlag || (archived && closed && !hasOfficialWinner)),
+    resolution
+  };
 }
 
 function parseMarketResolution(row: Record<string, unknown>): PolymarketMarketResolution {

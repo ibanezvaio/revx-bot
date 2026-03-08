@@ -7,6 +7,7 @@ import { CrossVenueFetcher } from "../signals/CrossVenueFetcher";
 import { sleep } from "../util/time";
 import {
   PolymarketClient,
+  PolymarketMarketContext,
   PolymarketMarketResolution,
   RawPolymarketEvent,
   RawPolymarketMarket
@@ -24,7 +25,7 @@ import { Strategy } from "./Strategy";
 import { FIVE_MIN_SEC, slugForTs, windowTs } from "./btc5m";
 import { BtcWindowMarket, DecisionLogLine, SpotFeed, SpotVenueTick } from "./types";
 import { VolEstimator } from "./VolEstimator";
-import { PaperLedger } from "./paper/PaperLedger";
+import { PaperLedger, getPaperTradeStatus } from "./paper/PaperLedger";
 import { getTradingTruthReporter } from "../logging/truth";
 import {
   applySellSlippage,
@@ -34,6 +35,7 @@ import {
   computePaperClosePnl,
   estimateNoBidFromYesBook,
   estimateNoAskFromYesBook,
+  getPaperBinarySettlementBounds,
   inferOutcomeFromOracle
 } from "./paper/PaperMath";
 
@@ -124,6 +126,52 @@ type YesBookSnapshot = {
   bookTs: number;
 };
 
+type TokenBookSnapshot = {
+  tokenId: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  mark: number | null;
+  markSource: string | null;
+  bookTs: number;
+};
+
+function prefixCachedMarkSource(source: string | null): string {
+  const normalized = String(source || "").trim();
+  if (normalized.startsWith("CACHED_LAST_GOOD")) return normalized;
+  return normalized ? `CACHED_LAST_GOOD_${normalized}` : "CACHED_LAST_GOOD";
+}
+
+type PaperIntervalContext = {
+  key: string;
+  marketId: string;
+  slug: string;
+  yesTokenId: string;
+  noTokenId: string;
+  intervalStartTs: number;
+  intervalEndTs: number;
+  remainingSec: number;
+  priceToBeat: number;
+  market: BtcWindowMarket;
+};
+
+type PaperIntervalSelection = {
+  interval: PaperIntervalContext | null;
+  selectedReason: string;
+  dominantReject: string;
+  attemptedSlugs: string[];
+};
+
+type PaperIntervalDecisionMemo = {
+  decidedAt: number;
+  action: "ENTRY_OPENED" | "ENTRY_SKIPPED";
+  reason: string;
+};
+
+type PaperSideChoice = {
+  chosenSide: "YES" | "NO" | null;
+  chooserReason: string;
+};
+
 export class PolymarketEngine {
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -153,8 +201,14 @@ export class PolymarketEngine {
     { impliedMid: number; oracleEst: number; ts: number }
   >();
   private readonly latestYesBookByMarketId = new Map<string, YesBookSnapshot>();
+  private readonly latestTokenBookByTokenId = new Map<string, TokenBookSnapshot>();
+  private readonly cachedPaperIntervalsBySlug = new Map<string, PaperIntervalContext>();
   private readonly resolutionPendingLogByTradeId = new Map<string, number>();
   private readonly paperStopLossTicksByTradeId = new Map<string, number>();
+  private readonly paperBestUnrealizedPnlUsdByTradeId = new Map<string, number>();
+  private readonly paperDecisionByIntervalKey = new Map<string, PaperIntervalDecisionMemo>();
+  private lastPaperIntervalKey: string | null = null;
+  private lastPaperIntervalEndTs: number | null = null;
   private latestPolymarketSnapshot: {
     ts: number;
     windowSlug: string;
@@ -188,16 +242,24 @@ export class PolymarketEngine {
   private truthLastSlug: string | null = null;
   private truthLastTradeTs: number | null = null;
   private truthHoldReason: string | null = null;
+  private truthChosenDirection: string | null = null;
+  private truthEntriesInWindow: number | null = null;
+  private truthWindowRealizedPnlUsd: number | null = null;
+  private truthResolutionSource: string | null = null;
   private truthSelection: {
     finalCandidatesCount: number | null;
     selectedSlug: string | null;
     selectedMarketId: string | null;
+    windowStartTs: number | null;
     windowEndTs: number | null;
+    remainingSec: number | null;
   } = {
     finalCandidatesCount: null,
     selectedSlug: null,
     selectedMarketId: null,
-    windowEndTs: null
+    windowStartTs: null,
+    windowEndTs: null,
+    remainingSec: null
   };
   private selectedTokenIds: string[] = [];
   private truthDataHealth: {
@@ -408,18 +470,30 @@ export class PolymarketEngine {
     };
     tradingPaused: boolean;
     pauseReason: string | null;
+    warningState: string | null;
     mode: "paper" | "live";
     polyMoney: boolean;
     lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
     holdReason: string | null;
+    currentWindowHoldReason: string | null;
+    openTradesCount: number;
+    awaitingResolutionCount: number;
+    resolutionErrorCount: number;
+    resolutionQueueCount: number;
     selection: {
       finalCandidatesCount: number | null;
       discoveredCandidatesCount: number | null;
       windowsCount: number | null;
       selectedSlug: string | null;
       selectedMarketId: string | null;
+      windowStartTs: number | null;
       windowEndTs: number | null;
       remainingSec: number | null;
+      chosenDirection: string | null;
+      entriesInWindow: number | null;
+      realizedPnlUsd: number | null;
+      resolutionSource: string | null;
+      lifecycleStatus: string | null;
     };
     dataHealth: {
       oracleSource: string | null;
@@ -447,6 +521,43 @@ export class PolymarketEngine {
       slug: string | null;
       ts: number | null;
     };
+    openTrade: {
+      tradeId: string;
+      marketId: string;
+      marketSlug: string | null;
+      windowStartTs: number;
+      windowEndTs: number;
+      side: "YES" | "NO";
+      direction: string;
+      heldTokenId: string | null;
+      strikePrice: number | null;
+      btcStartPrice: number | null;
+      entryBtcReferencePrice: number | null;
+      btcReferencePrice: number | null;
+      btcReferenceTs: number | null;
+      btcReferenceAgeMs: number | null;
+      btcReferenceStale: boolean;
+      contractEntryPrice: number;
+      contractLivePrice: number | null;
+      impliedProbPct: number | null;
+      bestBid: number | null;
+      bestAsk: number | null;
+      livePrice: number | null;
+      markSource: string | null;
+      markTs: number | null;
+      markAgeMs: number | null;
+      markStale: boolean;
+      isStale: boolean;
+      qty: number;
+      shares: number;
+      entryPrice: number;
+      entryNotionalUsd: number;
+      feesUsd: number;
+      markValueUsd: number | null;
+      unrealizedPnlUsd: number | null;
+    } | null;
+    serverNowTs: number;
+    lastActionTs: number;
     polyEngineRunning: boolean;
     lastUpdateTs: number;
     lastUpdateAgeSec: number | null;
@@ -461,37 +572,127 @@ export class PolymarketEngine {
       this.polyState.lastFetchOkTs > 0 && nowTs - this.polyState.lastFetchOkTs <= 60_000;
     const status: "STARTING" | "RUNNING" | "STALE" =
       lastUpdateTs <= 0 ? "STARTING" : fetchRecent || (lastUpdateAgeSec !== null && lastUpdateAgeSec <= 30) ? "RUNNING" : "STALE";
+    const selectionSnapshot = this.getTruthSelectionSnapshot(nowTs);
+    const lifecycleStatus = this.getPaperLifecycleStatus(nowTs, selectionSnapshot);
+    const paperWindowContext = this.getCurrentPaperWindowRuntimeContext(nowTs);
+    const openTrade = this.buildOpenTradeMonitorSnapshot(nowTs);
+    const paperResolutionStats = this.getPaperResolutionStats(nowTs);
+    const pausePresentation = this.getStatusPausePresentation(this.tradingPaused, this.pauseReason || null);
+    const holdSnapshotFreshMs = Math.max(5_000, this.config.polymarket.loopMs * 3);
+    const normalizedTruthHoldReason = this.truthHoldReason
+      ? String(this.truthHoldReason).trim().toUpperCase()
+      : null;
+    const truthHoldReasonIsFresh =
+      Boolean(normalizedTruthHoldReason) &&
+      this.polyState.lastUpdateTs > 0 &&
+      nowTs - this.polyState.lastUpdateTs <= holdSnapshotFreshMs;
+    const truthDynamicHoldReason =
+      normalizedTruthHoldReason &&
+      (normalizedTruthHoldReason === "REENTRY_COOLDOWN" ||
+        normalizedTruthHoldReason === "OPEN_POSITION_IN_WINDOW" ||
+        normalizedTruthHoldReason === "TOO_LATE_FOR_ENTRY" ||
+        normalizedTruthHoldReason === "EXPIRED_WINDOW")
+        ? normalizedTruthHoldReason
+        : null;
+    const derivedDynamicHoldReason =
+      paperWindowContext?.holdReason ??
+      (truthDynamicHoldReason === "OPEN_POSITION_IN_WINDOW" && openTrade
+        ? "OPEN_POSITION_IN_WINDOW"
+        : truthDynamicHoldReason === "TOO_LATE_FOR_ENTRY" &&
+            selectionSnapshot.remainingSec !== null &&
+            selectionSnapshot.remainingSec < this.config.polymarket.paper.entryMinRemainingSec
+          ? "TOO_LATE_FOR_ENTRY"
+          : truthDynamicHoldReason === "EXPIRED_WINDOW" &&
+              selectionSnapshot.remainingSec !== null &&
+              selectionSnapshot.remainingSec <= 0
+            ? "EXPIRED_WINDOW"
+            : null);
+    const freshPaperCycleWithoutOpenTrade =
+      this.config.polymarket.mode === "paper" &&
+      !openTrade &&
+      this.polyState.lastUpdateTs > this.truthLastActionTs;
+    const freshPaperHoldCycleWithoutOpenTrade =
+      this.config.polymarket.mode === "paper" &&
+      !openTrade &&
+      truthHoldReasonIsFresh &&
+      this.polyState.lastUpdateTs >= this.truthLastActionTs;
+    const effectiveLastAction =
+      freshPaperHoldCycleWithoutOpenTrade || freshPaperCycleWithoutOpenTrade
+        ? "HOLD"
+        : this.truthLastAction;
+    const effectiveLastActionTs =
+      (freshPaperHoldCycleWithoutOpenTrade || freshPaperCycleWithoutOpenTrade || effectiveLastAction === "HOLD") &&
+      this.polyState.lastUpdateTs > 0
+        ? Math.max(this.truthLastActionTs, this.polyState.lastUpdateTs)
+        : this.truthLastActionTs;
+    const currentWindowHoldReason =
+      effectiveLastAction === "HOLD"
+        ? derivedDynamicHoldReason ??
+          (truthHoldReasonIsFresh && !truthDynamicHoldReason ? normalizedTruthHoldReason : null)
+        : null;
+    const latestPolymarket =
+      this.latestPolymarketSnapshot
+        ? {
+            ...this.latestPolymarketSnapshot,
+            tauSec:
+              selectionSnapshot.remainingSec ??
+              (Number(this.latestPolymarketSnapshot.tauSec) >= 0
+                ? Number(this.latestPolymarketSnapshot.tauSec)
+                : null),
+            windowSlug:
+              selectionSnapshot.selectedSlug ??
+              this.latestPolymarketSnapshot.windowSlug
+          }
+        : null;
+    const latestModel =
+      this.latestModelSnapshot
+        ? {
+            ...this.latestModelSnapshot,
+            tauSec:
+              selectionSnapshot.remainingSec ??
+              (Number(this.latestModelSnapshot.tauSec) >= 0 ? Number(this.latestModelSnapshot.tauSec) : null)
+          }
+        : null;
     return {
-      latestPolymarket: this.latestPolymarketSnapshot ? { ...this.latestPolymarketSnapshot } : null,
-      latestModel: this.latestModelSnapshot ? { ...this.latestModelSnapshot } : null,
+      latestPolymarket,
+      latestModel,
       latestLag: this.lagProfiler.getStats(),
       sniperWindow: {
         minRemainingSec: this.config.polymarket.paper.entryMinRemainingSec,
         maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
       },
-      tradingPaused: this.tradingPaused,
-      pauseReason: this.pauseReason || null,
+      tradingPaused: pausePresentation.tradingPaused,
+      pauseReason: pausePresentation.pauseReason,
+      warningState: pausePresentation.warningState,
       mode: this.config.polymarket.mode,
       polyMoney:
         this.config.polymarket.mode !== "paper" &&
         !this.config.polymarket.killSwitch &&
         this.config.polymarket.liveConfirmed,
-      lastAction: this.truthLastAction,
-      holdReason: this.truthHoldReason,
+      lastAction: effectiveLastAction,
+      holdReason: currentWindowHoldReason,
+      currentWindowHoldReason,
+      openTradesCount: paperResolutionStats.openTradesCount,
+      awaitingResolutionCount: paperResolutionStats.awaitingResolutionCount,
+      resolutionErrorCount: paperResolutionStats.resolutionErrorCount,
+      resolutionQueueCount: paperResolutionStats.resolutionQueueCount,
       selection: {
         finalCandidatesCount:
           this.polyState.finalCandidatesCount > 0
             ? this.polyState.finalCandidatesCount
-            : this.truthSelection.finalCandidatesCount,
+            : selectionSnapshot.finalCandidatesCount,
         discoveredCandidatesCount: this.polyState.fetchedCount,
         windowsCount: this.polyState.afterWindowCount,
-        selectedSlug: this.polyState.selectedSlug ?? this.truthSelection.selectedSlug,
-        selectedMarketId: this.polyState.selectedMarketId ?? this.truthSelection.selectedMarketId,
-        windowEndTs: this.truthSelection.windowEndTs,
-        remainingSec:
-          this.truthSelection.windowEndTs && this.truthSelection.windowEndTs > 0
-            ? Math.floor((this.truthSelection.windowEndTs - Date.now()) / 1000)
-            : null
+        selectedSlug: selectionSnapshot.selectedSlug,
+        selectedMarketId: selectionSnapshot.selectedMarketId,
+        windowStartTs: selectionSnapshot.windowStartTs,
+        windowEndTs: selectionSnapshot.windowEndTs,
+        remainingSec: selectionSnapshot.remainingSec,
+        chosenDirection: paperWindowContext?.chosenDirection ?? this.truthChosenDirection,
+        entriesInWindow: paperWindowContext?.entriesInWindow ?? this.truthEntriesInWindow,
+        realizedPnlUsd: paperWindowContext?.realizedPnlUsd ?? this.truthWindowRealizedPnlUsd,
+        resolutionSource: this.truthResolutionSource,
+        lifecycleStatus
       },
       dataHealth: {
         oracleSource: this.polyState.oracleSource ?? this.truthDataHealth.oracleSource,
@@ -519,10 +720,526 @@ export class PolymarketEngine {
         slug: this.truthLastSlug,
         ts: this.truthLastTradeTs
       },
+      openTrade,
+      serverNowTs: nowTs,
+      lastActionTs: effectiveLastActionTs,
       polyEngineRunning,
       lastUpdateTs,
       lastUpdateAgeSec,
       status
+    };
+  }
+
+  private getTickTimestamp(now: string | null | undefined): number {
+    return toMs(now) || Date.now();
+  }
+
+  private getTickActionRoot(action: string | null | undefined): string {
+    return String(action || "")
+      .split(":")[0]
+      .trim()
+      .toUpperCase();
+  }
+
+  private isSelectionRollover(input: Pick<TickLogLine, "selectedSlug" | "currentMarketId" | "windowEnd">): boolean {
+    const nextSelectedSlug =
+      input.selectedSlug !== undefined ? input.selectedSlug : this.truthSelection.selectedSlug;
+    const nextSelectedMarketId =
+      input.currentMarketId !== undefined ? input.currentMarketId : this.truthSelection.selectedMarketId;
+    const nextWindowEndTs =
+      input.windowEnd !== undefined ? input.windowEnd : this.truthSelection.windowEndTs;
+    const hasNextSelection = Boolean(nextSelectedSlug || nextSelectedMarketId);
+    if (!hasNextSelection) {
+      return false;
+    }
+    const prevSelectedSlug = this.truthSelection.selectedSlug ?? this.polyState.selectedSlug ?? null;
+    const prevSelectedMarketId = this.truthSelection.selectedMarketId ?? this.polyState.selectedMarketId ?? null;
+    const prevWindowEndTs = Number(this.truthSelection.windowEndTs || 0) || null;
+    return (
+      nextSelectedSlug !== prevSelectedSlug ||
+      nextSelectedMarketId !== prevSelectedMarketId ||
+      Number(nextWindowEndTs || 0) !== Number(prevWindowEndTs || 0)
+    );
+  }
+
+  private getStatusPausePresentation(
+    tradingPaused: boolean | null | undefined,
+    pauseReason: string | null | undefined
+  ): {
+    tradingPaused: boolean;
+    pauseReason: string | null;
+    warningState: string | null;
+  } {
+    const normalizedPauseReason = String(pauseReason || "")
+      .trim()
+      .toUpperCase();
+    if (
+      this.config.polymarket.mode === "paper" &&
+      tradingPaused &&
+      normalizedPauseReason.includes("NETWORK")
+    ) {
+      return {
+        tradingPaused: false,
+        pauseReason: null,
+        warningState: "NETWORK_ERROR"
+      };
+    }
+    return {
+      tradingPaused: Boolean(tradingPaused),
+      pauseReason: tradingPaused ? (normalizedPauseReason || null) : null,
+      warningState: null
+    };
+  }
+
+  private getTruthSelectionSnapshot(nowTs: number): {
+    finalCandidatesCount: number | null;
+    selectedSlug: string | null;
+    selectedMarketId: string | null;
+    windowStartTs: number | null;
+    windowEndTs: number | null;
+    remainingSec: number | null;
+  } {
+    const selectedSlug = this.truthSelection.selectedSlug ?? null;
+    const selectedMarketId = this.truthSelection.selectedMarketId ?? null;
+    const windowEndTs =
+      Number(this.truthSelection.windowEndTs || 0) > 0 ? Number(this.truthSelection.windowEndTs) : null;
+    const windowStartTs =
+      Number(this.truthSelection.windowStartTs || 0) > 0
+        ? Number(this.truthSelection.windowStartTs)
+        : windowEndTs !== null
+          ? Math.max(0, windowEndTs - FIVE_MIN_SEC * 1000)
+          : null;
+    const hasTrackedSelection = Boolean(selectedSlug || selectedMarketId);
+    const hasActiveSelection = hasTrackedSelection && windowEndTs !== null && windowEndTs > nowTs;
+    const remainingSec = hasActiveSelection ? Math.max(0, Math.floor((windowEndTs - nowTs) / 1000)) : null;
+    return {
+      finalCandidatesCount: this.truthSelection.finalCandidatesCount,
+      selectedSlug: hasActiveSelection ? selectedSlug : null,
+      selectedMarketId: hasActiveSelection ? selectedMarketId : null,
+      windowStartTs: hasActiveSelection ? windowStartTs : null,
+      windowEndTs: hasActiveSelection ? windowEndTs : null,
+      remainingSec
+    };
+  }
+
+  private getPaperLifecycleStatus(
+    nowTs: number,
+    selectionSnapshot: {
+      selectedSlug: string | null;
+      selectedMarketId: string | null;
+      windowEndTs: number | null;
+    }
+  ): string | null {
+    const paperResolutionStats = this.getPaperResolutionStats(nowTs);
+    const hasActiveSelection = Boolean(selectionSnapshot.selectedSlug || selectionSnapshot.selectedMarketId);
+    if (hasActiveSelection) {
+      return paperResolutionStats.openTradesCount > 0 ? "OPEN" : "ACTIVE";
+    }
+    if (paperResolutionStats.openTradesCount > 0) {
+      return "OPEN";
+    }
+    if (paperResolutionStats.awaitingResolutionCount > 0 || this.truthHoldReason === "AWAITING_RESOLUTION") {
+      return "AWAITING_RESOLUTION";
+    }
+    if (paperResolutionStats.resolutionErrorCount > 0) {
+      return "RESOLUTION_ERROR";
+    }
+    if (this.truthLastAction === "RESOLVE" || this.truthLastAction === "CLOSE") {
+      const latestTrade = this.paperLedger
+        .getAllTrades()
+        .slice()
+        .sort((a, b) => Number(b.statusUpdatedAt || b.resolvedAt || b.createdTs || 0) - Number(a.statusUpdatedAt || a.resolvedAt || a.createdTs || 0))[0];
+      return latestTrade ? getPaperTradeStatus(latestTrade) : this.truthLastAction;
+    }
+    if (this.truthLastAction === "OPEN" && paperResolutionStats.openTradesCount > 0) {
+      return "OPEN";
+    }
+    return hasActiveSelection && selectionSnapshot.windowEndTs && selectionSnapshot.windowEndTs > nowTs ? "ACTIVE" : "IDLE";
+  }
+
+  private getPaperResolutionStats(nowTs: number): {
+    openTradesCount: number;
+    awaitingResolutionCount: number;
+    resolutionErrorCount: number;
+    resolutionQueueCount: number;
+  } {
+    if (this.config.polymarket.mode !== "paper") {
+      return {
+        openTradesCount: 0,
+        awaitingResolutionCount: 0,
+        resolutionErrorCount: 0,
+        resolutionQueueCount: 0
+      };
+    }
+    let openTradesCount = 0;
+    let awaitingResolutionCount = 0;
+    let resolutionErrorCount = 0;
+    for (const trade of this.paperLedger.getAllTrades()) {
+      const status = getPaperTradeStatus(trade);
+      const expiryTs = Number(trade.expectedCloseTs || trade.windowEndTs || 0);
+      if (status === "OPEN") {
+        if (expiryTs > 0 && expiryTs <= nowTs) {
+          awaitingResolutionCount += 1;
+        } else {
+          openTradesCount += 1;
+        }
+      } else if (status === "AWAITING_RESOLUTION") {
+        awaitingResolutionCount += 1;
+      } else if (status === "RESOLUTION_ERROR") {
+        resolutionErrorCount += 1;
+      }
+    }
+    return {
+      openTradesCount,
+      awaitingResolutionCount,
+      resolutionErrorCount,
+      resolutionQueueCount: awaitingResolutionCount + resolutionErrorCount
+    };
+  }
+
+  private getCurrentPaperWindowRuntimeContext(nowTs: number): {
+    chosenDirection: string | null;
+    entriesInWindow: number | null;
+    realizedPnlUsd: number | null;
+    holdReason: string | null;
+  } | null {
+    if (this.config.polymarket.mode !== "paper") return null;
+    const marketId = this.truthSelection.selectedMarketId ?? null;
+    const windowStartTs =
+      Number(this.truthSelection.windowStartTs || 0) > 0 ? Number(this.truthSelection.windowStartTs) : null;
+    const windowEndTs =
+      Number(this.truthSelection.windowEndTs || 0) > 0 ? Number(this.truthSelection.windowEndTs) : null;
+    if (!marketId || windowStartTs === null || windowEndTs === null) {
+      return null;
+    }
+    const windowStats = this.getPaperWindowStats(marketId, windowStartTs, windowEndTs);
+    const windowTrades = windowStats.trades;
+    const openWindowTrade = windowTrades.find((row) => getPaperTradeStatus(row) === "OPEN") || null;
+    const lastExitedEarlyTrade =
+      windowTrades
+        .filter((row) => getPaperTradeStatus(row) === "EXITED_EARLY" && Number(row.resolvedAt || 0) > 0)
+        .sort((a, b) => Number(b.resolvedAt || 0) - Number(a.resolvedAt || 0))[0] || null;
+    const cooldownUntilTs =
+      lastExitedEarlyTrade && Number(lastExitedEarlyTrade.resolvedAt || 0) > 0
+        ? Number(lastExitedEarlyTrade.resolvedAt || 0) + this.config.polymarket.paper.reentryCooldownSec * 1000
+        : 0;
+    const latestWindowTrade =
+      windowTrades
+        .slice()
+        .sort(
+          (a, b) =>
+            Number(b.statusUpdatedAt || b.resolvedAt || b.createdTs || 0) -
+            Number(a.statusUpdatedAt || a.resolvedAt || a.createdTs || 0)
+        )[0] || null;
+    return {
+      chosenDirection: latestWindowTrade
+        ? this.getPaperDirectionLabel({
+            side: latestWindowTrade.side,
+            yesDisplayLabel: latestWindowTrade.yesDisplayLabel,
+            noDisplayLabel: latestWindowTrade.noDisplayLabel,
+            marketQuestion: latestWindowTrade.marketQuestion
+          })
+        : this.truthChosenDirection,
+      entriesInWindow: windowStats.entriesTaken,
+      realizedPnlUsd: windowStats.realizedPnlUsd,
+      holdReason:
+        windowEndTs > nowTs && !openWindowTrade && cooldownUntilTs > nowTs
+          ? "REENTRY_COOLDOWN"
+          : null
+    };
+  }
+
+  private buildOpenTradeMonitorSnapshot(nowTs: number): {
+    tradeId: string;
+    marketId: string;
+    marketSlug: string | null;
+    windowStartTs: number;
+    windowEndTs: number;
+    side: "YES" | "NO";
+    direction: string;
+    heldTokenId: string | null;
+    strikePrice: number | null;
+    btcStartPrice: number | null;
+    entryBtcReferencePrice: number | null;
+    btcReferencePrice: number | null;
+    btcReferenceTs: number | null;
+    btcReferenceAgeMs: number | null;
+    btcReferenceStale: boolean;
+    contractEntryPrice: number;
+    contractLivePrice: number | null;
+    impliedProbPct: number | null;
+    bestBid: number | null;
+    bestAsk: number | null;
+    livePrice: number | null;
+    markSource: string | null;
+    markTs: number | null;
+    markAgeMs: number | null;
+    markStale: boolean;
+    isStale: boolean;
+    qty: number;
+    shares: number;
+    entryPrice: number;
+    entryNotionalUsd: number;
+    feesUsd: number;
+    markValueUsd: number | null;
+    unrealizedPnlUsd: number | null;
+  } | null {
+    if (this.config.polymarket.mode !== "paper") return null;
+    const openTrade = this.paperLedger
+      .getOpenTrades()
+      .filter((row) => Number(row.expectedCloseTs || row.windowEndTs || 0) > nowTs)
+      .slice()
+      .sort((a, b) => Number(b.createdTs || 0) - Number(a.createdTs || 0))[0];
+    if (!openTrade) return null;
+
+    const yesSnapshot = this.getCachedYesBookSnapshot(openTrade.marketId, nowTs);
+    const heldTokenId =
+      String(
+        openTrade.heldTokenId ||
+          (openTrade.side === "YES" ? openTrade.yesTokenId : openTrade.noTokenId) ||
+          ""
+      ).trim() || null;
+    const actualHeldSnapshot = heldTokenId ? this.getCachedTokenBookSnapshot(heldTokenId, nowTs) : null;
+    let bestBid: number | null = actualHeldSnapshot?.bestBid ?? null;
+    let bestAsk: number | null = actualHeldSnapshot?.bestAsk ?? null;
+    let livePrice: number | null = actualHeldSnapshot?.mark ?? null;
+    let markSource: string | null = actualHeldSnapshot?.markSource ?? null;
+    let markTs: number | null = actualHeldSnapshot?.bookTs ?? null;
+
+    if (openTrade.side === "YES") {
+      if (yesSnapshot) {
+        bestBid = bestBid ?? (yesSnapshot.yesBid > 0 ? yesSnapshot.yesBid : null);
+        bestAsk = bestAsk ?? (yesSnapshot.yesAsk > 0 ? yesSnapshot.yesAsk : null);
+        livePrice =
+          livePrice ??
+          (bestBid !== null && bestAsk !== null
+            ? clamp((bestBid + bestAsk) / 2, Math.min(bestBid, bestAsk), Math.max(bestBid, bestAsk))
+            : bestBid ?? bestAsk ?? null);
+        markSource =
+          markSource ??
+          (bestBid !== null && bestAsk !== null
+            ? "MID"
+            : bestBid !== null
+              ? "BID_FALLBACK"
+              : bestAsk !== null
+                ? "ASK_FALLBACK"
+                : null);
+        markTs = markTs ?? yesSnapshot.bookTs;
+      }
+    } else if (yesSnapshot) {
+      const derivedNoBid = yesSnapshot.yesAsk > 0 ? estimateNoBidFromYesBook(yesSnapshot.yesAsk) : null;
+      const derivedNoAsk = yesSnapshot.yesBid > 0 ? estimateNoAskFromYesBook(yesSnapshot.yesBid) : null;
+      bestBid = bestBid ?? derivedNoBid;
+      bestAsk = bestAsk ?? derivedNoAsk;
+      livePrice =
+        livePrice ??
+        (bestBid !== null && bestAsk !== null
+          ? clamp((bestBid + bestAsk) / 2, Math.min(bestBid, bestAsk), Math.max(bestBid, bestAsk))
+          : bestBid ?? bestAsk ?? null);
+      markSource =
+        markSource ??
+        (bestBid !== null && bestAsk !== null
+          ? "DERIVED_NO_MID"
+          : bestBid !== null
+            ? "DERIVED_NO_BID_FALLBACK"
+            : bestAsk !== null
+              ? "DERIVED_NO_ASK_FALLBACK"
+              : null);
+      markTs = markTs ?? yesSnapshot.bookTs;
+    }
+
+    const entryNotionalUsd = Math.max(0, Number(openTrade.entryCostUsd || openTrade.notionalUsd || 0));
+    const feesUsd = Math.max(0, Number(openTrade.feesUsd || 0));
+    const qty = Math.max(0, Number(openTrade.qty || 0));
+    const markValueUsd = livePrice !== null ? qty * livePrice : null;
+    const unrealizedPnlUsd = markValueUsd !== null ? markValueUsd - entryNotionalUsd - feesUsd : null;
+    const markAgeMs = markTs !== null && markTs > 0 ? Math.max(0, nowTs - markTs) : null;
+    const staleThresholdMs = Math.max(5_000, this.config.polymarket.risk.staleMs);
+    const cachedThresholdMs = Math.max(staleThresholdMs, this.config.polymarket.loopMs * 2);
+    const isStale = markAgeMs !== null ? markAgeMs > staleThresholdMs : true;
+    const btcReferencePrice =
+      Number(this.lastOracleSnapshot?.price || 0) > 0
+        ? Number(this.lastOracleSnapshot?.price || 0)
+        : Number(openTrade.referencePriceAtEntry || 0) > 0
+          ? Number(openTrade.referencePriceAtEntry || 0)
+          : null;
+    const btcReferenceTs =
+      toMs(this.lastOracleSnapshot?.rawTs || 0) > 0
+        ? toMs(this.lastOracleSnapshot?.rawTs || 0)
+        : Number(openTrade.entryTs || openTrade.createdTs || 0) > 0
+          ? Number(openTrade.entryTs || openTrade.createdTs || 0)
+          : null;
+    const btcReferenceAgeMs =
+      btcReferenceTs !== null && btcReferenceTs > 0 ? Math.max(0, nowTs - btcReferenceTs) : null;
+    const btcReferenceStale =
+      btcReferenceAgeMs !== null ? btcReferenceAgeMs > Math.max(5_000, this.config.polymarket.risk.staleMs) : true;
+    const contractEntryPrice = Math.max(0, Number(openTrade.entryPrice || 0));
+    const contractLivePrice = livePrice;
+    const impliedProbPct = contractLivePrice !== null ? contractLivePrice * 100 : null;
+    const btcStartPrice =
+      Number(openTrade.referencePriceAtEntry || 0) > 0 ? Number(openTrade.referencePriceAtEntry) : null;
+    if (livePrice === null) {
+      markSource = "UNAVAILABLE";
+    } else if (markAgeMs !== null && markAgeMs > cachedThresholdMs) {
+      markSource = prefixCachedMarkSource(markSource);
+    }
+    return {
+      tradeId: openTrade.id,
+      marketId: openTrade.marketId,
+      marketSlug: openTrade.marketSlug || null,
+      windowStartTs: openTrade.windowStartTs,
+      windowEndTs: openTrade.windowEndTs,
+      side: openTrade.side,
+      direction: this.getPaperDirectionLabel({
+        side: openTrade.side,
+        yesDisplayLabel: openTrade.yesDisplayLabel,
+        noDisplayLabel: openTrade.noDisplayLabel,
+        marketQuestion: openTrade.marketQuestion
+      }),
+      heldTokenId,
+      strikePrice: Number(openTrade.priceToBeat || 0) > 0 ? Number(openTrade.priceToBeat) : null,
+      btcStartPrice,
+      entryBtcReferencePrice:
+        Number(openTrade.referencePriceAtEntry || 0) > 0 ? Number(openTrade.referencePriceAtEntry) : null,
+      btcReferencePrice,
+      btcReferenceTs,
+      btcReferenceAgeMs,
+      btcReferenceStale,
+      contractEntryPrice,
+      contractLivePrice,
+      impliedProbPct,
+      bestBid,
+      bestAsk,
+      livePrice,
+      markSource,
+      markTs,
+      markAgeMs,
+      markStale: isStale,
+      isStale,
+      qty,
+      shares: qty,
+      entryPrice: contractEntryPrice,
+      entryNotionalUsd,
+      feesUsd,
+      markValueUsd,
+      unrealizedPnlUsd
+    };
+  }
+
+  private getPaperTakeProfitUsd(remainingSec: number): number {
+    if (remainingSec >= 240) return this.config.polymarket.paper.takeProfitUsdGte240;
+    if (remainingSec >= 180) return this.config.polymarket.paper.takeProfitUsdGte180;
+    if (remainingSec >= 120) return this.config.polymarket.paper.takeProfitUsdGte120;
+    if (remainingSec >= 60) return this.config.polymarket.paper.takeProfitUsdGte60;
+    if (remainingSec >= this.config.polymarket.paper.entryMinRemainingSec) {
+      return this.config.polymarket.paper.takeProfitUsdGte45;
+    }
+    return this.config.polymarket.paper.takeProfitUsdGte45;
+  }
+
+  private getPaperTrailingRetraceFraction(remainingSec: number): number {
+    if (remainingSec > 180) return this.config.polymarket.paper.trailingRetraceFracGt180;
+    if (remainingSec >= 60) return this.config.polymarket.paper.trailingRetraceFracGte60;
+    return this.config.polymarket.paper.trailingRetraceFracLt60;
+  }
+
+  private getPaperWindowStats(marketId: string, windowStartTs: number, windowEndTs: number): {
+    trades: ReturnType<PaperLedger["getTradesForWindow"]>;
+    entriesTaken: number;
+    realizedPnlUsd: number;
+  } {
+    const trades = this.paperLedger.getTradesForWindow(marketId, windowStartTs, windowEndTs);
+    const realizedPnlUsd = trades
+      .filter((trade) => Boolean(trade.resolvedAt))
+      .reduce((sum, trade) => sum + Number(trade.pnlUsd || 0), 0);
+    return {
+      trades,
+      entriesTaken: trades.length,
+      realizedPnlUsd
+    };
+  }
+
+  private updateTruthWindowContextFromTrade(
+    trade: {
+      marketId: string;
+      marketSlug?: string;
+      marketQuestion?: string;
+      windowStartTs: number;
+      windowEndTs: number;
+      side: "YES" | "NO";
+      yesDisplayLabel?: string;
+      noDisplayLabel?: string;
+    },
+    resolutionSource?: string | null
+  ): void {
+    const windowStats = this.getPaperWindowStats(trade.marketId, trade.windowStartTs, trade.windowEndTs);
+    this.truthChosenDirection = this.getPaperDirectionLabel({
+      side: trade.side,
+      yesDisplayLabel: trade.yesDisplayLabel,
+      noDisplayLabel: trade.noDisplayLabel,
+      marketQuestion: trade.marketQuestion
+    });
+    this.truthEntriesInWindow = windowStats.entriesTaken;
+    this.truthWindowRealizedPnlUsd = windowStats.realizedPnlUsd;
+    if (resolutionSource !== undefined) {
+      this.truthResolutionSource = resolutionSource;
+    }
+    if (trade.marketSlug) {
+      this.truthSelection.selectedSlug = trade.marketSlug;
+    }
+    this.truthSelection.selectedMarketId = trade.marketId;
+    this.truthSelection.windowStartTs = trade.windowStartTs;
+    this.truthSelection.windowEndTs = trade.windowEndTs;
+  }
+
+  private getPaperDirectionLabel(input: {
+    side: "YES" | "NO";
+    yesDisplayLabel?: string | null;
+    noDisplayLabel?: string | null;
+    marketQuestion?: string | null;
+  }): string {
+    const yesLabel = normalizeDirectionalDisplayLabel(input.yesDisplayLabel, input.marketQuestion, "YES");
+    const noLabel = normalizeDirectionalDisplayLabel(input.noDisplayLabel, input.marketQuestion, "NO");
+    return input.side === "YES" ? yesLabel : noLabel;
+  }
+
+  private choosePaperEntrySide(input: {
+    netEdgeYes: number;
+    netEdgeNo: number;
+    pUpModel: number;
+  }): PaperSideChoice {
+    const diff = Number(input.netEdgeYes) - Number(input.netEdgeNo);
+    if (diff > 1e-9) {
+      return { chosenSide: "YES", chooserReason: "NET_EDGE_YES_GT_NO" };
+    }
+    if (diff < -1e-9) {
+      return { chosenSide: "NO", chooserReason: "NET_EDGE_NO_GT_YES" };
+    }
+    if (input.pUpModel > 0.5005) {
+      return { chosenSide: "YES", chooserReason: "PUP_GT_50_TIEBREAK" };
+    }
+    if (input.pUpModel < 0.4995) {
+      return { chosenSide: "NO", chooserReason: "PDOWN_GT_50_TIEBREAK" };
+    }
+    return { chosenSide: null, chooserReason: "EDGE_TIE_NO_DIRECTION" };
+  }
+
+  private buildPaperResolutionHints(trade: {
+    marketQuestion?: string;
+    yesDisplayLabel?: string;
+    noDisplayLabel?: string;
+  }): Pick<PolymarketMarketResolution, "yesOutcomeMapped" | "noOutcomeMapped"> {
+    return {
+      yesOutcomeMapped: normalizeDirectionalDisplayLabel(
+        trade.yesDisplayLabel,
+        trade.marketQuestion,
+        "YES"
+      ) as "UP" | "DOWN",
+      noOutcomeMapped: normalizeDirectionalDisplayLabel(
+        trade.noDisplayLabel,
+        trade.marketQuestion,
+        "NO"
+      ) as "UP" | "DOWN"
     };
   }
 
@@ -631,13 +1348,714 @@ export class PolymarketEngine {
     return cadence === 5 && symbol === "BTC-USD";
   }
 
+  private makePaperIntervalKey(marketId: string, intervalStartTs: number, intervalEndTs: number): string {
+    return `${marketId}:${intervalStartTs}:${intervalEndTs}`;
+  }
+
+  private prunePaperIntervalDecisions(nowTs: number): void {
+    const cutoffTs = nowTs - 3 * 60 * 60 * 1000;
+    for (const [key, memo] of this.paperDecisionByIntervalKey.entries()) {
+      if (memo.decidedAt < cutoffTs) {
+        this.paperDecisionByIntervalKey.delete(key);
+      }
+    }
+  }
+
+  private writePaperIntervalEvent(
+    event: string,
+    nowTs: number,
+    payload: Record<string, unknown> = {},
+    level: "info" | "warn" = "info"
+  ): void {
+    this.writePaperTradeLog({
+      ts: new Date(nowTs).toISOString(),
+      event,
+      ...payload
+    });
+    const loggerPayload = {
+      event,
+      ...payload
+    };
+    if (level === "warn") {
+      this.logger.warn(loggerPayload, `POLY_PAPER_${event}`);
+      return;
+    }
+    this.logger.info(loggerPayload, `POLY_PAPER_${event}`);
+  }
+
+  private notePaperIntervalSelection(interval: PaperIntervalContext | null, nowTs: number): void {
+    const nextKey = interval?.key ?? null;
+    if (
+      this.lastPaperIntervalKey &&
+      this.lastPaperIntervalEndTs &&
+      nowTs >= this.lastPaperIntervalEndTs &&
+      this.lastPaperIntervalKey !== nextKey
+    ) {
+      this.writePaperIntervalEvent("INTERVAL_EXPIRED", nowTs, {
+        intervalKey: this.lastPaperIntervalKey,
+        intervalEndTs: this.lastPaperIntervalEndTs
+      });
+    }
+    if (interval && nextKey !== this.lastPaperIntervalKey) {
+      this.cachedPaperIntervalsBySlug.set(interval.slug, { ...interval, market: { ...interval.market } });
+      this.writePaperIntervalEvent(this.lastPaperIntervalKey ? "NEXT_INTERVAL_SELECTED" : "INTERVAL_SELECTED", nowTs, {
+        intervalKey: interval.key,
+        marketId: interval.marketId,
+        slug: interval.slug,
+        intervalStartTs: interval.intervalStartTs,
+        intervalEndTs: interval.intervalEndTs,
+        remainingSec: interval.remainingSec
+      });
+    }
+    this.lastPaperIntervalKey = nextKey;
+    this.lastPaperIntervalEndTs = interval?.intervalEndTs ?? null;
+  }
+
+  private getCachedPaperInterval(slug: string, nowTs: number): PaperIntervalContext | null {
+    const cached = this.cachedPaperIntervalsBySlug.get(slug);
+    if (!cached) {
+      return null;
+    }
+    if (cached.intervalEndTs <= nowTs || cached.intervalStartTs - FIVE_MIN_SEC * 1000 > nowTs) {
+      return null;
+    }
+    return {
+      ...cached,
+      market: { ...cached.market },
+      remainingSec: Math.max(0, Math.floor((cached.intervalEndTs - nowTs) / 1000))
+    };
+  }
+
+  private async selectPaperInterval(nowTs: number): Promise<PaperIntervalSelection> {
+    const nowStartSec = windowTs(nowTs);
+    const previousStartSec = nowStartSec - FIVE_MIN_SEC;
+    const attemptedSlugs = [slugForTs(nowStartSec), slugForTs(previousStartSec)];
+    for (const slug of attemptedSlugs) {
+      let raw: Record<string, unknown> | null = null;
+      try {
+        raw = await this.client.getActiveMarketBySlug(slug);
+      } catch (error) {
+        this.logger.warn(
+          {
+            slug,
+            error: this.shortErrorText(error)
+          },
+          "POLY_PAPER_INTERVAL_FETCH_FAILED"
+        );
+      }
+      if (!raw) {
+        continue;
+      }
+      const startSec = parseBtc5mWindowStartSec(slug) ?? nowStartSec;
+      const intervalStartTs = startSec * 1000;
+      const intervalEndTs = (startSec + FIVE_MIN_SEC) * 1000;
+      const parsed = parseRawMarketToBtcWindow(raw, nowTs, intervalEndTs, this.lastOracleSnapshot?.price ?? null);
+      if (!parsed) {
+        continue;
+      }
+      const market = this.applyWindowState(
+        {
+          ...parsed,
+          startTs: intervalStartTs,
+          endTs: intervalEndTs
+        },
+        nowTs
+      );
+      const remainingSec = Math.floor((intervalEndTs - nowTs) / 1000);
+      if (
+        remainingSec <= 0 ||
+        market.closed ||
+        !slug.startsWith("btc-updown-5m-")
+      ) {
+        continue;
+      }
+      return {
+        interval: {
+          key: this.makePaperIntervalKey(market.marketId, intervalStartTs, intervalEndTs),
+          marketId: market.marketId,
+          slug,
+          yesTokenId: market.yesTokenId,
+          noTokenId: String(market.noTokenId || "").trim(),
+          intervalStartTs,
+          intervalEndTs,
+          remainingSec,
+          priceToBeat: market.priceToBeat,
+          market
+        },
+        selectedReason: slug === attemptedSlugs[0] ? "btc5m_current_interval" : "btc5m_previous_interval",
+        dominantReject: "OK",
+        attemptedSlugs
+      };
+    }
+    const cachedCurrentInterval = this.getCachedPaperInterval(attemptedSlugs[0], nowTs);
+    if (cachedCurrentInterval) {
+      return {
+        interval: cachedCurrentInterval,
+        selectedReason: "btc5m_cached_current_interval",
+        dominantReject: "FETCH_STALE",
+        attemptedSlugs
+      };
+    }
+    return {
+      interval: null,
+      selectedReason: "btc5m_not_found",
+      dominantReject: "NO_ACTIVE_BTC5M_MARKET",
+      attemptedSlugs
+    };
+  }
+
+  private async runPaperIntervalEngine(nowTs: number): Promise<void> {
+    this.prunePaperIntervalDecisions(nowTs);
+    await this.resolvePaperTrades(nowTs);
+
+    const selection = await this.selectPaperInterval(nowTs);
+    const interval = selection.interval;
+    this.notePaperIntervalSelection(interval, nowTs);
+
+    this.selectedTokenIds = interval ? [interval.yesTokenId, interval.noTokenId].filter(Boolean) : [];
+
+    const openTradesBefore = this.paperLedger.getOpenTrades();
+    const resolutionQueueBefore = this.paperLedger.getResolutionQueueTrades();
+    const shouldEstimateOracle =
+      Boolean(interval) || openTradesBefore.length > 0 || resolutionQueueBefore.length > 0;
+    let oracleEst = 0;
+    let oracleAgeMs = 0;
+    let sigmaPricePerSqrtSec = 0;
+    let sigmaPerSqrtSec = 0;
+    let oracleState: OracleState | "IDLE" = "IDLE";
+    let oracleSource = "none";
+    let oracleTs: number | null = null;
+    let oracleStaleMs: number | null = null;
+
+    if (shouldEstimateOracle) {
+      const oracle = await this.oracleRouter.getOracleNow(nowTs);
+      const oracleRawTsMs = toMs(oracle.rawTs);
+      this.lastOracleSnapshot = oracle;
+      oracleState = oracle.state;
+      oracleSource = oracle.source;
+      oracleTs = oracleRawTsMs > 0 ? oracleRawTsMs : null;
+      oracleStaleMs = Number.isFinite(oracle.staleMs) ? oracle.staleMs : null;
+      if (oracle.price > 0 && oracleRawTsMs > 0) {
+        oracleEst = oracle.price;
+        this.volEstimator.update(oracle.price, oracleRawTsMs);
+        this.recordOracleSample(oracle.price, oracleRawTsMs, oracle.source);
+        const vol = this.volEstimator.getEstimate(oracle.price, nowTs);
+        sigmaPricePerSqrtSec = vol.sigmaPricePerSqrtSec;
+        sigmaPerSqrtSec = vol.sigmaPerSqrtSec;
+        if (!(sigmaPricePerSqrtSec > 0) && oracle.fallbackSigmaPricePerSqrtSec > 0) {
+          sigmaPricePerSqrtSec = oracle.fallbackSigmaPricePerSqrtSec;
+          sigmaPerSqrtSec = oracleEst > 0 ? sigmaPricePerSqrtSec / oracleEst : 0;
+        }
+        oracleAgeMs = Math.max(0, nowTs - oracleRawTsMs);
+      } else {
+        oracleAgeMs = Number.POSITIVE_INFINITY;
+      }
+    }
+
+    const discoveryTickFields = {
+      discoveredCandidates: interval ? 1 : 0,
+      fetchedCount: interval ? 1 : 0,
+      afterActiveCount: interval ? 1 : 0,
+      afterSearchCount: interval ? 1 : 0,
+      afterWindowCount: interval ? 1 : 0,
+      afterPatternCount: interval ? 1 : 0,
+      finalCandidatesCount: interval ? 1 : 0,
+      fallbackUsed: "none" as const,
+      selectedReason: selection.selectedReason,
+      selectedScore: null,
+      rejectCountsByStage: createRejectCountsByStage(),
+      dominantReject: selection.dominantReject,
+      windowRejectCounters: createWindowRejectCounters(),
+      windowReject: interval ? null : selection.dominantReject,
+      minWindowSec: this.config.polymarket.paper.entryMinRemainingSec,
+      maxWindowSec: this.config.polymarket.paper.entryMaxRemainingSec,
+      acceptedSampleCount: interval ? 1 : 0,
+      sampleRejected: [] as RejectSample[]
+    };
+
+    if (!interval) {
+      const openTrades = this.paperLedger.getOpenTrades().length;
+      const awaitingResolutionCount = this.paperLedger.getResolutionQueueTrades().length;
+      this.maybeEmitTickLog({
+        marketsSeen: openTrades > 0 ? 1 : 0,
+        ...discoveryTickFields,
+        activeWindows: 0,
+        now: new Date(nowTs).toISOString(),
+        currentMarketId: null,
+        tauSec: null,
+        priceToBeat: null,
+        oracleEst: oracleEst > 0 ? oracleEst : null,
+        sigma: sigmaPricePerSqrtSec > 0 ? sigmaPricePerSqrtSec : null,
+        yesBid: null,
+        yesAsk: null,
+        yesMid: null,
+        pUpModel: null,
+        edge: null,
+        threshold: null,
+        action: "HOLD",
+        holdReason: selection.dominantReject || "NO_ACTIVE_BTC5M_MARKET",
+        holdDetailReason: selection.dominantReject,
+        chosenDirection: null,
+        size: null,
+        openTrades,
+        awaitingResolutionCount,
+        resolutionQueueCount: awaitingResolutionCount,
+        resolvedTrades: this.paperLedger.getResolvedTrades().length,
+        entriesInWindow: 0,
+        windowRealizedPnlUsd: 0,
+        oracleSource,
+        oracleTs,
+        oracleStaleMs,
+        oracleState,
+        selectedSlug: null,
+        windowStart: null,
+        windowEnd: null,
+        acceptingOrders: null,
+        enableOrderBook: null
+      });
+      return;
+    }
+
+    const market = interval.market;
+    const implied = await this.getImpliedYesBook(market, {
+      isSelectedMarket: true,
+      remainingSec: interval.remainingSec
+    });
+    const polyUpdateAgeMs = implied.bookTs > 0 ? Math.max(0, nowTs - implied.bookTs) : 0;
+    const paperSoftOracleStaleAllowed =
+      oracleState === "ORACLE_STALE" && polyUpdateAgeMs <= this.config.polymarket.risk.staleMs;
+
+    if (paperSoftOracleStaleAllowed) {
+      this.logger.warn(
+        {
+          marketId: market.marketId,
+          slug: interval.slug,
+          oracleState,
+          oracleSource,
+          oracleTs,
+          oracleStaleMs,
+          polyUpdateAgeMs
+        },
+        "Paper mode allowing interval entry despite ORACLE_STALE because the selected BTC5m book is fresh"
+      );
+    }
+
+    let noAsk = estimateNoAskFromYesBook(implied.yesBid);
+    let noTopAskSize = 0;
+    if (market.noTokenId) {
+      const noQuote = await this.getNoAskAndDepthFromTokenId(market.noTokenId, noAsk);
+      noAsk = noQuote.noAsk;
+      noTopAskSize = noQuote.topAskSize;
+    }
+
+    const fastMidSnapshot = this.oracleRouter.getFastMidNow(nowTs);
+    const fastMidNow =
+      fastMidSnapshot && fastMidSnapshot.price > 0
+        ? fastMidSnapshot.price
+        : oracleEst > 0
+          ? oracleEst
+          : 0;
+    const lagStatsSnapshot = this.lagProfiler.getStats();
+    const lagPolyP90Ms = lagStatsSnapshot.metrics.polyUpdateAgeMs.p90;
+    const shortReturn = this.computeShortReturn(nowTs, 45);
+    const realizedVolPricePerSqrtSec = this.computeRealizedVolPricePerSqrtSec(
+      nowTs,
+      fastMidNow > 0 ? fastMidNow : oracleEst,
+      sigmaPricePerSqrtSec,
+      300
+    );
+    const tauSec = interval.remainingSec;
+    const orderBook = {
+      marketId: market.marketId,
+      tokenId: market.yesTokenId,
+      yesBid: implied.yesBid,
+      yesAsk: implied.yesAsk,
+      yesMid: implied.yesMid,
+      spread: implied.spread,
+      bids: [],
+      asks: [],
+      ts: nowTs
+    };
+    const prob = this.probModel.computeAdaptive({
+      oracleEst: fastMidNow > 0 ? fastMidNow : oracleEst,
+      priceToBeat: market.priceToBeat,
+      tauSec,
+      cadenceSec: this.config.polymarket.marketQuery.cadenceMinutes * 60,
+      shortReturn,
+      realizedVolPricePerSqrtSec
+    });
+    const decision = this.strategy.decide({
+      pUpModel: prob.pUpModel,
+      orderBook,
+      sigmaPerSqrtSec,
+      tauSec
+    });
+    const calibrated = this.probModel.computeExpiryProbCalibrated({
+      fastMid: fastMidNow > 0 ? fastMidNow : oracleEst,
+      priceToBeat: market.priceToBeat,
+      sigmaPricePerSqrtSec,
+      tauSec,
+      polyUpdateAgeMs,
+      lagPolyP90Ms,
+      oracleAgeMs: oracleAgeMs > 0 && Number.isFinite(oracleAgeMs) ? oracleAgeMs : 0
+    });
+
+    this.lagProfiler.record({
+      tsMs: nowTs,
+      windowSlug: interval.slug,
+      tauSec,
+      priceToBeat: market.priceToBeat,
+      fastMid: fastMidNow > 0 ? fastMidNow : null,
+      oraclePrice: oracleEst > 0 ? oracleEst : null,
+      oracleUpdatedAtMs: oracleTs ?? null,
+      yesBid: implied.yesBid,
+      yesAsk: implied.yesAsk,
+      yesMid: implied.yesMid,
+      impliedProbMid: implied.yesMid,
+      pModel: prob.pUpModel,
+      absProbGap: Math.abs(prob.pUpModel - implied.yesMid)
+    });
+
+    this.latestPolymarketSnapshot = {
+      ts: nowTs,
+      windowSlug: interval.slug,
+      tauSec,
+      priceToBeat: market.priceToBeat,
+      fastMid: fastMidNow > 0 ? fastMidNow : null,
+      yesMid: implied.yesMid,
+      impliedProbMid: implied.yesMid
+    };
+    this.latestModelSnapshot = {
+      ts: nowTs,
+      pBase: calibrated.pBase,
+      pBoosted: calibrated.pBoosted,
+      z: calibrated.z,
+      d: calibrated.d,
+      sigma: calibrated.sigma,
+      tauSec: calibrated.tauSec,
+      polyUpdateAgeMs: calibrated.polyUpdateAgeMs,
+      lagPolyP90Ms: calibrated.lagPolyP90Ms,
+      oracleAgeMs: calibrated.oracleAgeMs,
+      boostApplied: calibrated.boostApplied,
+      boostReason: calibrated.boostReason
+    };
+    this.polyState.lastModelTs = nowTs;
+
+    await this.managePaperOpenPositions({
+      nowTs,
+      market,
+      implied,
+      edgeYes: prob.pUpModel - (decision.yesAsk > 0 ? decision.yesAsk : decision.yesMid),
+      edgeNo: (1 - prob.pUpModel) - noAsk,
+      costPenaltyProb:
+        (this.config.polymarket.paper.feeBps + this.config.polymarket.paper.slippageBps) / 10_000 +
+        Math.max(0, decision.spread) / 2,
+      remainingSec: tauSec
+    });
+
+    const yesEntryPrice = decision.yesAsk > 0 ? decision.yesAsk : decision.yesMid;
+    const noEntryPrice = noAsk > 0 ? noAsk : estimateNoAskFromYesBook(decision.yesBid);
+    const feeBps = this.config.polymarket.paper.feeBps;
+    const slippageBps = this.config.polymarket.paper.slippageBps;
+    const spreadProxy = Math.max(0, decision.spread) / 2;
+    const costPenaltyProb = Math.max(0, feeBps + slippageBps) / 10_000 + spreadProxy;
+    const edgeYes = prob.pUpModel - yesEntryPrice;
+    const edgeNo = (1 - prob.pUpModel) - noEntryPrice;
+    const netEdgeYes = edgeYes - costPenaltyProb;
+    const netEdgeNo = edgeNo - costPenaltyProb;
+    const sideChoice = this.choosePaperEntrySide({
+      netEdgeYes,
+      netEdgeNo,
+      pUpModel: prob.pUpModel
+    });
+    const chosenSide = sideChoice.chosenSide;
+    const chosenDirection =
+      chosenSide === null
+        ? null
+        : this.getPaperDirectionLabel({
+            side: chosenSide,
+            yesDisplayLabel: market.yesDisplayLabel,
+            noDisplayLabel: market.noDisplayLabel,
+            marketQuestion: market.question
+          });
+    const chosenEdge = chosenSide === "YES" ? edgeYes : chosenSide === "NO" ? edgeNo : 0;
+    const signedEdge = chosenSide === "YES" ? edgeYes : chosenSide === "NO" ? -edgeNo : 0;
+    const netEdgeAfterCosts =
+      chosenSide === "YES" ? netEdgeYes : chosenSide === "NO" ? netEdgeNo : Number.NEGATIVE_INFINITY;
+    const chosenAsk = chosenSide === "YES" ? yesEntryPrice : chosenSide === "NO" ? noEntryPrice : 0;
+    const stalenessEdge = this.computeStalenessEdge(market.marketId, decision.yesMid, oracleEst, nowTs);
+    const conviction = clamp(Math.abs(prob.pUpModel - decision.yesMid) + stalenessEdge, 0, 0.9999);
+    const extremeLow = this.config.polymarket.paper.extremeLowPrice;
+    const extremeHigh = this.config.polymarket.paper.extremeHighPrice;
+    const isExtremePrice = chosenSide !== null && (chosenAsk <= extremeLow || chosenAsk >= extremeHigh);
+    const pForExtreme = calibrated.pBoosted;
+    const probExtreme = this.config.polymarket.paper.probExtreme;
+    const hasExtremeModel =
+      chosenSide === "YES"
+        ? pForExtreme >= probExtreme
+        : chosenSide === "NO"
+          ? pForExtreme <= 1 - probExtreme
+          : false;
+
+    const decisionMemo = this.paperDecisionByIntervalKey.get(interval.key) || null;
+    const windowStats = this.getPaperWindowStats(
+      interval.marketId,
+      interval.intervalStartTs,
+      interval.intervalEndTs
+    );
+    const windowTrades = windowStats.trades;
+    const openWindowTrade = windowTrades.find((row) => getPaperTradeStatus(row) === "OPEN") || null;
+    const lastExitedEarlyTrade = windowTrades
+      .filter((row) => getPaperTradeStatus(row) === "EXITED_EARLY" && Number(row.resolvedAt || 0) > 0)
+      .sort((a, b) => Number(b.resolvedAt || 0) - Number(a.resolvedAt || 0))[0] || null;
+    const reentryCooldownUntilTs =
+      lastExitedEarlyTrade && Number(lastExitedEarlyTrade.resolvedAt || 0) > 0
+        ? Number(lastExitedEarlyTrade.resolvedAt || 0) + this.config.polymarket.paper.reentryCooldownSec * 1000
+        : 0;
+    const cooldownActive = reentryCooldownUntilTs > nowTs;
+    const intervalEligibleForEntry =
+      tauSec > 0 &&
+      tauSec >= this.config.polymarket.paper.entryMinRemainingSec &&
+      tauSec <= this.config.polymarket.paper.entryMaxRemainingSec &&
+      tauSec >= this.config.polymarket.risk.noNewOrdersInLastSec;
+
+    let action = "HOLD";
+    let holdReason: string | null = null;
+    let holdDetailReason: string | null = null;
+    let executedSize: number | null = null;
+
+    if (!intervalEligibleForEntry) {
+      holdReason = tauSec <= 0 ? "EXPIRED_WINDOW" : "TOO_LATE_FOR_ENTRY";
+      holdDetailReason = holdReason;
+    } else if (openWindowTrade) {
+      holdReason = "OPEN_POSITION_IN_WINDOW";
+      holdDetailReason = holdReason;
+    } else if (cooldownActive) {
+      holdReason = "REENTRY_COOLDOWN";
+      holdDetailReason = holdReason;
+    } else {
+      if (oracleState !== "OK" && !(oracleState === "ORACLE_STALE" && paperSoftOracleStaleAllowed)) {
+        holdReason = normalizeHoldReason(oracleState) || "ORACLE_UNAVAILABLE";
+        holdDetailReason = holdReason;
+      } else if (!chosenSide) {
+        holdReason = "EDGE_BELOW_THRESHOLD";
+        holdDetailReason = sideChoice.chooserReason;
+      } else if (!isExtremePrice || !hasExtremeModel) {
+        holdReason = "EDGE_BELOW_THRESHOLD";
+        holdDetailReason = holdReason;
+      } else {
+        const openOrderCount = 0;
+        const totalExposureUsd = this.paperLedger
+          .getOpenTrades()
+          .reduce((sum, row) => sum + row.entryCostUsd + row.feesUsd, 0);
+        const concurrentWindows = new Set(this.paperLedger.getOpenTrades().map((row) => row.marketId)).size;
+        const paperOpenNotional = this.paperLedger.getOpenNotionalForMarket(market.marketId);
+        const remainingWindowBudget = Math.max(
+          0,
+          Math.min(
+            this.config.polymarket.sizing.maxNotionalPerWindow,
+            this.config.polymarket.paper.maxNotionalPerWindow - paperOpenNotional
+          )
+        );
+        const remainingExposureBudget = Math.max(0, this.config.polymarket.risk.maxExposure - totalExposureUsd);
+        const sidePrice = chosenSide === "YES" ? decision.yesAsk : noAsk;
+        const sideProb = chosenSide === "YES" ? prob.pUpModel : 1 - prob.pUpModel;
+        const topAskDepthShares = chosenSide === "YES" ? implied.topAskSize : noTopAskSize;
+        const depthCapNotionalUsd =
+          topAskDepthShares > 0 ? topAskDepthShares * Math.max(0.0001, sidePrice) * 0.35 : 0;
+        const size = this.sizing.compute({
+          edge: Math.max(0, netEdgeAfterCosts),
+          pUpModel: sideProb,
+          yesAsk: sidePrice,
+          conviction,
+          remainingSec: tauSec,
+          entryMaxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec,
+          depthCapNotionalUsd,
+          remainingWindowBudget,
+          remainingExposureBudget,
+          remainingDailyLossBudget: this.risk.getRemainingDailyLossBudget()
+        });
+        const requiredNetEdge = Math.max(
+          this.config.polymarket.paper.minNetEdge,
+          this.config.polymarket.paper.minEdgeThreshold,
+          decision.threshold
+        );
+        if (!(netEdgeAfterCosts > requiredNetEdge)) {
+          holdReason = "EDGE_BELOW_THRESHOLD";
+          holdDetailReason = holdReason;
+        } else if (!(size.notionalUsd > 0)) {
+          holdReason = "EDGE_BELOW_THRESHOLD";
+          holdDetailReason = holdReason;
+        } else {
+          const check = this.risk.checkNewOrder({
+            tauSec,
+            oracleAgeMs,
+            projectedOrderNotionalUsd: size.notionalUsd,
+            openOrders: openOrderCount,
+            totalExposureUsd,
+            concurrentWindows
+          });
+          if (!check.ok) {
+            holdReason = check.reason || "RISK_BLOCKED";
+            holdDetailReason = holdReason;
+          } else {
+            const accepted = this.executePaperTrade({
+              marketId: market.marketId,
+              marketSlug: interval.slug,
+              marketQuestion: market.question,
+              referenceSymbol: this.config.polymarket.marketQuery.symbol,
+              windowStartTs: interval.intervalStartTs,
+              windowEndTs: interval.intervalEndTs,
+              priceToBeat: market.priceToBeat,
+              referencePriceAtEntry: fastMidNow > 0 ? fastMidNow : oracleEst,
+              side: chosenSide,
+              yesTokenId: market.yesTokenId,
+              noTokenId: market.noTokenId,
+              yesDisplayLabel: market.yesDisplayLabel,
+              noDisplayLabel: market.noDisplayLabel,
+              yesBid: decision.yesBid,
+              yesAsk: decision.yesAsk,
+              noAsk,
+              edge: netEdgeAfterCosts,
+              pBase: calibrated.pBase,
+              pBoosted: calibrated.pBoosted,
+              boostApplied: calibrated.boostApplied,
+              boostReason: calibrated.boostReason,
+              requestedNotionalUsd: size.notionalUsd,
+              ts: nowTs
+            });
+            if (accepted) {
+              action = chosenSide === "YES" ? "BUY_YES" : "BUY_NO";
+              executedSize = size.notionalUsd;
+              this.paperDecisionByIntervalKey.set(interval.key, {
+                decidedAt: nowTs,
+                action: "ENTRY_OPENED",
+                reason: "ENTRY_OPENED"
+              });
+              this.writePaperIntervalEvent("ENTRY_OPENED", nowTs, {
+                intervalKey: interval.key,
+                marketId: interval.marketId,
+                slug: interval.slug,
+                side: chosenSide,
+                direction: chosenDirection,
+                chooserReason: sideChoice.chooserReason,
+                edgeYes,
+                edgeNo,
+                netEdgeYes,
+                netEdgeNo,
+                notionalUsd: size.notionalUsd,
+                entryPrice: chosenSide === "YES" ? decision.yesAsk : noAsk
+              });
+            } else {
+              holdReason = "ENTRY_REJECTED";
+              holdDetailReason = holdReason;
+            }
+          }
+        }
+      }
+      if (
+        action === "HOLD" &&
+        holdReason &&
+        (!decisionMemo ||
+          decisionMemo.action !== "ENTRY_SKIPPED" ||
+          decisionMemo.reason !== holdReason)
+      ) {
+        this.paperDecisionByIntervalKey.set(interval.key, {
+          decidedAt: nowTs,
+          action: "ENTRY_SKIPPED",
+          reason: holdReason
+        });
+        this.writePaperIntervalEvent("ENTRY_SKIPPED", nowTs, {
+          intervalKey: interval.key,
+          marketId: interval.marketId,
+          slug: interval.slug,
+          reason: holdReason,
+          chooserReason: sideChoice.chooserReason,
+          edgeYes,
+          edgeNo,
+          netEdgeYes,
+          netEdgeNo,
+          chosenSide,
+          chosenDirection
+        });
+      }
+    }
+
+    if (action === "HOLD" && !holdReason) {
+      holdReason = "EDGE_BELOW_THRESHOLD";
+      holdDetailReason = "EDGE_BELOW_THRESHOLD";
+    }
+
+    const postDecisionWindowStats =
+      action === "HOLD"
+        ? windowStats
+        : this.getPaperWindowStats(interval.marketId, interval.intervalStartTs, interval.intervalEndTs);
+    const openTrades = this.paperLedger.getOpenTrades().length;
+    const awaitingResolutionCount = this.paperLedger.getResolutionQueueTrades().length;
+    const resolvedTrades = this.paperLedger.getResolvedTrades().length;
+    this.maybeEmitTickLog({
+      marketsSeen: 1,
+      ...discoveryTickFields,
+      activeWindows: 1,
+      now: new Date(nowTs).toISOString(),
+      currentMarketId: interval.marketId,
+      tauSec,
+      priceToBeat: market.priceToBeat,
+      oracleEst: oracleEst > 0 ? oracleEst : null,
+      sigma: sigmaPricePerSqrtSec > 0 ? sigmaPricePerSqrtSec : null,
+      yesBid: decision.yesBid,
+      yesAsk: decision.yesAsk,
+      yesMid: decision.yesMid,
+      pUpModel: prob.pUpModel,
+      pBase: calibrated.pBase,
+      pBoosted: calibrated.pBoosted,
+      z: calibrated.z,
+      d: calibrated.d,
+      sigmaCalibrated: calibrated.sigma,
+      polyUpdateAgeMs: calibrated.polyUpdateAgeMs,
+      lagPolyP90Ms: calibrated.lagPolyP90Ms,
+      boostApplied: calibrated.boostApplied,
+      boostReason: calibrated.boostReason,
+      edge: signedEdge,
+      edgeYes,
+      edgeNo,
+      chosenSide,
+      chosenDirection,
+      chosenEdge,
+      conviction,
+      stalenessEdge,
+      netEdgeAfterCosts,
+      threshold: decision.threshold,
+      action,
+      holdReason,
+      holdDetailReason,
+      size: executedSize,
+      openTrades,
+      awaitingResolutionCount,
+      resolutionQueueCount: awaitingResolutionCount,
+      resolvedTrades,
+      entriesInWindow: postDecisionWindowStats.entriesTaken,
+      windowRealizedPnlUsd: postDecisionWindowStats.realizedPnlUsd,
+      oracleSource,
+      oracleTs,
+      oracleStaleMs,
+      oracleState,
+      selectedSlug: interval.slug,
+      windowStart: interval.intervalStartTs,
+      windowEnd: interval.intervalEndTs,
+      acceptingOrders: market.acceptingOrders ?? null,
+      enableOrderBook: market.enableOrderBook ?? null
+    });
+  }
+
   private async runOnce(_tickStartedTs: number): Promise<void> {
     const nowTs = Date.now();
+    this.syncPaperLedgerFromDisk();
     await this.execution.refreshLiveState();
     await this.fetchAttempt(nowTs);
 
     if (this.risk.isKillSwitchActive()) {
-      if (this.canMutateVenueState()) {
+      if (this.config.polymarket.mode === "live" && this.canMutateVenueState()) {
         await this.execution.cancelAll("KILL_SWITCH_ACTIVE");
       }
       this.maybeEmitTickLog({
@@ -673,6 +2091,11 @@ export class PolymarketEngine {
         acceptingOrders: null,
         enableOrderBook: null
       });
+      return;
+    }
+
+    if (this.config.polymarket.mode === "paper" && this.isDeterministicBtc5mMode()) {
+      await this.runPaperIntervalEngine(nowTs);
       return;
     }
 
@@ -772,10 +2195,11 @@ export class PolymarketEngine {
           markets = [];
           selectedSlug = null;
         } else if (outsideSniperRange) {
-          dominantReject = "window_outside_sniper_range";
-          selectedReason = "btc5m_window_out_of_range";
+          dominantReject = remainingSec <= 0 ? "EXPIRED_WINDOW" : "window_outside_sniper_range";
+          selectedReason = remainingSec <= 0 ? "btc5m_window_expired" : "btc5m_window_out_of_range";
           selectedMarket = null;
           markets = [];
+          selectedSlug = null;
         } else {
           dominantReject = "OK";
           selectedReason = deterministicBtc5mMode ? "btc5m_deterministic_slug" : "market_selected";
@@ -925,7 +2349,16 @@ export class PolymarketEngine {
       await this.resolvePaperTrades(nowTs);
 
       if (oracleUnavailable) {
-        this.setTradingPaused(true, oracleState, nowTs);
+        const shouldPauseForOracle =
+          this.config.polymarket.mode === "live" || oracleState === "ORACLE_UNAVAILABLE";
+        if (shouldPauseForOracle) {
+          this.setTradingPaused(true, oracleState, nowTs);
+        } else if (
+          this.tradingPaused &&
+          (this.pauseReason === "ORACLE_STALE" || this.pauseReason === "ORACLE_UNAVAILABLE")
+        ) {
+          this.setTradingPaused(false, "PAPER_SOFT_ORACLE_STALE", nowTs);
+        }
       } else if (
         oracleState === "OK" &&
         (this.pauseReason === "ORACLE_STALE" ||
@@ -1038,9 +2471,13 @@ export class PolymarketEngine {
           forceTradeFired && paperMode
             ? "FORCE_TRADE"
             : hydratedMarkets.length === 0
-              ? dominantReject === "BTC5M_NOT_FOUND"
-                ? "BTC5M_NOT_FOUND"
-                : "NO_WINDOWS"
+              ? this.paperLedger.getOpenTrades().length > 0
+                ? "AWAITING_RESOLUTION"
+                : dominantReject === "EXPIRED_WINDOW"
+                  ? "EXPIRED_WINDOW"
+                  : dominantReject === "BTC5M_NOT_FOUND"
+                    ? "NO_ACTIVE_BTC5M_MARKET"
+                    : "NO_WINDOWS"
               : normalizeHoldReason(oracleState),
         holdDetailReason: dominantReject,
         forceTradeFired,
@@ -1326,6 +2763,10 @@ export class PolymarketEngine {
         minEdgeThreshold
       );
       const forceTrade = paperMode && this.config.polymarket.paper.forceTrade;
+      const paperSoftOracleStaleAllowed =
+        paperMode &&
+        oracleState === "ORACLE_STALE" &&
+        polyUpdateAgeMs <= this.config.polymarket.risk.staleMs;
       const bypassBaseAndSpreadChecks = forceTrade;
       const requiredNetEdge = forceTrade
         ? Number.NEGATIVE_INFINITY
@@ -1462,11 +2903,18 @@ export class PolymarketEngine {
         canAttemptTrade = false;
         blockReason = "YES_MID_OUT_OF_RANGE";
       }
-      if (paperMode && oracleState !== "OK") {
+      if (
+        paperMode &&
+        oracleState !== "OK" &&
+        !(oracleState === "ORACLE_STALE" && paperSoftOracleStaleAllowed)
+      ) {
         action = "HOLD";
         executedSize = 0;
         canAttemptTrade = false;
-        blockReason = oracleState;
+        blockReason =
+          oracleState === "ORACLE_STALE" && polyUpdateAgeMs > this.config.polymarket.risk.staleMs
+            ? "ORACLE_STALE_BOOK_STALE"
+            : oracleState;
       }
       if (
         paperMode &&
@@ -1521,21 +2969,10 @@ export class PolymarketEngine {
           canAttemptTrade = false;
           blockReason = "WINDOW_ALREADY_OPEN";
         } else if (windowTrades.length > 0) {
-          const profitableClosures = windowTrades.filter((row) => Number(row.pnlUsd || 0) > 0).length;
-          const hasNonProfitableClose = windowTrades.some(
-            (row) => row.resolvedAt && Number(row.pnlUsd || 0) <= 0
-          );
-          const allowSingleReentry =
-            profitableClosures >= 1 &&
-            !hasNonProfitableClose &&
-            windowTrades.length < 2 &&
-            remainingSec > this.config.polymarket.paper.entryMinRemainingSec;
-          if (!allowSingleReentry) {
-            action = "HOLD";
-            executedSize = 0;
-            canAttemptTrade = false;
-            blockReason = "WINDOW_ALREADY_TRADED";
-          }
+          action = "HOLD";
+          executedSize = 0;
+          canAttemptTrade = false;
+          blockReason = "WINDOW_ALREADY_TRADED";
         }
       }
       if (this.tradingPaused) {
@@ -1551,6 +2988,20 @@ export class PolymarketEngine {
           executedSize = 0;
           blockReason = "KILL_SWITCH";
         } else {
+          if (paperSoftOracleStaleAllowed) {
+            this.logger.warn(
+              {
+                marketId: market.marketId,
+                slug: market.eventSlug || market.slug || null,
+                oracleState,
+                oracleSource,
+                oracleTs,
+                oracleStaleMs,
+                polyUpdateAgeMs
+              },
+              "Paper mode allowing entry despite ORACLE_STALE because the selected BTC5m book is fresh"
+            );
+          }
           const check = this.risk.checkNewOrder({
             tauSec,
             oracleAgeMs,
@@ -1563,7 +3014,11 @@ export class PolymarketEngine {
           if (!check.ok) {
             action = "HOLD";
             executedSize = 0;
-            if (check.reason?.startsWith("KILL_SWITCH") && this.canMutateVenueState()) {
+            if (
+              check.reason?.startsWith("KILL_SWITCH") &&
+              this.config.polymarket.mode === "live" &&
+              this.canMutateVenueState()
+            ) {
               await this.execution.cancelAll(check.reason);
             }
             blockReason = check.reason || "RISK_BLOCKED";
@@ -1703,6 +3158,8 @@ export class PolymarketEngine {
         marketId: market.marketId,
         slug: market.eventSlug || market.slug || selectedSlug || undefined,
         selectedSlug: selectedSlug || null,
+        candidatesCount: discoveredCandidates,
+        windowsCount: stageCounts.afterWindowCount,
         tauSec,
         remainingSec,
         priceToBeat: market.priceToBeat,
@@ -1735,6 +3192,7 @@ export class PolymarketEngine {
         threshold: decision.threshold,
         action: blockReason ? `${action}:${blockReason}` : action,
         holdReason: holdReason || undefined,
+        holdDetailReason: action === "HOLD" ? (blockReason || dominantReject || undefined) : undefined,
         size: executedSize,
         mode: this.config.polymarket.mode,
         openTrades: openTradesCount,
@@ -1773,7 +3231,7 @@ export class PolymarketEngine {
       if (!this.risk.isKillSwitchActive()) {
         this.risk.triggerKillSwitch("MAX_EXPOSURE_REACHED");
       }
-      if (this.canMutateVenueState()) {
+      if (this.config.polymarket.mode === "live" && this.canMutateVenueState()) {
         await this.execution.cancelAll("MAX_EXPOSURE_REACHED");
       }
       this.logger.error(
@@ -1789,12 +3247,17 @@ export class PolymarketEngine {
   private executePaperTrade(params: {
     marketId: string;
     marketSlug?: string;
+    marketQuestion?: string;
+    referenceSymbol?: string;
     windowStartTs: number;
     windowEndTs: number;
     priceToBeat: number;
+    referencePriceAtEntry?: number;
     side: "YES" | "NO";
     yesTokenId: string;
     noTokenId?: string;
+    yesDisplayLabel?: string;
+    noDisplayLabel?: string;
     yesBid: number;
     yesAsk: number;
     noAsk?: number;
@@ -1870,6 +3333,8 @@ export class PolymarketEngine {
     const trade = this.paperLedger.recordTrade({
       marketId: params.marketId,
       marketSlug: params.marketSlug,
+      marketQuestion: params.marketQuestion,
+      referenceSymbol: params.referenceSymbol,
       windowStartTs: params.windowStartTs,
       windowEndTs: params.windowEndTs,
       side: params.side,
@@ -1881,12 +3346,22 @@ export class PolymarketEngine {
       feesUsd,
       entryCostUsd,
       priceToBeat: params.priceToBeat,
+      referencePriceAtEntry: params.referencePriceAtEntry,
       yesTokenId,
       noTokenId,
+      yesDisplayLabel: params.yesDisplayLabel,
+      noDisplayLabel: params.noDisplayLabel,
       heldTokenId,
       createdTs: params.ts
     });
     const openSummary = this.paperLedger.getSummary(params.ts);
+    const direction = this.getPaperDirectionLabel({
+      side: trade.side,
+      yesDisplayLabel: trade.yesDisplayLabel,
+      noDisplayLabel: trade.noDisplayLabel,
+      marketQuestion: trade.marketQuestion
+    });
+    this.updateTruthWindowContextFromTrade(trade, null);
 
     this.writePaperTradeLog({
       ts: new Date(params.ts).toISOString(),
@@ -1896,7 +3371,9 @@ export class PolymarketEngine {
       marketId: trade.marketId,
       marketSlug: trade.marketSlug || null,
       side: trade.side,
-      entryPrice: trade.entryPrice,
+      direction,
+      contractEntryPrice: trade.entryPrice,
+      btcReferencePrice: trade.referencePriceAtEntry ?? null,
       qty: trade.qty,
       notionalUsd: trade.notionalUsd,
       feesUsd: trade.feesUsd,
@@ -1925,14 +3402,16 @@ export class PolymarketEngine {
         marketId: trade.marketId,
         marketSlug: trade.marketSlug || null,
         side: trade.side,
+        direction,
         entryStyle: useTakerEntry ? "TAKER" : "MAKER_LIMIT",
-        entryPrice: trade.entryPrice,
+        contractEntryPrice: trade.entryPrice,
+        btcReferencePrice: trade.referencePriceAtEntry ?? null,
         qty: trade.qty,
         notionalUsd: trade.notionalUsd,
         feesUsd: trade.feesUsd,
         pnlUsd: null
       },
-      `POLY_TRADE event=OPEN mode=PAPER tradeId=${trade.id} slug=${String(trade.marketSlug || "-")} side=${trade.side} notionalUsd=${trade.notionalUsd.toFixed(2)} pnlUsd=- forced=${params.forced ? "1" : "0"}`
+      `POLY_TRADE event=OPEN mode=PAPER tradeId=${trade.id} slug=${String(trade.marketSlug || "-")} side=${trade.side} direction=${direction} contractEntryPrice=${trade.entryPrice.toFixed(4)} btcReferencePrice=${trade.referencePriceAtEntry ? trade.referencePriceAtEntry.toFixed(2) : "-"} notionalUsd=${trade.notionalUsd.toFixed(2)} pnlUsd=- forced=${params.forced ? "1" : "0"}`
     );
     return true;
   }
@@ -1985,16 +3464,26 @@ export class PolymarketEngine {
         exitPrice,
         feeBps: trade.feeBps
       });
-      const priceDelta = exitPrice - trade.entryPrice;
+      const bestUnrealizedPnlUsd = Math.max(
+        Number(this.paperBestUnrealizedPnlUsdByTradeId.get(trade.id) || Number.NEGATIVE_INFINITY),
+        mtm.pnlUsd
+      );
+      this.paperBestUnrealizedPnlUsdByTradeId.set(trade.id, bestUnrealizedPnlUsd);
+      const takeProfitUsd = this.getPaperTakeProfitUsd(params.remainingSec);
+      const retraceFraction = this.getPaperTrailingRetraceFraction(params.remainingSec);
+      const unrealizedRetraceUsd = Math.max(0, bestUnrealizedPnlUsd - mtm.pnlUsd);
+      const trailingRetraceTriggered =
+        bestUnrealizedPnlUsd >= this.config.polymarket.paper.trailingMinProfitUsd &&
+        mtm.pnlUsd > 0 &&
+        unrealizedRetraceUsd >= bestUnrealizedPnlUsd * retraceFraction;
 
-      let closeReason: "STOP_LOSS" | "TAKE_PROFIT" | "TIME_EXIT_PROFIT" | null = null;
+      let closeReason: "STOP_LOSS" | "TAKE_PROFIT" | "TIME_EXIT_PROFIT" | "TRAILING_RETRACE" | null = null;
       if (negativeTicks >= this.config.polymarket.paper.stopLossConsecutiveTicks) {
         closeReason = "STOP_LOSS";
-      } else if (
-        mtm.pnlUsd >= this.config.polymarket.paper.takeProfitUsd ||
-        priceDelta >= this.config.polymarket.paper.takeProfitDelta
-      ) {
+      } else if (mtm.pnlUsd >= takeProfitUsd) {
         closeReason = "TAKE_PROFIT";
+      } else if (trailingRetraceTriggered) {
+        closeReason = "TRAILING_RETRACE";
       } else if (
         params.remainingSec < this.config.polymarket.risk.noNewOrdersInLastSec &&
         mtm.pnlUsd > 0
@@ -2009,7 +3498,7 @@ export class PolymarketEngine {
 
   private closePaperTrade(
     tradeId: string,
-    closeReason: "STOP_LOSS" | "TAKE_PROFIT" | "TIME_EXIT_PROFIT" | "MANUAL",
+    closeReason: "STOP_LOSS" | "TAKE_PROFIT" | "TIME_EXIT_PROFIT" | "TRAILING_RETRACE" | "MANUAL",
     exitPrice: number,
     mtm: { exitProceedsUsd: number; exitFeesUsd: number; pnlUsd: number },
     nowTs: number
@@ -2025,16 +3514,26 @@ export class PolymarketEngine {
     });
     if (!closed) return;
     this.paperStopLossTicksByTradeId.delete(tradeId);
+    this.paperBestUnrealizedPnlUsdByTradeId.delete(tradeId);
     const closeSummary = this.paperLedger.getSummary(nowTs);
-    const result = classifyPaperResult(mtm.pnlUsd);
+      const result = classifyPaperResult(mtm.pnlUsd);
+    const direction = this.getPaperDirectionLabel({
+      side: closed.side,
+      yesDisplayLabel: closed.yesDisplayLabel,
+      noDisplayLabel: closed.noDisplayLabel,
+      marketQuestion: closed.marketQuestion
+    });
+    this.updateTruthWindowContextFromTrade(closed, "PAPER_EXIT");
 
     this.writePaperTradeLog({
       ts: new Date(nowTs).toISOString(),
-      event: "TRADE_CLOSED",
+      event: "EXITED_EARLY",
       tradeId: closed.id,
       marketId: closed.marketId,
       marketSlug: closed.marketSlug || null,
       side: closed.side,
+      direction,
+      status: getPaperTradeStatus(closed),
       closeReason,
       exitPrice,
       exitProceedsUsd: mtm.exitProceedsUsd,
@@ -2061,12 +3560,14 @@ export class PolymarketEngine {
         marketId: closed.marketId,
         marketSlug: closed.marketSlug || null,
         side: closed.side,
+        direction,
+        status: getPaperTradeStatus(closed),
         closeReason,
         exitPrice,
         notionalUsd: closed.notionalUsd,
         pnlUsd: mtm.pnlUsd
       },
-      `POLY_TRADE event=CLOSED mode=PAPER tradeId=${closed.id} slug=${String(closed.marketSlug || "-")} side=${closed.side} notionalUsd=${closed.notionalUsd.toFixed(2)} pnlUsd=${mtm.pnlUsd.toFixed(2)} reason=${closeReason}`
+      `POLY_TRADE event=EXITED_EARLY mode=PAPER tradeId=${closed.id} slug=${String(closed.marketSlug || "-")} side=${closed.side} direction=${direction} notionalUsd=${closed.notionalUsd.toFixed(2)} pnlUsd=${mtm.pnlUsd.toFixed(2)} reason=${closeReason}`
     );
   }
 
@@ -2127,7 +3628,10 @@ export class PolymarketEngine {
   private mapOutcomeToWinningTokenId(
     outcome: "UP" | "DOWN",
     tradeMapping: { yesTokenId: string; noTokenId: string },
-    marketResolution: PolymarketMarketResolution | null
+    marketResolution:
+      | Pick<PolymarketMarketResolution, "yesOutcomeMapped" | "noOutcomeMapped">
+      | PolymarketMarketResolution
+      | null
   ): string {
     const yesOutcome = marketResolution?.yesOutcomeMapped ?? null;
     const noOutcome = marketResolution?.noOutcomeMapped ?? null;
@@ -2143,7 +3647,10 @@ export class PolymarketEngine {
   private deriveOutcomeFromWinningTokenId(
     winningTokenId: string,
     tradeMapping: { yesTokenId: string; noTokenId: string },
-    marketResolution: PolymarketMarketResolution | null
+    marketResolution:
+      | Pick<PolymarketMarketResolution, "yesOutcomeMapped" | "noOutcomeMapped">
+      | PolymarketMarketResolution
+      | null
   ): "UP" | "DOWN" {
     if (winningTokenId === tradeMapping.yesTokenId) {
       return marketResolution?.yesOutcomeMapped ?? "UP";
@@ -2154,14 +3661,319 @@ export class PolymarketEngine {
     return "UP";
   }
 
+  private getOfficialWinningTokenId(
+    tradeMapping: { yesTokenId: string; noTokenId: string },
+    marketResolution: PolymarketMarketResolution | null
+  ): string | null {
+    const directWinner =
+      marketResolution?.winningTokenId &&
+      (marketResolution.winningTokenId === tradeMapping.yesTokenId ||
+        marketResolution.winningTokenId === tradeMapping.noTokenId)
+        ? marketResolution.winningTokenId
+        : null;
+    if (directWinner) return directWinner;
+    if (marketResolution?.winningSide === "YES") return tradeMapping.yesTokenId;
+    if (marketResolution?.winningSide === "NO") return tradeMapping.noTokenId;
+    if (marketResolution?.winningOutcome) {
+      return this.mapOutcomeToWinningTokenId(marketResolution.winningOutcome, tradeMapping, marketResolution);
+    }
+    return null;
+  }
+
+  private hasOfficialMarketWinner(marketResolution: PolymarketMarketResolution | null): boolean {
+    return Boolean(
+      marketResolution &&
+        (marketResolution.winningTokenId || marketResolution.winningSide || marketResolution.winningOutcome)
+    );
+  }
+
+  private isMarketStillOpenForPaperResolution(context: PolymarketMarketContext | null): boolean {
+    if (!context) return false;
+    if (context.closed) return false;
+    if (context.active === false) return false;
+    return true;
+  }
+
+  private shortErrorText(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message || error.name || "error";
+    }
+    const raw = String(error || "error").trim();
+    return raw || "error";
+  }
+
+  private upsertPaperTradeLifecycle(
+    tradeId: string,
+    input: {
+      status: "OPEN" | "AWAITING_RESOLUTION" | "RESOLUTION_ERROR";
+      nowTs: number;
+      statusReason: string;
+      statusDetail: string;
+      awaitingResolutionSinceTs?: number | null;
+      resolutionAttempts?: number;
+      resolutionError?: string | null;
+      resolutionContextState?: "TRADING_OPEN" | "CLOSED_AWAITING_OUTCOME" | "FETCH_FAILED";
+    }
+  ): { trade: ReturnType<PaperLedger["getTrade"]>; changed: boolean } {
+    const current = this.paperLedger.getTrade(tradeId);
+    if (!current) {
+      return {
+        trade: null,
+        changed: false
+      };
+    }
+    const currentStatus = getPaperTradeStatus(current);
+    const same =
+      currentStatus === input.status &&
+      String(current.statusReason || "") === input.statusReason &&
+      String(current.statusDetail || "") === input.statusDetail &&
+      Number(current.awaitingResolutionSinceTs || 0) === Number(input.awaitingResolutionSinceTs || 0) &&
+      Number(current.resolutionAttempts || 0) === Number(input.resolutionAttempts || 0) &&
+      String(current.resolutionError || "") === String(input.resolutionError || "") &&
+      String(current.resolutionContextState || "") === String(input.resolutionContextState || "");
+    if (same) {
+      return {
+        trade: current,
+        changed: false
+      };
+    }
+    const updated = this.paperLedger.updateTradeStatus({
+      tradeId,
+      status: input.status,
+      statusUpdatedAt: input.nowTs,
+      statusReason: input.statusReason,
+      statusDetail: input.statusDetail,
+      awaitingResolutionSinceTs: input.awaitingResolutionSinceTs ?? null,
+      lastResolutionAttemptTs: input.nowTs,
+      resolutionAttempts: input.resolutionAttempts,
+      resolutionError: input.resolutionError ?? null,
+      resolutionErrorAt: input.resolutionError ? input.nowTs : null,
+      resolutionContextState: input.resolutionContextState
+    });
+    return {
+      trade: updated,
+      changed: Boolean(updated)
+    };
+  }
+
+  private async getPaperFallbackReferencePrice(nowTs: number): Promise<number | null> {
+    const fastMid = this.oracleRouter.getFastMidNow(nowTs);
+    if (fastMid && fastMid.price > 0) {
+      return fastMid.price;
+    }
+    try {
+      const oracle = await this.oracleRouter.getOracleNow(nowTs);
+      if (oracle.price > 0) {
+        return oracle.price;
+      }
+    } catch {
+      // Fallback below.
+    }
+    const lastOraclePrice = Number(this.lastOracleSnapshot?.price || 0);
+    return lastOraclePrice > 0 ? lastOraclePrice : null;
+  }
+
+  private async resolvePaperTradeWithDerivedFallback(
+    trade: ReturnType<PaperLedger["getTrade"]> extends infer T ? NonNullable<T> : never,
+    tokenMapping: { heldSide: "YES" | "NO"; heldTokenId: string; yesTokenId: string; noTokenId: string },
+    nowTs: number,
+    reason: string,
+    detail: string
+  ): Promise<boolean> {
+    const referencePrice = await this.getPaperFallbackReferencePrice(nowTs);
+    if (!(referencePrice && referencePrice > 0)) {
+      const errorText = "Derived fallback reference price unavailable";
+      this.upsertPaperTradeLifecycle(trade.id, {
+        status: "RESOLUTION_ERROR",
+        nowTs,
+        statusReason: "DERIVED_FALLBACK_UNAVAILABLE",
+        statusDetail: errorText,
+        resolutionAttempts: Math.max(1, Number(trade.resolutionAttempts || 0)),
+        resolutionError: errorText,
+        resolutionContextState: "FETCH_FAILED"
+      });
+      this.writePaperIntervalEvent("RESOLUTION_ERROR", nowTs, {
+        tradeId: trade.id,
+        marketId: trade.marketId,
+        slug: trade.marketSlug || null,
+        statusReason: "DERIVED_FALLBACK_UNAVAILABLE",
+        statusDetail: errorText
+      }, "warn");
+      return false;
+    }
+
+    const derivedOutcome = inferOutcomeFromOracle(referencePrice, Number(trade.priceToBeat || 0));
+    const winningTokenId = this.mapOutcomeToWinningTokenId(
+      derivedOutcome,
+      tokenMapping,
+      this.buildPaperResolutionHints(trade)
+    );
+    const settlement = computePaperBinarySettlementPnl({
+      qty: trade.qty,
+      entryPrice: trade.entryPrice,
+      notionalUsd: trade.notionalUsd,
+      entryCostUsd: trade.entryCostUsd,
+      feesUsd: trade.feesUsd,
+      heldSide: tokenMapping.heldSide,
+      heldTokenId: tokenMapping.heldTokenId,
+      yesTokenId: tokenMapping.yesTokenId,
+      noTokenId: tokenMapping.noTokenId,
+      winningTokenId
+    });
+    const resolved = this.paperLedger.resolveTrade({
+      tradeId: trade.id,
+      resolvedAt: nowTs,
+      outcome: derivedOutcome,
+      payoutUsd: settlement.exitPayoutUsd,
+      pnlUsd: settlement.pnlUsd,
+      winningTokenId,
+      winningOutcomeText: derivedOutcome,
+      oracleAtEnd: referencePrice,
+      resolutionSource: "DERIVED_FALLBACK",
+      statusReason: reason,
+      statusDetail: detail
+    });
+    if (!resolved) {
+      return false;
+    }
+    this.validateResolvedPaperSettlement(resolved);
+    const resolveSummary = this.paperLedger.getSummary(nowTs);
+    const result = classifyPaperResult(settlement.pnlUsd);
+    const tradeDirection = this.getPaperDirectionLabel({
+      side: trade.side,
+      yesDisplayLabel: trade.yesDisplayLabel,
+      noDisplayLabel: trade.noDisplayLabel,
+      marketQuestion: trade.marketQuestion
+    });
+    const winningSide = winningTokenId === tokenMapping.yesTokenId ? "YES" : "NO";
+    const winningDirection = this.getPaperDirectionLabel({
+      side: winningSide,
+      yesDisplayLabel: trade.yesDisplayLabel,
+      noDisplayLabel: trade.noDisplayLabel,
+      marketQuestion: trade.marketQuestion
+    });
+    this.updateTruthWindowContextFromTrade(resolved, "DERIVED_FALLBACK");
+    this.resolutionPendingLogByTradeId.delete(trade.id);
+    this.paperStopLossTicksByTradeId.delete(trade.id);
+    this.paperBestUnrealizedPnlUsdByTradeId.delete(trade.id);
+    this.writePaperIntervalEvent(getPaperTradeStatus(resolved), nowTs, {
+      tradeId: resolved.id,
+      marketId: resolved.marketId,
+      slug: resolved.marketSlug || null,
+      side: resolved.side,
+      winner: derivedOutcome,
+      winningTokenId,
+      qty: resolved.qty,
+      entryCostUsd: resolved.entryCostUsd,
+      exitPayoutUsd: settlement.exitPayoutUsd,
+      pnlUsd: settlement.pnlUsd,
+      referencePrice: referencePrice,
+      strikePrice: resolved.priceToBeat,
+      resolutionSource: "DERIVED_FALLBACK",
+      result,
+      cumulativePnlUsd: resolveSummary.totalPnlUsd,
+      wins: resolveSummary.wins,
+      losses: resolveSummary.losses,
+      winRate: resolveSummary.winRate
+    });
+    this.emitPolymarketTruth({
+      ts: nowTs,
+      force: true,
+      action: "RESOLVE",
+      tradeId: resolved.id,
+      slug: resolved.marketSlug || null
+    });
+    this.logger.warn(
+      {
+        tradeId: resolved.id,
+        marketId: resolved.marketId,
+        marketSlug: resolved.marketSlug || null,
+        side: resolved.side,
+        direction: tradeDirection,
+        outcome: derivedOutcome,
+        winningDirection,
+        winningTokenId,
+        payoutUsd: settlement.exitPayoutUsd,
+        notionalUsd: resolved.notionalUsd,
+        pnlUsd: settlement.pnlUsd,
+        referencePrice,
+        strikePrice: resolved.priceToBeat,
+        resolutionSource: "DERIVED_FALLBACK",
+        result
+      },
+      `POLY_TRADE event=${getPaperTradeStatus(resolved)} mode=PAPER tradeId=${resolved.id} slug=${String(resolved.marketSlug || "-")} side=${resolved.side} notionalUsd=${resolved.notionalUsd.toFixed(2)} pnlUsd=${settlement.pnlUsd.toFixed(2)} reason=DERIVED_FALLBACK`
+    );
+    return true;
+  }
+
+  private validateResolvedPaperSettlement(trade: {
+    id: string;
+    marketId: string;
+    marketSlug?: string;
+    entryPrice: number;
+    qty: number;
+    notionalUsd: number;
+    entryCostUsd: number;
+    feesUsd: number;
+    payoutUsd?: number;
+    exitProceedsUsd?: number;
+  }): void {
+    const bounds = getPaperBinarySettlementBounds({
+      qty: trade.qty,
+      entryPrice: trade.entryPrice,
+      entryCostUsd: trade.entryCostUsd,
+      notionalUsd: trade.notionalUsd
+    });
+    const payoutUsd = Math.max(0, Number(trade.exitProceedsUsd ?? trade.payoutUsd ?? 0));
+    if (payoutUsd < bounds.minPayoutUsd - 1e-9 || payoutUsd > bounds.maxPayoutUsd + 1e-9) {
+      this.logger.error(
+        {
+          tradeId: trade.id,
+          marketId: trade.marketId,
+          marketSlug: trade.marketSlug || null,
+          payoutUsd,
+          minPayoutUsd: bounds.minPayoutUsd,
+          maxPayoutUsd: bounds.maxPayoutUsd,
+          shareCount: bounds.shareCount,
+          entryPrice: trade.entryPrice,
+          entryCostUsd: trade.entryCostUsd,
+          feesUsd: trade.feesUsd
+        },
+        "POLY_PAPER_INVALID_BINARY_PAYOUT"
+      );
+    }
+  }
+
   private async resolvePaperTrades(nowTs: number): Promise<void> {
     if (this.config.polymarket.mode !== "paper") {
       return;
     }
 
-    const openTrades = this.paperLedger.getOpenTrades();
-    for (const trade of openTrades) {
-      const targetTs = trade.windowEndTs + this.config.polymarket.paper.resolveGraceMs;
+    const activeTrades = this.paperLedger.getActiveTrades();
+    for (const trade of activeTrades) {
+      const expiryTs = trade.expectedCloseTs || trade.windowEndTs;
+      if (expiryTs <= nowTs && getPaperTradeStatus(trade) === "OPEN") {
+        const statusUpdate = this.upsertPaperTradeLifecycle(trade.id, {
+          status: "AWAITING_RESOLUTION",
+          nowTs,
+          statusReason: "EXPIRED_WINDOW",
+          statusDetail: "Market window expired; awaiting official market outcome",
+          awaitingResolutionSinceTs: expiryTs,
+          resolutionAttempts: Math.max(0, Number(trade.resolutionAttempts || 0)),
+          resolutionError: null,
+          resolutionContextState: "CLOSED_AWAITING_OUTCOME"
+        });
+        if (statusUpdate.changed) {
+          this.writePaperIntervalEvent("AWAITING_RESOLUTION", nowTs, {
+            tradeId: trade.id,
+            marketId: trade.marketId,
+            slug: trade.marketSlug || null,
+            intervalEndTs: expiryTs,
+            reason: "EXPIRED_WINDOW"
+          });
+        }
+      }
+      const targetTs = expiryTs + this.config.polymarket.paper.resolveGraceMs;
       if (targetTs > nowTs) continue;
 
       const tokenMapping = this.getPaperTradeTokenMapping(trade);
@@ -2181,78 +3993,246 @@ export class PolymarketEngine {
         continue;
       }
 
-      let marketResolution: PolymarketMarketResolution | null = null;
+      const nextResolutionAttempts = Math.max(0, Number(trade.resolutionAttempts || 0)) + 1;
+      let marketContext: PolymarketMarketContext | null = null;
       try {
-        marketResolution = await this.client.getMarketResolution(trade.marketId);
-      } catch {
-        marketResolution = null;
+        marketContext = await this.client.getMarketContext(trade.marketId);
+      } catch (error) {
+        const errorText = this.shortErrorText(error);
+        const fallbackResolved = await this.resolvePaperTradeWithDerivedFallback(
+          trade,
+          tokenMapping,
+          nowTs,
+          "DERIVED_FALLBACK_AFTER_FETCH_FAILED",
+          `Derived fallback used after exact market fetch failed: ${errorText}`
+        );
+        if (!fallbackResolved) {
+          const statusUpdate = this.upsertPaperTradeLifecycle(trade.id, {
+            status: "RESOLUTION_ERROR",
+            nowTs,
+            statusReason: "RESOLUTION_FETCH_FAILED",
+            statusDetail: `Exact market fetch failed: ${errorText}`,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: errorText,
+            resolutionContextState: "FETCH_FAILED"
+          });
+          const loggedTrade = statusUpdate.trade || trade;
+          this.logger.warn(
+            {
+              tradeId: loggedTrade.id,
+              marketId: loggedTrade.marketId,
+              marketSlug: loggedTrade.marketSlug || null,
+              status: "RESOLUTION_ERROR",
+              resolutionAttempts: nextResolutionAttempts,
+              error: errorText
+            },
+            "POLY_PAPER_RESOLUTION_FETCH_FAILED"
+          );
+          this.writePaperIntervalEvent("RESOLUTION_ERROR", nowTs, {
+            tradeId: loggedTrade.id,
+            marketId: loggedTrade.marketId,
+            slug: loggedTrade.marketSlug || null,
+            statusReason: "RESOLUTION_FETCH_FAILED",
+            statusDetail: `Exact market fetch failed: ${errorText}`,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: errorText
+          }, "warn");
+        }
+        continue;
       }
 
-      let winningTokenId =
-        marketResolution?.winningTokenId &&
-        (marketResolution.winningTokenId === tokenMapping.yesTokenId ||
-          marketResolution.winningTokenId === tokenMapping.noTokenId)
-          ? marketResolution.winningTokenId
-          : null;
-      let winningOutcome = marketResolution?.winningOutcome ?? null;
-      let winningOutcomeText = marketResolution?.winningOutcomeText ?? null;
-      let oracleAtEnd: number | undefined;
-      let resolutionSource: "market_api" | "oracle_proxy" | "internal_fair_mid" = "market_api";
+      if (!marketContext) {
+        const fallbackResolved = await this.resolvePaperTradeWithDerivedFallback(
+          trade,
+          tokenMapping,
+          nowTs,
+          "DERIVED_FALLBACK_AFTER_CONTEXT_MISSING",
+          "Derived fallback used because exact market context was unavailable after grace period"
+        );
+        if (!fallbackResolved) {
+          const errorText = "Exact market context unavailable";
+          const statusUpdate = this.upsertPaperTradeLifecycle(trade.id, {
+            status: "RESOLUTION_ERROR",
+            nowTs,
+            statusReason: "RESOLUTION_FETCH_EMPTY",
+            statusDetail: errorText,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: errorText,
+            resolutionContextState: "FETCH_FAILED"
+          });
+          const loggedTrade = statusUpdate.trade || trade;
+          this.logger.warn(
+            {
+              tradeId: loggedTrade.id,
+              marketId: loggedTrade.marketId,
+              marketSlug: loggedTrade.marketSlug || null,
+              status: "RESOLUTION_ERROR",
+              resolutionAttempts: nextResolutionAttempts
+            },
+            "POLY_PAPER_RESOLUTION_CONTEXT_MISSING"
+          );
+          this.writePaperIntervalEvent("RESOLUTION_ERROR", nowTs, {
+            tradeId: loggedTrade.id,
+            marketId: loggedTrade.marketId,
+            slug: loggedTrade.marketSlug || null,
+            statusReason: "RESOLUTION_FETCH_EMPTY",
+            statusDetail: errorText,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: errorText
+          }, "warn");
+        }
+        continue;
+      }
 
-      if (!winningTokenId) {
-        const oracleSample = this.pickOracleAtOrAfter(targetTs);
-        if (!oracleSample || !(oracleSample.px > 0)) {
-          if (nowTs - targetTs >= 30_000) {
-            const lastLogged = this.resolutionPendingLogByTradeId.get(trade.id) || 0;
-            if (nowTs - lastLogged >= 10_000) {
-              this.resolutionPendingLogByTradeId.set(trade.id, nowTs);
-              this.logger.warn(
-                {
-                  tradeId: trade.id,
-                  marketId: trade.marketId,
-                  marketSlug: trade.marketSlug || null,
-                  targetTs,
-                  nowTs
-                },
-                "PAPER RESOLUTION PENDING: awaiting market outcome or oracle snapshot"
-              );
-            }
+      if (this.isMarketStillOpenForPaperResolution(marketContext)) {
+        const fallbackResolved = await this.resolvePaperTradeWithDerivedFallback(
+          trade,
+          tokenMapping,
+          nowTs,
+          "DERIVED_FALLBACK_AFTER_GRACE",
+          "Derived fallback used because the interval expired and exact market remained open past grace period"
+        );
+        if (!fallbackResolved) {
+          const statusUpdate = this.upsertPaperTradeLifecycle(trade.id, {
+            status: "AWAITING_RESOLUTION",
+            nowTs,
+            statusReason: "MARKET_STILL_OPEN",
+            statusDetail: "Interval expired locally; exact market still open without official outcome",
+            awaitingResolutionSinceTs: trade.awaitingResolutionSinceTs || expiryTs,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: null,
+            resolutionContextState: "CLOSED_AWAITING_OUTCOME"
+          });
+          if (statusUpdate.changed) {
+            const loggedTrade = statusUpdate.trade || trade;
+            this.writePaperIntervalEvent("AWAITING_RESOLUTION", nowTs, {
+              tradeId: loggedTrade.id,
+              marketId: loggedTrade.marketId,
+              slug: loggedTrade.marketSlug || null,
+              statusReason: "MARKET_STILL_OPEN",
+              statusDetail: "Interval expired locally; exact market still open without official outcome",
+              resolutionAttempts: nextResolutionAttempts
+            });
           }
-          continue;
+          this.resolutionPendingLogByTradeId.delete(trade.id);
         }
-        oracleAtEnd = oracleSample.px;
-        const oracleOutcome = inferOutcomeFromOracle(oracleAtEnd, trade.priceToBeat);
-        winningTokenId = this.mapOutcomeToWinningTokenId(oracleOutcome, tokenMapping, marketResolution);
-        winningOutcome = oracleOutcome;
-        if (!winningOutcomeText) {
-          winningOutcomeText = oracleOutcome;
-        }
-        resolutionSource = oracleSample.source === "internal_fair_mid" ? "internal_fair_mid" : "oracle_proxy";
+        continue;
       }
 
-      if (!winningTokenId) {
+      const marketResolution = marketContext.resolution;
+      if (marketContext.cancelled) {
+        const cancelled = this.paperLedger.cancelTrade({
+          tradeId: trade.id,
+          resolvedAt: nowTs,
+          cancelReason: "MARKET_CANCELLED",
+          status: "VOID",
+          statusDetail: "Exact market context marked the BTC5m market cancelled/void",
+          payoutUsd: trade.notionalUsd,
+          pnlUsd: 0,
+          resolutionSource: "OFFICIAL"
+        });
+        if (!cancelled) continue;
+        this.updateTruthWindowContextFromTrade(cancelled, "OFFICIAL");
+        this.resolutionPendingLogByTradeId.delete(trade.id);
+        this.paperStopLossTicksByTradeId.delete(trade.id);
+        this.paperBestUnrealizedPnlUsdByTradeId.delete(trade.id);
+        this.writePaperIntervalEvent("VOID", nowTs, {
+          tradeId: cancelled.id,
+          marketId: cancelled.marketId,
+          slug: cancelled.marketSlug || null,
+          side: cancelled.side,
+          statusReason: "MARKET_CANCELLED",
+          statusDetail: cancelled.statusDetail || null,
+          pnlUsd: 0,
+          exitPayoutUsd: cancelled.exitProceedsUsd ?? cancelled.payoutUsd ?? cancelled.notionalUsd
+        }, "warn");
         this.logger.warn(
           {
-            tradeId: trade.id,
-            marketId: trade.marketId,
-            marketSlug: trade.marketSlug || null,
-            heldTokenId: tokenMapping.heldTokenId,
-            yesTokenId: tokenMapping.yesTokenId,
-            noTokenId: tokenMapping.noTokenId,
-            winningOutcome: winningOutcome || null,
-            winningOutcomeText: winningOutcomeText || null
+            tradeId: cancelled.id,
+            marketId: cancelled.marketId,
+            marketSlug: cancelled.marketSlug || null,
+            status: "VOID"
           },
-          "PAPER settlement skipped: winning token unresolved"
+          "POLY_PAPER_LIFECYCLE_VOID"
         );
         continue;
       }
 
-      if (!winningOutcome) {
-        winningOutcome = this.deriveOutcomeFromWinningTokenId(winningTokenId, tokenMapping, marketResolution);
+      const tradeResolutionHints = this.buildPaperResolutionHints(trade);
+      const mergedResolution = {
+        ...marketResolution,
+        yesOutcomeMapped: marketResolution?.yesOutcomeMapped ?? tradeResolutionHints.yesOutcomeMapped,
+        noOutcomeMapped: marketResolution?.noOutcomeMapped ?? tradeResolutionHints.noOutcomeMapped
+      };
+      let winningTokenId = this.getOfficialWinningTokenId(tokenMapping, mergedResolution);
+      let winningOutcome = marketResolution?.winningOutcome ?? null;
+      let winningOutcomeText = marketResolution?.winningOutcomeText ?? null;
+      if (!winningOutcome && winningTokenId) {
+        winningOutcome = this.deriveOutcomeFromWinningTokenId(winningTokenId, tokenMapping, mergedResolution);
+      }
+      if (!winningTokenId && this.hasOfficialMarketWinner(marketResolution) && winningOutcome) {
+        winningTokenId = this.mapOutcomeToWinningTokenId(winningOutcome, tokenMapping, mergedResolution);
+      }
+
+      if (!this.hasOfficialMarketWinner(marketResolution) || !winningTokenId || !winningOutcome) {
+        const fallbackResolved = await this.resolvePaperTradeWithDerivedFallback(
+          trade,
+          tokenMapping,
+          nowTs,
+          "DERIVED_FALLBACK_AFTER_OFFICIAL_UNAVAILABLE",
+          "Derived fallback used because official market winner data was unavailable after grace period"
+        );
+        if (!fallbackResolved) {
+          const awaitingSince = trade.awaitingResolutionSinceTs || (trade.expectedCloseTs || trade.windowEndTs);
+          const statusDetail = "Market closed but official winner data is not published yet";
+          const statusUpdate = this.upsertPaperTradeLifecycle(trade.id, {
+            status: "AWAITING_RESOLUTION",
+            nowTs,
+            statusReason: "MARKET_CLOSED_AWAITING_OUTCOME",
+            statusDetail,
+            awaitingResolutionSinceTs: awaitingSince,
+            resolutionAttempts: nextResolutionAttempts,
+            resolutionError: null,
+            resolutionContextState: "CLOSED_AWAITING_OUTCOME"
+          });
+          const awaitingTrade = statusUpdate.trade || trade;
+          const awaitingAgeSec = Math.max(0, Math.floor((nowTs - awaitingSince) / 1000));
+          const lastLogged = this.resolutionPendingLogByTradeId.get(trade.id) || 0;
+          if (statusUpdate.changed || nowTs - lastLogged >= 10_000) {
+            this.resolutionPendingLogByTradeId.set(trade.id, nowTs);
+            this.logger.warn(
+              {
+                tradeId: awaitingTrade.id,
+                marketId: awaitingTrade.marketId,
+                marketSlug: awaitingTrade.marketSlug || null,
+                status: "AWAITING_RESOLUTION",
+                awaitingAgeSec,
+                closed: marketContext.closed,
+                active: marketContext.active,
+                acceptingOrders: marketContext.acceptingOrders,
+                enableOrderBook: marketContext.enableOrderBook
+              },
+              "POLY_PAPER_LIFECYCLE_AWAITING_RESOLUTION"
+            );
+            this.writePaperIntervalEvent("AWAITING_RESOLUTION", nowTs, {
+              tradeId: awaitingTrade.id,
+              marketId: awaitingTrade.marketId,
+              slug: awaitingTrade.marketSlug || null,
+              side: awaitingTrade.side,
+              statusReason: "MARKET_CLOSED_AWAITING_OUTCOME",
+              statusDetail,
+              awaitingResolutionAgeSec: awaitingAgeSec,
+              resolutionAttempts: nextResolutionAttempts
+            }, "warn");
+          }
+        }
+        continue;
       }
 
       const settlement = computePaperBinarySettlementPnl({
         qty: trade.qty,
+        entryPrice: trade.entryPrice,
+        notionalUsd: trade.notionalUsd,
         entryCostUsd: trade.entryCostUsd,
         feesUsd: trade.feesUsd,
         heldSide: tokenMapping.heldSide,
@@ -2269,52 +4249,75 @@ export class PolymarketEngine {
         pnlUsd: settlement.pnlUsd,
         winningTokenId,
         winningOutcomeText: winningOutcomeText || undefined,
-        oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
-        resolutionSource
+        resolutionSource: "OFFICIAL",
+        statusReason: "OFFICIAL_OUTCOME",
+        statusDetail: "Resolved from exact market winner data"
       });
       if (!resolved) continue;
+      this.validateResolvedPaperSettlement(resolved);
       const resolveSummary = this.paperLedger.getSummary(nowTs);
       const result = classifyPaperResult(settlement.pnlUsd);
+      this.updateTruthWindowContextFromTrade(resolved, "OFFICIAL");
+      const tradeDirection = this.getPaperDirectionLabel({
+        side: trade.side,
+        yesDisplayLabel: trade.yesDisplayLabel,
+        noDisplayLabel: trade.noDisplayLabel,
+        marketQuestion: trade.marketQuestion
+      });
+      const winningSide = winningTokenId === tokenMapping.yesTokenId ? "YES" : "NO";
+      const winningDirection = this.getPaperDirectionLabel({
+        side: winningSide,
+        yesDisplayLabel: trade.yesDisplayLabel,
+        noDisplayLabel: trade.noDisplayLabel,
+        marketQuestion: trade.marketQuestion
+      });
+      const outcomeSource =
+        marketResolution?.winningTokenId
+          ? "market_api.winningTokenId"
+          : marketResolution?.winningSide
+            ? "market_api.winningSide"
+            : marketResolution?.winningOutcome
+              ? "market_api.winningOutcome"
+              : "market_api.derived";
 
       this.logger.info(
         {
           tradeId: resolved.id,
           slug: resolved.marketSlug || null,
           heldSide: tokenMapping.heldSide,
+          direction: tradeDirection,
           heldTokenId: tokenMapping.heldTokenId,
           winningOutcome: winningOutcomeText || winningOutcome,
+          winningDirection,
           winningTokenId,
           qty: resolved.qty,
           entryCostUsd: resolved.entryCostUsd,
           exitPayoutUsd: settlement.exitPayoutUsd,
           feesUsd: resolved.feesUsd,
           pnlUsd: settlement.pnlUsd,
-          result
+          result,
+          outcomeSource
         },
         "POLY_PAPER_RESOLUTION"
       );
 
-      this.writePaperTradeLog({
-        ts: new Date(nowTs).toISOString(),
-        event: "TRADE_RESOLVED",
+      this.writePaperIntervalEvent(getPaperTradeStatus(resolved), nowTs, {
         tradeId: resolved.id,
         marketId: resolved.marketId,
         slug: resolved.marketSlug || null,
-        marketSlug: resolved.marketSlug || null,
         side: resolved.side,
         heldSide: tokenMapping.heldSide,
         heldTokenId: tokenMapping.heldTokenId,
         winner: winningOutcome,
         winningOutcome: winningOutcomeText || winningOutcome,
         winningTokenId,
-        finalOraclePrice: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : null,
         qty: resolved.qty,
         entryCostUsd: resolved.entryCostUsd,
         exitPayoutUsd: settlement.exitPayoutUsd,
         feesUsd: resolved.feesUsd,
         pnlUsd: settlement.pnlUsd,
-        oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
-        resolutionSource,
+        resolutionSource: "OFFICIAL",
+        outcomeSource,
         result,
         cumulativePnlUsd: resolveSummary.totalPnlUsd,
         wins: resolveSummary.wins,
@@ -2323,6 +4326,7 @@ export class PolymarketEngine {
       });
       this.resolutionPendingLogByTradeId.delete(trade.id);
       this.paperStopLossTicksByTradeId.delete(trade.id);
+      this.paperBestUnrealizedPnlUsdByTradeId.delete(trade.id);
 
       this.emitPolymarketTruth({
         ts: nowTs,
@@ -2338,15 +4342,18 @@ export class PolymarketEngine {
           marketId: resolved.marketId,
           marketSlug: resolved.marketSlug || null,
           side: resolved.side,
+          direction: tradeDirection,
           outcome: winningOutcome,
+          winningDirection,
           winningTokenId,
           payoutUsd: settlement.exitPayoutUsd,
           notionalUsd: resolved.notionalUsd,
           pnlUsd: settlement.pnlUsd,
-          oracleAtEnd: oracleAtEnd && oracleAtEnd > 0 ? oracleAtEnd : undefined,
-          resolutionSource
+          resolutionSource: "OFFICIAL",
+          outcomeSource,
+          result
         },
-        `POLY_TRADE event=RESOLVED mode=PAPER tradeId=${resolved.id} slug=${String(resolved.marketSlug || "-")} side=${resolved.side} notionalUsd=${resolved.notionalUsd.toFixed(2)} pnlUsd=${settlement.pnlUsd.toFixed(2)} reason=${winningOutcome}`
+        `POLY_TRADE event=${getPaperTradeStatus(resolved)} mode=PAPER tradeId=${resolved.id} slug=${String(resolved.marketSlug || "-")} side=${resolved.side} notionalUsd=${resolved.notionalUsd.toFixed(2)} pnlUsd=${settlement.pnlUsd.toFixed(2)} reason=${winningOutcome}`
       );
     }
   }
@@ -2530,9 +4537,10 @@ export class PolymarketEngine {
         outcome: trade.side === "YES" ? "UP" : "DOWN",
         payoutUsd: requestedNotionalUsd + feesUsd,
         pnlUsd: 0,
-        resolutionSource: "internal_fair_mid"
+        resolutionSource: "DERIVED_FALLBACK"
       });
       if (resolved) {
+        this.validateResolvedPaperSettlement(resolved);
         const summary = this.paperLedger.getSummary(context.nowTs);
         this.writePaperTradeLog({
           ts: new Date(context.nowTs).toISOString(),
@@ -2874,6 +4882,78 @@ export class PolymarketEngine {
     }
   }
 
+  private getCachedTokenBookSnapshot(tokenId: string, nowTs: number): TokenBookSnapshot | null {
+    const normalizedTokenId = String(tokenId || "").trim();
+    if (!normalizedTokenId) return null;
+    const cached = this.latestTokenBookByTokenId.get(normalizedTokenId);
+    if (!cached) return null;
+    const maxAgeMs = Math.max(30_000, this.config.polymarket.risk.staleMs * 4);
+    if (cached.bookTs <= 0 || nowTs - cached.bookTs > maxAgeMs) {
+      this.latestTokenBookByTokenId.delete(normalizedTokenId);
+      return null;
+    }
+    return cached;
+  }
+
+  private cacheTokenBookSnapshot(
+    tokenId: string,
+    snapshot: {
+      bestBid?: number | null;
+      bestAsk?: number | null;
+      bookTs?: number | null;
+      markSource?: string | null;
+    }
+  ): void {
+    const normalizedTokenId = String(tokenId || "").trim();
+    if (!normalizedTokenId) return;
+    const previous = this.latestTokenBookByTokenId.get(normalizedTokenId) || null;
+    const hasFreshBid = Number.isFinite(Number(snapshot.bestBid)) && Number(snapshot.bestBid) > 0;
+    const hasFreshAsk = Number.isFinite(Number(snapshot.bestAsk)) && Number(snapshot.bestAsk) > 0;
+    const nextBestBid = hasFreshBid
+      ? clamp(Number(snapshot.bestBid), 0.0001, 0.9999)
+      : previous?.bestBid ?? null;
+    const nextBestAsk = hasFreshAsk
+      ? clamp(Number(snapshot.bestAsk), 0.0001, 0.9999)
+      : previous?.bestAsk ?? null;
+    const nextBookTs = Number.isFinite(Number(snapshot.bookTs)) && Number(snapshot.bookTs) > 0
+      ? Math.floor(Number(snapshot.bookTs))
+      : previous?.bookTs ?? Date.now();
+    const usedCachedSide =
+      Boolean(previous) && ((!hasFreshBid && previous?.bestBid !== null) || (!hasFreshAsk && previous?.bestAsk !== null));
+    const nextMark =
+      nextBestBid !== null && nextBestAsk !== null
+        ? clamp((nextBestBid + nextBestAsk) / 2, Math.min(nextBestBid, nextBestAsk), Math.max(nextBestBid, nextBestAsk))
+        : nextBestBid !== null
+          ? nextBestBid
+          : nextBestAsk !== null
+            ? nextBestAsk
+            : previous?.mark ?? null;
+    const baseMarkSource =
+      nextBestBid !== null && nextBestAsk !== null
+        ? "MID"
+        : nextBestBid !== null
+          ? "BID_FALLBACK"
+          : nextBestAsk !== null
+            ? "ASK_FALLBACK"
+            : previous?.markSource ?? (snapshot.markSource || null);
+    const nextMarkSource =
+      nextMark !== null && usedCachedSide ? prefixCachedMarkSource(baseMarkSource) : baseMarkSource;
+    this.latestTokenBookByTokenId.set(normalizedTokenId, {
+      tokenId: normalizedTokenId,
+      bestBid: nextBestBid,
+      bestAsk: nextBestAsk,
+      mark: nextMark,
+      markSource: nextMarkSource,
+      bookTs: nextBookTs
+    });
+    const maxEntries = 400;
+    if (this.latestTokenBookByTokenId.size <= maxEntries) return;
+    const oldest = this.latestTokenBookByTokenId.keys().next().value;
+    if (typeof oldest === "string") {
+      this.latestTokenBookByTokenId.delete(oldest);
+    }
+  }
+
   private async getImpliedYesBook(market: {
     marketId: string;
     yesTokenId: string;
@@ -2916,6 +4996,12 @@ export class PolymarketEngine {
           bookTs: toMs(orderBook.ts || nowTs)
         } satisfies YesBookSnapshot;
         this.cacheYesBookSnapshot(market.marketId, snapshot);
+        this.cacheTokenBookSnapshot(market.yesTokenId, {
+          bestBid: orderBook.bids.length > 0 ? Number(orderBook.bids[0]?.price || 0) : null,
+          bestAsk: orderBook.asks.length > 0 ? Number(orderBook.asks[0]?.price || 0) : null,
+          bookTs: snapshot.bookTs,
+          markSource: "MID"
+        });
         return snapshot;
       }
       if (cachedSnapshot) {
@@ -2971,18 +5057,29 @@ export class PolymarketEngine {
   }
 
   private async getNoBookFromTokenId(tokenId: string): Promise<{
-    bestBid: number;
-    bestAsk: number;
+    bestBid: number | null;
+    bestAsk: number | null;
     topBidSize: number;
     topAskSize: number;
+    bookTs: number;
   } | null> {
     try {
       const noBook = await this.client.getTokenOrderBook(tokenId);
+      const bestBid = noBook.bids.length > 0 ? clamp(Number(noBook.bids[0]?.price || 0), 0.0001, 0.9999) : null;
+      const bestAsk = noBook.asks.length > 0 ? clamp(Number(noBook.asks[0]?.price || 0), 0.0001, 0.9999) : null;
+      const bookTs = toMs(noBook.ts || Date.now());
+      this.cacheTokenBookSnapshot(tokenId, {
+        bestBid,
+        bestAsk,
+        bookTs,
+        markSource: bestBid !== null && bestAsk !== null ? "MID" : bestBid !== null ? "BID_FALLBACK" : "ASK_FALLBACK"
+      });
       return {
-        bestBid: clamp(Number(noBook.bestBid || 0), 0.0001, 0.9999),
-        bestAsk: clamp(Number(noBook.bestAsk || 0), 0.0001, 0.9999),
+        bestBid,
+        bestAsk,
         topBidSize: Math.max(0, Number(noBook.bids?.[0]?.size || 0)),
-        topAskSize: Math.max(0, Number(noBook.asks?.[0]?.size || 0))
+        topAskSize: Math.max(0, Number(noBook.asks?.[0]?.size || 0)),
+        bookTs
       };
     } catch (error) {
       const transient = isTransientPolymarketError(error);
@@ -3003,7 +5100,7 @@ export class PolymarketEngine {
 
   private async getNoAskFromTokenId(tokenId: string, fallbackNoAsk: number): Promise<number> {
     const noBook = await this.getNoBookFromTokenId(tokenId);
-    if (noBook?.bestAsk && noBook.bestAsk > 0) {
+    if (noBook && noBook.bestAsk !== null && noBook.bestAsk > 0) {
       return clamp(noBook.bestAsk, 0.0001, 0.9999);
     }
     return clamp(fallbackNoAsk, 0.0001, 0.9999);
@@ -3011,7 +5108,7 @@ export class PolymarketEngine {
 
   private async getNoBidFromTokenId(tokenId: string, fallbackNoBid: number): Promise<number> {
     const noBook = await this.getNoBookFromTokenId(tokenId);
-    if (noBook?.bestBid && noBook.bestBid > 0) {
+    if (noBook && noBook.bestBid !== null && noBook.bestBid > 0) {
       return clamp(noBook.bestBid, 0.0001, 0.9999);
     }
     return clamp(fallbackNoBid, 0.0001, 0.9999);
@@ -3029,7 +5126,7 @@ export class PolymarketEngine {
       };
     }
     return {
-      noAsk: clamp(noBook.bestAsk > 0 ? noBook.bestAsk : fallbackNoAsk, 0.0001, 0.9999),
+      noAsk: clamp(noBook.bestAsk !== null && noBook.bestAsk > 0 ? noBook.bestAsk : fallbackNoAsk, 0.0001, 0.9999),
       topAskSize: Math.max(0, noBook.topAskSize)
     };
   }
@@ -3266,25 +5363,31 @@ export class PolymarketEngine {
   }
 
   private maybeEmitTickLog(input: TickLogLine): void {
-    const nowTs = Date.now();
-    this.polyState.lastUpdateTs = Math.max(this.polyState.lastUpdateTs, nowTs);
+    const tickTs = this.getTickTimestamp(input.now);
+    this.polyState.lastUpdateTs = Math.max(this.polyState.lastUpdateTs, tickTs);
     this.polyEngineRunning = this.polyState.lastFetchAttemptTs > 0;
     const defaultWindowCfg = this.scanner.getPrimaryWindowConfig();
-    if (Date.now() - this.lastTickLogTs < 30_000) {
+    const selectionRollover = this.isSelectionRollover(input);
+    if (tickTs - this.lastTickLogTs < 30_000) {
     const line: TickLogLine = {
       ...input,
       tradingPaused: input.tradingPaused ?? this.tradingPaused,
       pauseReason: input.pauseReason ?? (this.pauseReason || null),
       pauseSinceTs: input.pauseSinceTs ?? this.pauseSinceTs,
-      lastFetchAttemptTs: this.polyState.lastFetchAttemptTs,
-      lastFetchOkTs: this.polyState.lastFetchOkTs,
-      lastFetchErr: this.polyState.lastFetchErr,
-      lastHttpStatus: this.polyState.lastHttpStatus,
+      lastFetchAttemptTs: input.lastFetchAttemptTs ?? this.polyState.lastFetchAttemptTs,
+      lastFetchOkTs: input.lastFetchOkTs ?? this.polyState.lastFetchOkTs,
+      lastFetchErr: input.lastFetchErr ?? this.polyState.lastFetchErr,
+      lastHttpStatus: input.lastHttpStatus ?? this.polyState.lastHttpStatus,
       rejectCountsByStage:
         input.rejectCountsByStage
           ? cloneRejectCountsByStage(input.rejectCountsByStage)
           : cloneRejectCountsByStage(this.polyState.rejectCountsByStage),
-      dominantReject: input.dominantReject ?? this.polyState.dominantReject,
+      dominantReject:
+        input.dominantReject !== undefined
+          ? input.dominantReject
+          : selectionRollover
+            ? null
+            : this.polyState.dominantReject,
       sampleRejected:
         input.sampleRejected && input.sampleRejected.length > 0
           ? input.sampleRejected.slice(0, 5).map((row) => ({ ...row }))
@@ -3303,19 +5406,29 @@ export class PolymarketEngine {
       acceptedSampleCount: Math.max(0, Math.floor(Number(input.acceptedSampleCount || 0))),
       forceTradeFired: Boolean(input.forceTradeFired),
       forceTradeMode: input.forceTradeMode ?? "none",
-      holdDetailReason: input.holdDetailReason ?? this.polyState.holdDetailReason
+      holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason)
     };
-      line.holdReason = this.deriveCanonicalHoldReason(line) ?? line.holdReason ?? null;
-      if ((line.holdReason === "NO_CANDIDATES" || line.holdReason === "NO_WINDOWS") && !line.holdDetailReason) {
-        line.holdDetailReason = line.dominantReject ?? this.polyState.dominantReject;
+      const pausePresentation = this.getStatusPausePresentation(line.tradingPaused, line.pauseReason ?? null);
+      line.tradingPaused = pausePresentation.tradingPaused;
+      line.pauseReason = pausePresentation.pauseReason;
+      line.warningState = pausePresentation.warningState;
+      const actionRoot = this.getTickActionRoot(line.action);
+      if (actionRoot === "HOLD") {
+        line.holdReason = this.deriveCanonicalHoldReason(line) ?? line.holdReason ?? null;
+        if ((line.holdReason === "NO_CANDIDATES" || line.holdReason === "NO_WINDOWS") && !line.holdDetailReason) {
+          line.holdDetailReason = line.dominantReject ?? this.polyState.dominantReject;
+        }
+      } else {
+        line.holdReason = null;
+        line.holdDetailReason = null;
       }
-      this.maybeWarnNoData(line.holdReason, nowTs);
+      this.maybeWarnNoData(line.holdReason, tickTs);
       this.captureTruthStateFromTick(line);
-      this.emitPolyStatusLine(line, nowTs);
+      this.emitPolyStatusLine(line, tickTs);
       this.emitPolymarketTruth({
-        ts: nowTs,
+        ts: tickTs,
         force: false,
-        action: nowTs - this.truthLastActionTs >= 5_000 ? "HOLD" : undefined
+        action: actionRoot === "HOLD" && tickTs - this.truthLastActionTs >= 5_000 ? "HOLD" : undefined
       });
       return;
     }
@@ -3324,15 +5437,20 @@ export class PolymarketEngine {
         tradingPaused: input.tradingPaused ?? this.tradingPaused,
         pauseReason: input.pauseReason ?? (this.pauseReason || null),
         pauseSinceTs: input.pauseSinceTs ?? this.pauseSinceTs,
-        lastFetchAttemptTs: this.polyState.lastFetchAttemptTs,
-        lastFetchOkTs: this.polyState.lastFetchOkTs,
-        lastFetchErr: this.polyState.lastFetchErr,
-        lastHttpStatus: this.polyState.lastHttpStatus,
+        lastFetchAttemptTs: input.lastFetchAttemptTs ?? this.polyState.lastFetchAttemptTs,
+        lastFetchOkTs: input.lastFetchOkTs ?? this.polyState.lastFetchOkTs,
+        lastFetchErr: input.lastFetchErr ?? this.polyState.lastFetchErr,
+        lastHttpStatus: input.lastHttpStatus ?? this.polyState.lastHttpStatus,
         rejectCountsByStage:
           input.rejectCountsByStage
             ? cloneRejectCountsByStage(input.rejectCountsByStage)
             : cloneRejectCountsByStage(this.polyState.rejectCountsByStage),
-        dominantReject: input.dominantReject ?? this.polyState.dominantReject,
+        dominantReject:
+          input.dominantReject !== undefined
+            ? input.dominantReject
+            : selectionRollover
+              ? null
+              : this.polyState.dominantReject,
         sampleRejected:
           input.sampleRejected && input.sampleRejected.length > 0
             ? input.sampleRejected.slice(0, 5).map((row) => ({ ...row }))
@@ -3351,29 +5469,39 @@ export class PolymarketEngine {
         acceptedSampleCount: Math.max(0, Math.floor(Number(input.acceptedSampleCount || 0))),
         forceTradeFired: Boolean(input.forceTradeFired),
         forceTradeMode: input.forceTradeMode ?? "none",
-        holdDetailReason: input.holdDetailReason ?? this.polyState.holdDetailReason
+        holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason)
       };
-    line.holdReason = this.deriveCanonicalHoldReason(line) ?? line.holdReason ?? null;
-    if ((line.holdReason === "NO_CANDIDATES" || line.holdReason === "NO_WINDOWS") && !line.holdDetailReason) {
-      line.holdDetailReason = line.dominantReject ?? this.polyState.dominantReject;
+    const pausePresentation = this.getStatusPausePresentation(line.tradingPaused, line.pauseReason ?? null);
+    line.tradingPaused = pausePresentation.tradingPaused;
+    line.pauseReason = pausePresentation.pauseReason;
+    line.warningState = pausePresentation.warningState;
+    const actionRoot = this.getTickActionRoot(line.action);
+    if (actionRoot === "HOLD") {
+      line.holdReason = this.deriveCanonicalHoldReason(line) ?? line.holdReason ?? null;
+      if ((line.holdReason === "NO_CANDIDATES" || line.holdReason === "NO_WINDOWS") && !line.holdDetailReason) {
+        line.holdDetailReason = line.dominantReject ?? this.polyState.dominantReject;
+      }
+    } else {
+      line.holdReason = null;
+      line.holdDetailReason = null;
     }
-    this.maybeWarnNoData(line.holdReason, nowTs);
+    this.maybeWarnNoData(line.holdReason, tickTs);
     this.captureTruthStateFromTick(line);
-    this.emitPolyStatusLine(line, nowTs);
-    this.lastTickLogTs = Date.now();
+    this.emitPolyStatusLine(line, tickTs);
+    this.lastTickLogTs = tickTs;
     if (this.debugPoly) {
       this.logger.info(line, "Polymarket tick");
     }
-    const truthTs = nowTs;
+    const truthTs = tickTs;
     this.emitPolymarketTruth({
       ts: truthTs,
       force: false,
-      action: truthTs - this.truthLastActionTs >= 5_000 ? "HOLD" : undefined
+      action: actionRoot === "HOLD" && truthTs - this.truthLastActionTs >= 5_000 ? "HOLD" : undefined
     });
     appendFileSync(
       this.logPath,
       `${JSON.stringify({
-        ts: new Date().toISOString(),
+        ts: new Date(truthTs).toISOString(),
         type: "tick",
         marketsSeen: line.marketsSeen,
         discoveredCandidates: line.discoveredCandidates ?? null,
@@ -3425,6 +5553,7 @@ export class PolymarketEngine {
         edgeYes: line.edgeYes ?? null,
         edgeNo: line.edgeNo ?? null,
         chosenSide: line.chosenSide ?? null,
+        chosenDirection: line.chosenDirection ?? null,
         chosenEdge: line.chosenEdge ?? null,
         conviction: line.conviction ?? null,
         stalenessEdge: line.stalenessEdge ?? null,
@@ -3432,7 +5561,12 @@ export class PolymarketEngine {
         threshold: line.threshold,
         size: line.size ?? null,
         openTrades: line.openTrades ?? 0,
+        awaitingResolutionCount: line.awaitingResolutionCount ?? 0,
+        resolutionQueueCount: line.resolutionQueueCount ?? line.awaitingResolutionCount ?? 0,
         resolvedTrades: line.resolvedTrades ?? 0,
+        entriesInWindow: line.entriesInWindow ?? null,
+        windowRealizedPnlUsd: line.windowRealizedPnlUsd ?? null,
+        resolutionSource: line.resolutionSource ?? null,
         oracleSource: line.oracleSource ?? "none",
         oracleTs: line.oracleTs ?? null,
         oracleStaleMs: line.oracleStaleMs ?? null,
@@ -3443,6 +5577,7 @@ export class PolymarketEngine {
         lastHttpStatus: line.lastHttpStatus ?? 0,
         tradingPaused: line.tradingPaused ?? false,
         pauseReason: line.pauseReason ?? null,
+        warningState: line.warningState ?? null,
         pauseSinceTs: line.pauseSinceTs ?? null,
         lastAction: line.action,
         selectedSlug: line.selectedSlug,
@@ -3459,14 +5594,38 @@ export class PolymarketEngine {
     const explicitHoldReason = String(line.holdReason || "")
       .trim()
       .toUpperCase();
-    if (explicitHoldReason === "BTC5M_NOT_FOUND") {
-      return "BTC5M_NOT_FOUND";
+    if (explicitHoldReason === "NO_ACTIVE_BTC5M_MARKET" || explicitHoldReason === "BTC5M_NOT_FOUND") {
+      return "NO_ACTIVE_BTC5M_MARKET";
+    }
+    if (explicitHoldReason === "NO_NEW_ORDERS_FINAL_SECONDS") {
+      return "NO_NEW_ORDERS_FINAL_SECONDS";
+    }
+    if (explicitHoldReason === "OPEN_POSITION_IN_WINDOW") return "OPEN_POSITION_IN_WINDOW";
+    if (explicitHoldReason === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
+    if (explicitHoldReason === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
+    if (explicitHoldReason === "EXPIRED_WINDOW") {
+      return "EXPIRED_WINDOW";
+    }
+    if (explicitHoldReason === "AWAITING_RESOLUTION") {
+      return "AWAITING_RESOLUTION";
     }
     const detailReason = String(line.holdDetailReason || line.dominantReject || "")
       .trim()
       .toUpperCase();
     if (detailReason === "BTC5M_NOT_FOUND") {
-      return "BTC5M_NOT_FOUND";
+      return "NO_ACTIVE_BTC5M_MARKET";
+    }
+    if (detailReason === "NO_NEW_ORDERS_FINAL_SECONDS") {
+      return "NO_NEW_ORDERS_FINAL_SECONDS";
+    }
+    if (detailReason === "OPEN_POSITION_IN_WINDOW") return "OPEN_POSITION_IN_WINDOW";
+    if (detailReason === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
+    if (detailReason === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
+    if (detailReason === "EXPIRED_WINDOW") {
+      return "EXPIRED_WINDOW";
+    }
+    if (detailReason === "MARKET_CLOSED_AWAITING_OUTCOME" || detailReason === "AWAITING_RESOLUTION") {
+      return "AWAITING_RESOLUTION";
     }
 
     const actionRoot = String(line.action || "")
@@ -3477,26 +5636,10 @@ export class PolymarketEngine {
       return null;
     }
 
-    if (line.tradingPaused) {
-      return "TRADING_PAUSED";
-    }
-
-    const lastFetchOkTs = Number(line.lastFetchOkTs ?? this.polyState.lastFetchOkTs ?? 0);
-    const fetchedCount = Number(line.fetchedCount ?? this.polyState.fetchedCount ?? 0);
-    if (!(lastFetchOkTs > 0) || fetchedCount <= 0) {
-      return "NO_DATA";
-    }
-
-    const afterWindowCount = Number(line.afterWindowCount ?? this.polyState.afterWindowCount ?? 0);
-    if (afterWindowCount <= 0) {
-      return "NO_WINDOWS";
-    }
-
-    const finalCandidatesCount = Number(line.finalCandidatesCount ?? this.truthSelection.finalCandidatesCount ?? 0);
-    if (finalCandidatesCount <= 0) {
-      return "NO_CANDIDATES";
-    }
-
+    const normalizedDetail = normalizeHoldReason(line.holdDetailReason || line.dominantReject || "");
+    const pauseReason = String(line.pauseReason || this.pauseReason || "")
+      .trim()
+      .toUpperCase();
     const oracleState = String(line.oracleState ?? this.truthDataHealth.oracleState ?? "")
       .trim()
       .toUpperCase();
@@ -3504,6 +5647,63 @@ export class PolymarketEngine {
       Number(line.activeWindows || 0) > 0 ||
       Number(line.openTrades || 0) > 0 ||
       (this.config.polymarket.mode === "paper" && this.config.polymarket.paper.forceTrade);
+    const nowTsFromLine = toMsOrNull(line.now) ?? Date.now();
+    const lastFetchOkTs = Number(line.lastFetchOkTs ?? this.polyState.lastFetchOkTs ?? 0);
+    const fetchedCount = Number(line.fetchedCount ?? this.polyState.fetchedCount ?? 0);
+    const fetchStaleAfterMs = Math.max(
+      30_000,
+      this.config.polymarket.risk.staleKillAfterMs,
+      this.config.polymarket.risk.staleMs * 2
+    );
+
+    if (normalizedDetail === "ORACLE_STALE" || normalizedDetail === "ORACLE_STALE_BOOK_STALE") {
+      return normalizedDetail;
+    }
+    if (normalizedDetail === "AWAITING_RESOLUTION") {
+      return "AWAITING_RESOLUTION";
+    }
+    if (normalizedDetail === "EXPIRED_WINDOW") {
+      return "EXPIRED_WINDOW";
+    }
+    if (normalizedDetail === "NO_NEW_ORDERS_FINAL_SECONDS") {
+      return "NO_NEW_ORDERS_FINAL_SECONDS";
+    }
+    if (normalizedDetail === "OPEN_POSITION_IN_WINDOW") return "OPEN_POSITION_IN_WINDOW";
+    if (normalizedDetail === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
+    if (normalizedDetail === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
+    if (normalizedDetail === "SIZE_BELOW_MIN_NOTIONAL") {
+      return "SIZE_BELOW_MIN_NOTIONAL";
+    }
+    if (pauseReason.includes("ORACLE_STALE")) {
+      return "ORACLE_STALE";
+    }
+    if (normalizedDetail === "ORACLE_UNAVAILABLE" || pauseReason.includes("ORACLE_UNAVAILABLE")) {
+      return "ORACLE_UNAVAILABLE";
+    }
+    if (line.tradingPaused) {
+      if (pauseReason.includes("NETWORK")) return "NETWORK_ERROR";
+      if (pauseReason.includes("ORACLE_STALE")) return "ORACLE_STALE";
+      if (pauseReason.includes("ORACLE_UNAVAILABLE")) return "ORACLE_UNAVAILABLE";
+      return "TRADING_PAUSED";
+    }
+
+    if (!(lastFetchOkTs > 0) || fetchedCount <= 0) {
+      return "NO_DATA";
+    }
+    if (nowTsFromLine - lastFetchOkTs >= fetchStaleAfterMs) {
+      return "FETCH_STALE";
+    }
+
+    const afterWindowCount = Number(line.afterWindowCount ?? this.polyState.afterWindowCount ?? 0);
+    if (afterWindowCount <= 0) {
+      return "NO_ACTIVE_BTC5M_MARKET";
+    }
+
+    const finalCandidatesCount = Number(line.finalCandidatesCount ?? this.truthSelection.finalCandidatesCount ?? 0);
+    if (finalCandidatesCount <= 0) {
+      return "NO_CANDIDATES";
+    }
+
     if (oracleRequired && (!oracleState || oracleState === "IDLE" || oracleState === "NULL")) {
       return "ORACLE_IDLE";
     }
@@ -3521,13 +5721,22 @@ export class PolymarketEngine {
 
     const chosenEdge = Number(line.chosenEdge);
     const threshold = Number(line.threshold);
-    if (Number.isFinite(chosenEdge) && Number.isFinite(threshold) && chosenEdge <= threshold) {
+    if (
+      normalizedDetail === "EDGE_BELOW_THRESHOLD" ||
+      normalizedDetail === "NET_EDGE_BELOW_PAPER_MIN" ||
+      normalizedDetail === "NET_EDGE_BELOW_MIN_NET_EDGE" ||
+      normalizedDetail === "NET_EDGE_BELOW_DYNAMIC_THRESHOLD" ||
+      (Number.isFinite(chosenEdge) && Number.isFinite(threshold) && chosenEdge <= threshold)
+    ) {
       return "EDGE_BELOW_THRESHOLD";
     }
 
-    const normalizedDetail = normalizeHoldReason(line.holdDetailReason);
     if (normalizedDetail && normalizedDetail !== "HOLD_GENERIC") {
       return normalizedDetail;
+    }
+
+    if (oracleRequired && (oracleState === "ORACLE_STALE" || oracleState === "ORACLE_UNAVAILABLE")) {
+      return oracleState;
     }
 
     return "HOLD_GENERIC";
@@ -3581,14 +5790,41 @@ export class PolymarketEngine {
       Number.isFinite(Number(line.maxWindowSec)) && Number(line.maxWindowSec) > 0
         ? Math.floor(Number(line.maxWindowSec))
         : this.scanner.getPrimaryWindowConfig().maxWindowSec;
+    const thresholdText = Number.isFinite(Number(line.threshold))
+      ? Number(line.threshold).toFixed(4)
+      : "-";
+    const pauseReasonText = String(line.pauseReason || "-");
+    const warningStateText = String(line.warningState || "-");
+    const oracleStateText = String(line.oracleState || "-");
+    const chosenSideText = String(line.chosenSide || "-");
+    const chosenDirectionText = String(line.chosenDirection || "-");
+    const entriesInWindowText = Number.isFinite(Number(line.entriesInWindow))
+      ? String(Math.max(0, Math.floor(Number(line.entriesInWindow))))
+      : "-";
+    const openTradesText = Number.isFinite(Number(line.openTrades))
+      ? String(Math.max(0, Math.floor(Number(line.openTrades))))
+      : "-";
+    const awaitingResolutionText = Number.isFinite(Number(line.awaitingResolutionCount))
+      ? String(Math.max(0, Math.floor(Number(line.awaitingResolutionCount))))
+      : "-";
+    const resolutionQueueText = Number.isFinite(Number(line.resolutionQueueCount))
+      ? String(Math.max(0, Math.floor(Number(line.resolutionQueueCount))))
+      : awaitingResolutionText;
+    const windowRealizedPnlText = Number.isFinite(Number(line.windowRealizedPnlUsd))
+      ? Number(line.windowRealizedPnlUsd).toFixed(2)
+      : "-";
+    const resolutionSourceText = String(line.resolutionSource || this.truthResolutionSource || "-");
+    const holdReasonText = String(line.holdReason || "-");
+    const holdDetailText = String(line.holdDetailReason || line.dominantReject || "-");
     const nowIso = new Date(nowTs).toISOString();
     this.logger.info(
-      `POLY_STATUS now=${nowIso} candidatesCount=${candidatesCount} windowsCount=${Number(line.afterWindowCount ?? 0)} acceptedSampleCount=${Math.max(0, Math.floor(Number(line.acceptedSampleCount || 0)))} selectedSlug=${selected} remainingSec=${remaining} dominantReject=${line.dominantReject || "-"} forceTradeFired=${line.forceTradeFired ? "1" : "0"} minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec}`
+      `POLY_STATUS now=${nowIso} candidatesCount=${candidatesCount} windowsCount=${Number(line.afterWindowCount ?? 0)} acceptedSampleCount=${Math.max(0, Math.floor(Number(line.acceptedSampleCount || 0)))} selectedSlug=${selected} remainingSec=${remaining} dominantReject=${line.dominantReject || "-"} currentWindowHoldReason=${holdReasonText} holdDetail=${holdDetailText} oracleState=${oracleStateText} paused=${line.tradingPaused ? "1" : "0"} pauseReason=${pauseReasonText} warningState=${warningStateText} chosenSide=${chosenSideText} chosenDirection=${chosenDirectionText} openTradesCount=${openTradesText} awaitingResolutionCount=${awaitingResolutionText} resolutionQueueCount=${resolutionQueueText} entriesInWindow=${entriesInWindowText} realizedPnlWindowUsd=${windowRealizedPnlText} resolutionSource=${resolutionSourceText} threshold=${thresholdText} forceTradeFired=${line.forceTradeFired ? "1" : "0"} minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec}`
     );
   }
 
   private captureTruthStateFromTick(line: TickLogLine): void {
-    const tickTs = toMs(line.now) || Date.now();
+    const tickTs = this.getTickTimestamp(line.now);
+    const selectionRollover = this.isSelectionRollover(line);
     this.polyState.fetchedCount = Number.isFinite(Number(line.fetchedCount))
       ? Math.max(0, Math.floor(Number(line.fetchedCount)))
       : this.polyState.fetchedCount;
@@ -3598,15 +5834,25 @@ export class PolymarketEngine {
     this.polyState.finalCandidatesCount = Number.isFinite(Number(line.finalCandidatesCount))
       ? Math.max(0, Math.floor(Number(line.finalCandidatesCount)))
       : this.polyState.finalCandidatesCount;
-    this.polyState.selectedSlug = line.selectedSlug ?? this.polyState.selectedSlug;
-    this.polyState.selectedMarketId = line.currentMarketId ?? this.polyState.selectedMarketId;
+    if (line.selectedSlug !== undefined) {
+      this.polyState.selectedSlug = line.selectedSlug;
+    }
+    if (line.currentMarketId !== undefined) {
+      this.polyState.selectedMarketId = line.currentMarketId;
+    }
     this.polyState.holdDetailReason =
       line.holdDetailReason !== undefined
         ? line.holdDetailReason
+        : selectionRollover
+          ? null
         : String(line.action || "").toUpperCase().startsWith("HOLD")
           ? this.polyState.holdDetailReason
           : null;
-    this.polyState.dominantReject = line.dominantReject ?? this.polyState.dominantReject;
+    if (line.dominantReject !== undefined) {
+      this.polyState.dominantReject = line.dominantReject;
+    } else if (selectionRollover) {
+      this.polyState.dominantReject = null;
+    }
     if (line.rejectCountsByStage) {
       this.polyState.rejectCountsByStage = cloneRejectCountsByStage(line.rejectCountsByStage);
     }
@@ -3633,23 +5879,60 @@ export class PolymarketEngine {
     if (Number.isFinite(Number(line.polyUpdateAgeMs)) && Number(line.polyUpdateAgeMs) >= 0) {
       this.polyState.lastBookTsMs = Math.max(
         this.polyState.lastBookTsMs,
-        Math.max(0, Date.now() - Number(line.polyUpdateAgeMs))
+        Math.max(0, tickTs - Number(line.polyUpdateAgeMs))
       );
     }
     if (Number.isFinite(Number(line.pBase)) || Number.isFinite(Number(line.pBoosted)) || Number.isFinite(Number(line.pUpModel))) {
-      this.polyState.lastModelTs = Math.max(this.polyState.lastModelTs, Date.now());
+      this.polyState.lastModelTs = Math.max(this.polyState.lastModelTs, tickTs);
     }
     this.polyState.latestPolymarketTs = Math.max(
       Number(this.polyState.latestPolymarketTs || 0),
       Number(this.latestPolymarketSnapshot?.ts || 0),
-      Number(this.polyState.lastFetchOkTs || 0)
+      Number(this.polyState.lastFetchOkTs || 0),
+      Number.isFinite(Number(line.yesMid)) || Boolean(line.selectedSlug || line.currentMarketId) ? tickTs : 0
     ) || null;
+    const nextSelectedSlug =
+      line.selectedSlug !== undefined ? line.selectedSlug : this.truthSelection.selectedSlug;
+    const nextSelectedMarketId =
+      line.currentMarketId !== undefined ? line.currentMarketId : this.truthSelection.selectedMarketId;
+    const nextWindowStartTs =
+      Number((line.windowStart ?? this.truthSelection.windowStartTs) || 0) > 0
+        ? Number(line.windowStart ?? this.truthSelection.windowStartTs)
+        : null;
+    const nextWindowEndTs =
+      Number((line.windowEnd ?? this.truthSelection.windowEndTs) || 0) > 0
+        ? Number(line.windowEnd ?? this.truthSelection.windowEndTs)
+        : null;
+    const nextHasSelection = Boolean(nextSelectedSlug || nextSelectedMarketId);
     this.truthSelection = {
       finalCandidatesCount: line.finalCandidatesCount ?? this.truthSelection.finalCandidatesCount,
-      selectedSlug: line.selectedSlug ?? this.truthSelection.selectedSlug,
-      selectedMarketId: line.currentMarketId ?? this.truthSelection.selectedMarketId,
-      windowEndTs: line.windowEnd ?? this.truthSelection.windowEndTs
+      selectedSlug: nextSelectedSlug,
+      selectedMarketId: nextSelectedMarketId,
+      windowStartTs: nextWindowStartTs,
+      windowEndTs: nextWindowEndTs,
+      remainingSec:
+        Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0
+          ? Math.floor(Number(line.tauSec))
+          : nextHasSelection && nextWindowEndTs && nextWindowEndTs > tickTs
+            ? Math.floor((nextWindowEndTs - tickTs) / 1000)
+            : null
     };
+    if (line.chosenDirection !== undefined) {
+      this.truthChosenDirection = line.chosenDirection;
+    }
+    if (line.entriesInWindow !== undefined) {
+      this.truthEntriesInWindow = Number.isFinite(Number(line.entriesInWindow))
+        ? Math.max(0, Math.floor(Number(line.entriesInWindow)))
+        : null;
+    }
+    if (line.windowRealizedPnlUsd !== undefined) {
+      this.truthWindowRealizedPnlUsd = Number.isFinite(Number(line.windowRealizedPnlUsd))
+        ? Number(line.windowRealizedPnlUsd)
+        : null;
+    }
+    if (line.resolutionSource !== undefined) {
+      this.truthResolutionSource = line.resolutionSource;
+    }
     this.truthDataHealth = {
       oracleSource: this.polyState.oracleSource ?? this.truthDataHealth.oracleSource,
       oracleState: this.polyState.oracleState ?? this.truthDataHealth.oracleState,
@@ -3662,10 +5945,10 @@ export class PolymarketEngine {
     };
     this.polyState.lastUpdateTs = Math.max(this.polyState.lastUpdateTs, tickTs);
     this.polyEngineRunning = this.polyState.lastFetchAttemptTs > 0;
-    const actionRoot = String(line.action || "").split(":")[0].trim().toUpperCase();
+    const actionRoot = this.getTickActionRoot(line.action);
     if (actionRoot === "HOLD") {
       this.truthHoldReason = normalizeHoldReason(line.holdReason || line.action);
-    } else if (actionRoot === "BUY_YES" || actionRoot === "BUY_NO") {
+    } else {
       this.truthHoldReason = null;
     }
   }
@@ -3696,9 +5979,8 @@ export class PolymarketEngine {
       this.truthHoldReason = params.holdReason ? normalizeHoldReason(params.holdReason) : null;
     }
     const summary = this.paperLedger.getSummary(params.ts);
-    const windowEndTs = this.truthSelection.windowEndTs;
-    const remainingSec =
-      windowEndTs && windowEndTs > 0 ? Math.floor((windowEndTs - Date.now()) / 1000) : null;
+    const resolutionStats = this.getPaperResolutionStats(params.ts);
+    const selectionSnapshot = this.getTruthSelectionSnapshot(params.ts);
     this.truthReporter.updatePolymarket({
       ts: params.ts,
       force: params.force ?? false,
@@ -3709,20 +5991,29 @@ export class PolymarketEngine {
       polyEngineRunning: this.polyState.lastFetchAttemptTs > 0,
       fetchOk: this.polyState.lastFetchOkTs > 0 && this.polyState.lastHttpStatus === 200,
       lastAction: this.truthLastAction,
-      openTrades: summary.openPositions,
+      openTrades: resolutionStats.openTradesCount,
+      awaitingResolutionTrades: resolutionStats.awaitingResolutionCount,
+      resolutionErrorTrades: resolutionStats.resolutionErrorCount,
+      resolutionQueueCount: resolutionStats.resolutionQueueCount,
       resolvedTrades: summary.resolvedTrades,
       pnlTotalUsd: summary.totalPnlUsd,
       lastTradeId: this.truthLastTradeId,
       lastSlug: this.truthLastSlug,
       lastTradeTs: this.truthLastTradeTs,
       holdReason: this.truthHoldReason,
-      finalCandidatesCount: this.truthSelection.finalCandidatesCount,
+      currentWindowHoldReason: this.truthHoldReason,
+      chosenDirection: this.truthChosenDirection,
+      entriesInWindow: this.truthEntriesInWindow,
+      windowRealizedPnlUsd: this.truthWindowRealizedPnlUsd,
+      resolutionSource: this.truthResolutionSource,
+      finalCandidatesCount: selectionSnapshot.finalCandidatesCount,
       discoveredCandidatesCount: this.polyState.fetchedCount,
       windowsCount: this.polyState.afterWindowCount,
-      selectedSlug: this.truthSelection.selectedSlug,
-      selectedMarketId: this.truthSelection.selectedMarketId,
-      windowEndTs,
-      remainingSec,
+      selectedSlug: selectionSnapshot.selectedSlug,
+      selectedMarketId: selectionSnapshot.selectedMarketId,
+      windowStartTs: selectionSnapshot.windowStartTs,
+      windowEndTs: selectionSnapshot.windowEndTs,
+      remainingSec: selectionSnapshot.remainingSec,
       oracleSource: this.truthDataHealth.oracleSource,
       oracleState: this.truthDataHealth.oracleState,
       latestPolymarketTs: this.truthDataHealth.latestPolymarketTs,
@@ -3760,6 +6051,47 @@ export class PolymarketEngine {
     );
     if (this.config.polymarket.mode === "paper") {
       this.paperLedger.appendStartup();
+    }
+  }
+
+  private syncPaperLedgerFromDisk(): void {
+    if (this.config.polymarket.mode !== "paper") {
+      return;
+    }
+    this.paperLedger.reloadFromDisk();
+    const liveTradeIds = new Set(this.paperLedger.getAllTrades().map((trade) => trade.id));
+    const pruneMissing = <T>(store: Map<string, T>): void => {
+      for (const tradeId of store.keys()) {
+        if (!liveTradeIds.has(tradeId)) {
+          store.delete(tradeId);
+        }
+      }
+    };
+    pruneMissing(this.paperStopLossTicksByTradeId);
+    pruneMissing(this.paperBestUnrealizedPnlUsdByTradeId);
+    pruneMissing(this.resolutionPendingLogByTradeId);
+    if (liveTradeIds.size === 0) {
+      this.paperDecisionByIntervalKey.clear();
+      this.lastPaperIntervalKey = null;
+      this.lastPaperIntervalEndTs = null;
+      this.truthLastAction = "HOLD";
+      this.truthLastActionTs = 0;
+      this.truthLastTradeId = null;
+      this.truthLastSlug = null;
+      this.truthLastTradeTs = null;
+      this.truthHoldReason = null;
+      this.truthChosenDirection = null;
+      this.truthEntriesInWindow = 0;
+      this.truthWindowRealizedPnlUsd = 0;
+      this.truthResolutionSource = null;
+      this.truthSelection = {
+        finalCandidatesCount: null,
+        selectedSlug: null,
+        selectedMarketId: null,
+        windowStartTs: null,
+        windowEndTs: null,
+        remainingSec: null
+      };
     }
   }
 
@@ -4821,6 +7153,7 @@ type TickLogLine = {
   edgeYes?: number | null;
   edgeNo?: number | null;
   chosenSide?: "YES" | "NO" | null;
+  chosenDirection?: string | null;
   chosenEdge?: number | null;
   conviction?: number | null;
   stalenessEdge?: number | null;
@@ -4829,7 +7162,12 @@ type TickLogLine = {
   action: string;
   size?: number | null;
   openTrades?: number;
+  awaitingResolutionCount?: number;
+  resolutionQueueCount?: number;
   resolvedTrades?: number;
+  entriesInWindow?: number | null;
+  windowRealizedPnlUsd?: number | null;
+  resolutionSource?: string | null;
   oracleSource?: string;
   oracleTs?: number | null;
   oracleStaleMs?: number | null;
@@ -4840,6 +7178,7 @@ type TickLogLine = {
   lastHttpStatus?: number;
   tradingPaused?: boolean;
   pauseReason?: string | null;
+  warningState?: string | null;
   pauseSinceTs?: number | null;
   selectedSlug: string | null;
   windowStart: number | null;
@@ -5190,15 +7529,25 @@ function parseRawMarketToBtcWindow(
       "startTime"
     ]
   );
-  let priceToBeat = pickRawNumber(row, [
+  let priceToBeat = sanitizePaperPriceToBeatCandidate(
+    pickRawNumber(row, [
     "price_to_beat",
     "priceToBeat",
     "target_price",
     "strike",
     "threshold"
-  ]);
+    ]),
+    question,
+    slug,
+    oracleReferencePrice
+  );
   if (!(priceToBeat > 0)) {
-    priceToBeat = parsePriceToBeatFromText(question);
+    priceToBeat = sanitizePaperPriceToBeatCandidate(
+      parsePriceToBeatFromText(question),
+      question,
+      slug,
+      oracleReferencePrice
+    );
   }
   if (!(priceToBeat > 0)) {
     priceToBeat = oracleReferencePrice && oracleReferencePrice > 0 ? oracleReferencePrice : 50_000;
@@ -5207,6 +7556,7 @@ function parseRawMarketToBtcWindow(
   const yesTokenId = clobTokenIds[0];
   const noTokenId = clobTokenIds[1];
   if (!yesTokenId || !noTokenId || yesTokenId === noTokenId) return null;
+  const directionalLabels = deriveDirectionalDisplayLabelsFromRawMarket(row, question);
   const tickSize = normalizeTickSize(
     pickRawString(row, ["minimum_tick_size", "tickSize", "tick_size"])
   );
@@ -5220,6 +7570,8 @@ function parseRawMarketToBtcWindow(
     startTs: startTs > 0 ? startTs : undefined,
     yesTokenId,
     noTokenId,
+    yesDisplayLabel: directionalLabels.yesDisplayLabel,
+    noDisplayLabel: directionalLabels.noDisplayLabel,
     tickSize: tickSize ?? undefined,
     negRisk,
     acceptingOrders,
@@ -5253,6 +7605,57 @@ function parseOutcomePricesHint(row: Record<string, unknown>): number[] | undefi
     }
   }
   return undefined;
+}
+
+function deriveDirectionalDisplayLabelsFromRawMarket(
+  row: Record<string, unknown>,
+  question: string
+): { yesDisplayLabel: string; noDisplayLabel: string } {
+  const outcomes = parseRawStringArray(
+    row.outcomes ??
+      row.outcomeNames ??
+      row.outcome_names ??
+      row.options ??
+      row.labels
+  );
+  const yesCandidate = outcomes[0];
+  const noCandidate = outcomes[1];
+  return {
+    yesDisplayLabel: normalizeDirectionalDisplayLabel(yesCandidate, question, "YES"),
+    noDisplayLabel: normalizeDirectionalDisplayLabel(noCandidate, question, "NO")
+  };
+}
+
+function normalizeDirectionalDisplayLabel(
+  raw: string | null | undefined,
+  question: string | null | undefined,
+  side: "YES" | "NO"
+): string {
+  const normalized = String(raw || "").trim().toUpperCase();
+  if (
+    normalized.includes("UP") ||
+    normalized.includes("HIGHER") ||
+    normalized.includes("ABOVE") ||
+    normalized.includes("RISE")
+  ) {
+    return "UP";
+  }
+  if (
+    normalized.includes("DOWN") ||
+    normalized.includes("LOWER") ||
+    normalized.includes("BELOW") ||
+    normalized.includes("FALL")
+  ) {
+    return "DOWN";
+  }
+  const text = String(question || "").trim().toLowerCase();
+  if (text.includes("above") || text.includes("higher") || text.includes("up")) {
+    return side === "YES" ? "UP" : "DOWN";
+  }
+  if (text.includes("below") || text.includes("lower") || text.includes("down")) {
+    return side === "YES" ? "DOWN" : "UP";
+  }
+  return side === "YES" ? "UP" : "DOWN";
 }
 
 function parseRawTokens(
@@ -5411,10 +7814,48 @@ function pickRawTimestamp(obj: Record<string, unknown>, keys: string[]): number 
 
 function parsePriceToBeatFromText(text: string): number {
   const normalized = String(text || "").replace(/,/g, "");
-  const match = normalized.match(/\$?([0-9]+(?:\.[0-9]+)?)\s*(?:usd)?/i);
-  if (!match) return Number.NaN;
-  const parsed = Number(match[1]);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number.NaN;
+  const contextualPatterns = [
+    /(?:price\s+to\s+beat|target(?:\s+price)?|strike|threshold|from|at|above|below|over|under|higher\s+than|lower\s+than)\s*\$?([0-9]+(?:\.[0-9]+)?)\s*(?:usd)?/i,
+    /\$([0-9]+(?:\.[0-9]+)?)\s*(?:usd)?/i
+  ];
+  for (const pattern of contextualPatterns) {
+    const match = normalized.match(pattern);
+    if (!match) continue;
+    const parsed = Number(match[1]);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return Number.NaN;
+}
+
+function sanitizePaperPriceToBeatCandidate(
+  candidate: number,
+  question: string,
+  slug: string,
+  oracleReferencePrice: number | null
+): number {
+  if (!(candidate > 0)) return Number.NaN;
+  const normalizedQuestion = String(question || "").trim().toLowerCase();
+  const normalizedSlug = String(slug || "").trim().toLowerCase();
+  const isBtc5mFastMarket =
+    normalizedSlug.startsWith("btc-updown-5m-") ||
+    (normalizedQuestion.includes("bitcoin") || normalizedQuestion.includes("btc")) &&
+      (normalizedQuestion.includes("5 minute") || normalizedQuestion.includes("next 5 minutes"));
+  const hasExplicitStrikeHint =
+    /\$\s*[0-9]/.test(normalizedQuestion) ||
+    /\b(price\s+to\s+beat|target(?:\s+price)?|strike|threshold|from|at|above|below|over|under|higher\s+than|lower\s+than)\b/.test(
+      normalizedQuestion
+    );
+  const oraclePrice = Number(oracleReferencePrice || 0);
+  if (isBtc5mFastMarket && oraclePrice > 0 && !hasExplicitStrikeHint) {
+    const minReasonable = oraclePrice * 0.5;
+    const maxReasonable = oraclePrice * 1.5;
+    if (candidate < minReasonable || candidate > maxReasonable) {
+      return Number.NaN;
+    }
+  }
+  return candidate;
 }
 
 function normalizeTickSize(value: string): "0.1" | "0.01" | "0.001" | "0.0001" | null {
@@ -5493,6 +7934,18 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
     return normalizeHoldReason(raw.slice(5));
   }
   if (upper === "HOLD") return "HOLD_GENERIC";
+  if (upper.includes("NO_ACTIVE_BTC5M_MARKET") || upper.includes("BTC5M_NOT_FOUND")) return "NO_ACTIVE_BTC5M_MARKET";
+  if (upper.includes("EXPIRED_WINDOW")) return "EXPIRED_WINDOW";
+  if (upper.includes("AWAITING_RESOLUTION") || upper.includes("MARKET_CLOSED_AWAITING_OUTCOME")) {
+    return "AWAITING_RESOLUTION";
+  }
+  if (upper.includes("NO_NEW_ORDERS_FINAL_SECONDS")) return "NO_NEW_ORDERS_FINAL_SECONDS";
+  if (upper.includes("OPEN_POSITION_IN_WINDOW")) return "OPEN_POSITION_IN_WINDOW";
+  if (upper.includes("REENTRY_COOLDOWN")) return "REENTRY_COOLDOWN";
+  if (upper.includes("TOO_LATE_FOR_ENTRY")) return "TOO_LATE_FOR_ENTRY";
+  if (upper.includes("SIZE_BELOW_MIN_NOTIONAL")) return "SIZE_BELOW_MIN_NOTIONAL";
+  if (upper.includes("WINDOW_ALREADY_OPEN") || upper.includes("WINDOW_ALREADY_TRADED")) return "DUPLICATE_WINDOW";
+  if (upper.includes("ORACLE_STALE_BOOK_STALE")) return "ORACLE_STALE_BOOK_STALE";
   if (upper.includes("OUTSIDE_SNIPING_WINDOW")) return "WINDOW_OUTSIDE_SNIPER_RANGE";
   if (upper.includes("NET_EDGE_BELOW_PAPER_MIN") || upper.includes("NET_EDGE_BELOW_MIN_NET_EDGE")) {
     return "EDGE_BELOW_THRESHOLD";
