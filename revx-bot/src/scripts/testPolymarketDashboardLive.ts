@@ -261,6 +261,7 @@ function run(): void {
           windowStartTs: baseNow - 56_000,
           windowEndTs: baseNow + 244_000,
           remainingSec: 244,
+          chosenSide: "NO",
           chosenDirection: "DOWN",
           entriesInWindow: 2,
           realizedPnlUsd: 0.68,
@@ -377,6 +378,9 @@ function run(): void {
     assert(Number(payload.summary?.windowEndTs || 0) > Number(payload.serverNowTs || 0), "summary should expose an active windowEndTs");
     assert(Number(payload.summary?.windowStartTs || 0) > 0, "summary should expose windowStartTs");
     assert(String(payload.summary?.lifecycleStatus || "") === "OPEN", "summary should expose lifecycleStatus");
+    assert(Object.prototype.hasOwnProperty.call(payload.summary || {}, "pollMode"), "summary should expose pollMode field");
+    assert(Object.prototype.hasOwnProperty.call(payload.summary || {}, "holdCategory"), "summary should expose holdCategory field");
+    assert(Object.prototype.hasOwnProperty.call(payload.summary || {}, "selectedTokenId"), "summary should expose selectedTokenId field");
     assert(Number(payload.summary?.lastActionTs || 0) > 0, "summary should expose lastActionTs");
     assert(Number(payload.summary?.openTrade?.livePrice || 0) === 0.62, "summary should expose open trade livePrice");
     assert(Number(payload.summary?.openTrade?.contractLivePrice || 0) === 0.62, "summary should expose contractLivePrice");
@@ -452,6 +456,9 @@ function run(): void {
     assert(htmlSink.body.includes("Estimated Live"), "dashboard should label estimated live explicitly");
     assert(htmlSink.body.includes("Entries In Window"), "dashboard should expose entries in window in dedicated fields");
     assert(htmlSink.body.includes("Lifecycle"), "dashboard should expose lifecycle in dedicated fields");
+    assert(htmlSink.body.includes("Hold Category"), "dashboard should expose hold category");
+    assert(htmlSink.body.includes("Poll Mode"), "dashboard should expose poll mode");
+    assert(htmlSink.body.includes("Selected Token"), "dashboard should expose selected token id");
     assert(htmlSink.body.includes('id="pmCurrentPanel"'), "polymarket HTML should include current/model details panel");
     assert(!htmlSink.body.includes('id="pmCurrentPanel" open'), "current/model panel should be collapsed by default");
     assert(htmlSink.body.includes('id="pmLagPanel"'), "polymarket HTML should include lag details panel");

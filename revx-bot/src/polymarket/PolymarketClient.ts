@@ -26,6 +26,13 @@ type ClobCreds = {
 };
 
 type CredsSource = "env" | "cache" | "derived";
+type TradeAuthDebugInfo = {
+  signerAddress: string;
+  signatureType: number;
+  funder: string;
+  apiKeyPrefix: string;
+  credsSource: CredsSource;
+};
 
 export type RawPolymarketMarket = Record<string, unknown>;
 export type RawPolymarketMarketPage = {
@@ -51,6 +58,18 @@ export type TokenOrderBook = {
   bids: OrderBookLevel[];
   asks: OrderBookLevel[];
   ts: number;
+};
+
+export type TokenPriceQuote = {
+  tokenId: string;
+  price: number;
+  bestBid: number | null;
+  bestAsk: number | null;
+  mid: number;
+  ts: number;
+  source: "clob_price" | "book_mid";
+  fetchFailed: boolean;
+  failedSides: Array<"BUY" | "SELL">;
 };
 
 type OpenOrderRow = {
@@ -139,6 +158,7 @@ export class PolymarketClient {
   private readonly requestScheduler: RequestScheduler;
   private readonly tickSizeCache = new Map<string, TickSize>();
   private readonly negRiskCache = new Map<string, boolean>();
+  private readonly feeRateCache = new Map<string, number>();
   private transientFailureCount = 0;
   private circuitOpenUntilTs = 0;
   private readonly circuitFailureThreshold = 5;
@@ -154,7 +174,11 @@ export class PolymarketClient {
   private clobModule: any | null = null;
   private publicClient: any | null = null;
   private authClient: any | null = null;
+  private authClientContextSignature: string | null = null;
+  private authClientInfo: TradeAuthDebugInfo | null = null;
   private resolvedCredsSource: CredsSource | "none" = "none";
+  private lastRetryWarningSignature = "";
+  private lastRetryWarningLogTs = 0;
 
   constructor(private readonly config: BotConfig, private readonly logger: Logger) {
     this.gammaBaseUrl = config.polymarket.baseUrls.gamma.replace(/\/+$/, "");
@@ -766,7 +790,100 @@ export class PolymarketClient {
     return this.parseOrderBookPayload(book, tokenId);
   }
 
-  async placeMarketableOrder(params: {
+  async getTokenPriceQuote(
+    tokenId: string,
+    options: {
+      slug?: string | null;
+    } = {}
+  ): Promise<TokenPriceQuote> {
+    validateTokenId(tokenId);
+    const slug = String(options.slug || "").trim() || null;
+    const client = await this.getPublicClient();
+    const buySide = normalizePolymarketClobSide("BUY");
+    const sellSide = normalizePolymarketClobSide("SELL");
+    const failedSides: Array<"BUY" | "SELL"> = [];
+    const fetchPricePoint = async (side: "BUY" | "SELL"): Promise<{ price: number; ts: number } | null> => {
+      const normalizedSide = normalizePolymarketClobSide(side);
+      if (!normalizedSide) {
+        failedSides.push(side);
+        this.logPriceProbe(slug, tokenId, side, false, "INVALID_SIDE");
+        return null;
+      }
+      try {
+        const payload = await this.runClobCall(`getPrice:${normalizedSide.toLowerCase()}`, async () =>
+          client.getPrice(tokenId, normalizedSide)
+        );
+        const parsed = parseMarketPricePayload(payload);
+        if (!parsed) {
+          failedSides.push(side);
+          this.logPriceProbe(slug, tokenId, normalizedSide, false, "EMPTY_PRICE");
+          return null;
+        }
+        this.logPriceProbe(slug, tokenId, normalizedSide, true);
+        return parsed;
+      } catch (error) {
+        failedSides.push(side);
+        this.logPriceProbe(slug, tokenId, normalizedSide, false, shortErrorMessage(error));
+        return null;
+      }
+    };
+
+    const sellPoint = sellSide ? await fetchPricePoint(sellSide) : null;
+    const buyPoint = buySide ? await fetchPricePoint(buySide) : null;
+    if (sellPoint || buyPoint) {
+      const bestBid =
+        sellPoint && Number.isFinite(Number(sellPoint.price)) ? clamp(Number(sellPoint.price), 0.0001, 0.9999) : null;
+      const bestAsk =
+        buyPoint && Number.isFinite(Number(buyPoint.price)) ? clamp(Number(buyPoint.price), 0.0001, 0.9999) : null;
+      const mid =
+        bestBid !== null && bestAsk !== null
+          ? clamp((bestBid + bestAsk) / 2, 0.0001, 0.9999)
+          : bestBid !== null
+            ? bestBid
+            : bestAsk !== null
+              ? bestAsk
+              : 0.5;
+      return {
+        tokenId,
+        price: mid,
+        bestBid,
+        bestAsk,
+        mid,
+        ts: Math.max(Number(sellPoint?.ts || 0), Number(buyPoint?.ts || 0), Date.now()),
+        source: "clob_price",
+        fetchFailed: failedSides.length > 0,
+        failedSides
+      };
+    }
+
+    const book = await this.getTokenOrderBook(tokenId);
+    const bestBid =
+      Number.isFinite(book.bestBid) && book.bestBid > 0 ? clamp(book.bestBid, 0.0001, 0.9999) : null;
+    const bestAsk =
+      Number.isFinite(book.bestAsk) && book.bestAsk > 0 ? clamp(book.bestAsk, 0.0001, 0.9999) : null;
+    const mid =
+      bestBid !== null && bestAsk !== null
+        ? clamp((bestBid + bestAsk) / 2, 0.0001, 0.9999)
+        : bestBid !== null
+          ? bestBid
+          : bestAsk !== null
+            ? bestAsk
+            : 0.5;
+    return {
+      tokenId,
+      price: mid,
+      bestBid,
+      bestAsk,
+      mid,
+      ts: book.ts,
+      source: "book_mid",
+      fetchFailed: true,
+      failedSides
+    };
+  }
+
+  async placeMarketableBuyYes(params: {
+    marketId?: string;
     tokenId: string;
     side: "BUY" | "SELL";
     limitPrice: number;
@@ -780,24 +897,132 @@ export class PolymarketClient {
     validateSize(params.size);
 
     const authClient = await this.getAuthClient();
+    const authInfo = this.authClientInfo;
     const orderType = await this.getOrderTypeConstant("GTD");
-
-    const expirationSec = Math.floor((Date.now() + Math.max(1000, params.ttlMs)) / 1000);
     const tickSize = params.tickSize ?? (await this.getTickSize(params.tokenId));
     const negRisk = params.negRisk ?? (await this.getNegRisk(params.tokenId));
-
-    const { userOrder, options } = buildCreateOrderInput({
-      tokenId: params.tokenId,
-      side: params.side,
-      price: params.limitPrice,
-      size: params.size,
-      expirationSec,
-      tickSize,
-      negRisk
-    });
-
-    const response = await this.runClobCall("createAndPostOrder", async () =>
-      authClient.createAndPostOrder(userOrder, options, orderType, false, false)
+    const feeRateBps = await this.getFeeRateBps(params.tokenId);
+    const response = await this.runClobCall(
+      "postOrder",
+      async (attempt) => {
+        const expirationPlan = computeLiveOrderExpirationSec(params.ttlMs, Date.now());
+        const { userOrder, options } = buildCreateOrderInput({
+          tokenId: params.tokenId,
+          side: "BUY",
+          price: params.limitPrice,
+          size: params.size,
+          expirationSec: expirationPlan.expirationSec,
+          feeRateBps,
+          tickSize,
+          negRisk
+        });
+        const finalizedUserOrder = this.cloneJsonValue(userOrder);
+        const finalizedOptions = this.cloneJsonValue(options);
+        const finalizedInputBeforeCreate = JSON.stringify({
+          userOrder: finalizedUserOrder,
+          options: finalizedOptions
+        });
+        const signingPayloadSummary = this.summarizeOrderPayload({
+          userOrder: finalizedUserOrder,
+          options: finalizedOptions
+        });
+        this.logger.info(
+          {
+            tokenId: params.tokenId,
+            marketId: params.marketId ?? null,
+            attempt,
+            nowSec: expirationPlan.nowSec,
+            expirationSec: expirationPlan.expirationSec,
+            requestedTtlSec: expirationPlan.requestedTtlSec,
+            mandatoryLeadSec: expirationPlan.mandatoryLeadSec,
+            safetyBufferSec: expirationPlan.safetyBufferSec,
+            minExpirationSec: expirationPlan.minExpirationSec,
+            signerAddress: authInfo?.signerAddress ?? null,
+            signatureType: authInfo?.signatureType ?? null,
+            funder: authInfo?.funder ?? null,
+            apiKeyPrefix: authInfo?.apiKeyPrefix ?? null,
+            credsSource: authInfo?.credsSource ?? null,
+            orderPrice: finalizedUserOrder.price,
+            orderSize: finalizedUserOrder.size,
+            orderExpirationSec: finalizedUserOrder.expiration,
+            orderSide: finalizedUserOrder.side,
+            feeRateBps: finalizedUserOrder.feeRateBps ?? feeRateBps,
+            signingPayload: signingPayloadSummary
+          },
+          "POLY_ORDER_ATTEMPT"
+        );
+        try {
+          const signedOrder = await authClient.createOrder(finalizedUserOrder, finalizedOptions);
+          this.assertPayloadUnchanged(
+            "Polymarket userOrder/options payload",
+            finalizedInputBeforeCreate,
+            { userOrder: finalizedUserOrder, options: finalizedOptions },
+            { payloadMutatedBetweenSignAndPost: false }
+          );
+          const signedOrderBeforePost = JSON.stringify(signedOrder);
+          const postingPayloadSummary = this.summarizeOrderPayload(signedOrder);
+          const result = await authClient.postOrder(signedOrder, orderType, false, false);
+          this.assertPayloadUnchanged("Polymarket signed order payload", signedOrderBeforePost, signedOrder, {
+            payloadMutatedBetweenSignAndPost: true
+          });
+          this.logger.info(
+            {
+              tokenId: params.tokenId,
+              marketId: params.marketId ?? null,
+              attempt,
+              nowSec: expirationPlan.nowSec,
+              expirationSec: expirationPlan.expirationSec,
+              orderPrice: finalizedUserOrder.price,
+              orderSize: finalizedUserOrder.size,
+              feeRateBps: finalizedUserOrder.feeRateBps ?? feeRateBps,
+              orderSide: finalizedUserOrder.side,
+              signingPayload: signingPayloadSummary,
+              postingPayload: postingPayloadSummary
+            },
+            "POLY_ORDER_RESULT"
+          );
+          return result;
+        } catch (error) {
+          const errorText = shortErrorMessage(error).toUpperCase();
+          this.logger.warn(
+            {
+              tokenId: params.tokenId,
+              marketId: params.marketId ?? null,
+              attempt,
+              nowSec: expirationPlan.nowSec,
+              expirationSec: expirationPlan.expirationSec,
+              signerAddress: authInfo?.signerAddress ?? null,
+              signatureType: authInfo?.signatureType ?? null,
+              funder: authInfo?.funder ?? null,
+              errorSummary: shortErrorMessage(error),
+              signingPayload: signingPayloadSummary,
+              payloadMutatedBetweenSignAndPost: false,
+              authDiagnosticHint: errorText.includes("SIGNATURE")
+                ? "verify signer/funder/signatureType/tokenId/expirationSec and signing vs posting payload parity"
+                : null
+            },
+            "POLY_ORDER_RESULT"
+          );
+          throw error;
+        }
+      },
+      {
+        isRetryable: (error) => isRetryableError(error) || isOrderRebuildRequiredError(error),
+        onRetry: (attempt, error, delayMs) => {
+          if (this.config.debugHttp || process.env.DEBUG_POLY === "1") {
+            this.logger.warn(
+              {
+                label: "postOrder",
+                attempt,
+                delayMs,
+                rebuildRequired: isOrderRebuildRequiredError(error),
+                errorSummary: shortErrorMessage(error)
+              },
+              "Polymarket live order retrying with rebuilt payload"
+            );
+          }
+        }
+      }
     );
 
     const orderId = pickString(response, ["orderID", "order_id", "id"]);
@@ -910,7 +1135,54 @@ export class PolymarketClient {
     return value;
   }
 
-  private async runClobCall<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  async getFeeRateBps(tokenId: string): Promise<number> {
+    const cached = this.feeRateCache.get(tokenId);
+    if (cached !== undefined) return cached;
+    const publicClient = await this.getPublicClient();
+    const raw = await this.runClobCall("getFeeRateBps", async () => publicClient.getFeeRateBps(tokenId));
+    const value = Math.max(0, Math.floor(Number(raw || 0)));
+    this.feeRateCache.set(tokenId, value);
+    return value;
+  }
+
+  private cloneJsonValue<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
+  }
+
+  private assertPayloadUnchanged(
+    label: string,
+    before: string,
+    afterValue: unknown,
+    context: { payloadMutatedBetweenSignAndPost: boolean }
+  ): void {
+    const after = JSON.stringify(afterValue);
+    if (before !== after) {
+      const beforePayload = this.summarizeOrderPayload(parseJsonSafe(before));
+      const afterPayload = this.summarizeOrderPayload(afterValue);
+      this.logger.error(
+        {
+          label,
+          payloadMutatedBetweenSignAndPost: context.payloadMutatedBetweenSignAndPost,
+          signerAddress: this.authClientInfo?.signerAddress ?? null,
+          signatureType: this.authClientInfo?.signatureType ?? null,
+          funder: this.authClientInfo?.funder ?? null,
+          beforePayload,
+          afterPayload
+        },
+        "POLY_ORDER_PAYLOAD_MUTATED"
+      );
+      throw new Error(`${label} mutated after signing/finalization`);
+    }
+  }
+
+  private async runClobCall<T>(
+    label: string,
+    fn: (attempt: number) => Promise<T>,
+    options?: {
+      isRetryable?: (error: unknown) => boolean;
+      onRetry?: (attempt: number, error: unknown, delayMs: number) => void;
+    }
+  ): Promise<T> {
     this.throwIfCircuitOpen(label);
     this.markIngestionAttempt();
     const trace = beginHttpRequestTrace({
@@ -923,11 +1195,12 @@ export class PolymarketClient {
       module: "polymarket"
     });
     try {
+      let attempt = 0;
       const result = await withRetry(
         () =>
           this.requestScheduler.schedule(() =>
             withTimeout(
-              fn(),
+              fn(++attempt),
               this.getHttpTimeoutMs(),
               `Polymarket CLOB call timeout (${label})`
             )
@@ -937,17 +1210,32 @@ export class PolymarketClient {
           baseDelayMs: this.config.polymarket.http.baseBackoffMs,
           maxDelayMs: this.config.polymarket.http.maxBackoffMs,
           jitterMs: this.config.polymarket.http.jitterMs,
-          isRetryable: (error) => isRetryableError(error),
+          isRetryable: (error) => options?.isRetryable ? options.isRetryable(error) : isRetryableError(error),
           onRetry: (attempt, error, delayMs) => {
-            this.logger.warn(
-              {
-                label,
-                attempt,
-                delayMs,
-                error: serializeError(error)
-              },
-              "Polymarket call retrying"
-            );
+            const nowTs = Date.now();
+            const errorSummary = shortErrorMessage(error);
+            const signature = JSON.stringify({
+              label,
+              error: errorSummary
+            });
+            if (
+              signature !== this.lastRetryWarningSignature ||
+              nowTs - this.lastRetryWarningLogTs >= 15_000
+            ) {
+              this.lastRetryWarningSignature = signature;
+              this.lastRetryWarningLogTs = nowTs;
+              if (this.isPolyVerboseDebug()) {
+                const payload: Record<string, unknown> = {
+                  label,
+                  attempt,
+                  delayMs,
+                  errorSummary,
+                  error: serializeError(error)
+                };
+                this.logger.warn(payload, "Polymarket call retrying");
+              }
+            }
+            options?.onRetry?.(attempt, error, delayMs);
           }
         }
       );
@@ -959,9 +1247,46 @@ export class PolymarketClient {
       this.markNetworkFailure(label, error);
       this.markIngestionFailure(error, extractStatus(error) ?? 0);
       trace.fail(error, extractStatus(error), null);
-      this.logger.error({ label, error: serializeError(error) }, "Polymarket CLOB call failed after retries");
+      const payload: Record<string, unknown> = {
+        label,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.error(payload, "Polymarket CLOB call failed after retries");
       throw error;
     }
+  }
+
+  private summarizeOrderPayload(value: unknown): Record<string, unknown> {
+    const object = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+    const userOrder =
+      object.userOrder && typeof object.userOrder === "object"
+        ? (object.userOrder as Record<string, unknown>)
+        : object;
+    const options =
+      object.options && typeof object.options === "object"
+        ? (object.options as Record<string, unknown>)
+        : null;
+    return {
+      tokenId:
+        pickString(userOrder, ["tokenID", "tokenId", "asset_id", "assetId"]) ||
+        pickString(object, ["tokenID", "tokenId", "asset_id", "assetId"]) ||
+        null,
+      side: pickString(userOrder, ["side"]) || pickString(object, ["side"]) || null,
+      price: asNumber(userOrder.price ?? object.price),
+      size: asNumber(userOrder.size ?? object.size),
+      expirationSec: asNumber(userOrder.expiration ?? object.expiration),
+      feeRateBps: asNumber(userOrder.feeRateBps ?? object.feeRateBps),
+      tickSize: options ? pickString(options, ["tickSize"]) : pickString(object, ["tickSize"]),
+      negRisk:
+        (options ? pickBoolean(options, ["negRisk"]) : pickBoolean(object, ["negRisk"])) ?? null
+    };
+  }
+
+  private isPolyVerboseDebug(): boolean {
+    return this.config.debugHttp || process.env.DEBUG_POLY === "1" || process.env.DEBUG_POLY_VERBOSE === "true";
   }
 
   private async getPublicClient(): Promise<any> {
@@ -977,12 +1302,26 @@ export class PolymarketClient {
   }
 
   private async getAuthClient(): Promise<any> {
-    if (this.authClient) return this.authClient;
-
-    const module = await this.getClobModule();
     const signerCtx = await this.requireSignerContext();
     const { creds, source } = await this.resolveTradeCreds(signerCtx);
+    const contextSignature = this.buildTradeAuthContextSignature(signerCtx, creds);
+    if (this.authClient && this.authClientContextSignature === contextSignature) {
+      return this.authClient;
+    }
+    if (this.authClient && this.authClientContextSignature !== contextSignature) {
+      this.logger.warn(
+        {
+          signerAddress: signerCtx.signerAddress,
+          signatureType: signerCtx.signatureType,
+          funder: signerCtx.funder,
+          apiKeyPrefix: prefixApiKey(creds.key),
+          credsSource: source
+        },
+        "Reinitializing Polymarket trade client after auth context change"
+      );
+    }
 
+    const module = await this.getClobModule();
     this.authClient = createPolymarketClobClient({
       mode: "trade",
       host: this.clobBaseUrl,
@@ -993,6 +1332,14 @@ export class PolymarketClient {
       signatureType: signerCtx.signatureType,
       funder: signerCtx.funder
     });
+    this.authClientContextSignature = contextSignature;
+    this.authClientInfo = {
+      signerAddress: signerCtx.signerAddress,
+      signatureType: signerCtx.signatureType,
+      funder: signerCtx.funder,
+      apiKeyPrefix: prefixApiKey(creds.key),
+      credsSource: source
+    };
     this.resolvedCredsSource = source;
     this.logger.info(
       {
@@ -1008,6 +1355,49 @@ export class PolymarketClient {
     );
 
     return this.authClient;
+  }
+
+  private buildTradeAuthContextSignature(
+    signerCtx: {
+      signerAddress: string;
+      chainId: number;
+      signatureType: number;
+      funder: string;
+    },
+    creds: ApiCreds
+  ): string {
+    return JSON.stringify({
+      host: this.clobBaseUrl,
+      chainId: Number(signerCtx.chainId),
+      signerAddress: String(signerCtx.signerAddress || "").trim().toLowerCase(),
+      signatureType: Number(signerCtx.signatureType),
+      funder: String(signerCtx.funder || "").trim().toLowerCase(),
+      key: String(creds.key || "").trim(),
+      secret: String(creds.secret || "").trim(),
+      passphrase: String(creds.passphrase || "").trim()
+    });
+  }
+
+  private logPriceProbe(
+    slug: string | null,
+    tokenId: string,
+    side: "BUY" | "SELL",
+    ok: boolean,
+    note?: string
+  ): void {
+    if (!(this.config.debugHttp || process.env.DEBUG_POLY === "1")) {
+      return;
+    }
+    this.logger.debug(
+      {
+        slug,
+        tokenId,
+        side,
+        ok,
+        note: note ?? null
+      },
+      "POLY_PRICE"
+    );
   }
 
   private async requireSignerContext(): Promise<{
@@ -1327,16 +1717,18 @@ export class PolymarketClient {
           jitterMs: this.config.polymarket.http.jitterMs,
           isRetryable: (error) => isRetryableError(error),
           onRetry: (attempt, error, delayMs) => {
-            this.logger.warn(
-              {
-                method,
-                url,
-                attempt,
-                delayMs,
-                error: serializeError(error)
-              },
-              "Polymarket HTTP retrying"
-            );
+            if (this.config.debugHttp || process.env.DEBUG_POLY === "1") {
+              this.logger.warn(
+                {
+                  method,
+                  url,
+                  attempt,
+                  delayMs,
+                  error: serializeError(error)
+                },
+                "Polymarket HTTP retrying"
+              );
+            }
           }
         }
       );
@@ -1550,6 +1942,7 @@ function isRetryableError(error: unknown): boolean {
   const message = String((error as Error)?.message || "").toLowerCase();
   return (
     message.includes("timeout") ||
+    message.includes("epipe") ||
     message.includes("aborted") ||
     message.includes("aborterror") ||
     message.includes("econnreset") ||
@@ -1559,6 +1952,48 @@ function isRetryableError(error: unknown): boolean {
     message.includes("temporarily") ||
     message.includes("socket")
   );
+}
+
+function isOrderRebuildRequiredError(error: unknown): boolean {
+  const status = extractStatus(error);
+  const message = String((error as Error)?.message || "").toLowerCase();
+  if (!(status === 400 || status === 408 || status === 422 || status === 0)) {
+    return false;
+  }
+  return (
+    message.includes("invalid expiration") ||
+    message.includes("expiration value") ||
+    (message.includes("expiration") && message.includes("stale")) ||
+    (message.includes("signed order") && (message.includes("stale") || message.includes("expired"))) ||
+    (message.includes("signature") && message.includes("expired"))
+  );
+}
+
+function computeLiveOrderExpirationSec(
+  ttlMs: number,
+  nowMs: number
+): {
+  nowSec: number;
+  expirationSec: number;
+  requestedTtlSec: number;
+  mandatoryLeadSec: number;
+  safetyBufferSec: number;
+  minExpirationSec: number;
+} {
+  const nowSec = Math.floor(Number(nowMs) / 1000);
+  const requestedTtlSec = Math.max(1, Math.ceil(Math.max(1000, Number(ttlMs || 0)) / 1000));
+  const mandatoryLeadSec = 60;
+  const safetyBufferSec = 30;
+  const minExpirationSec = nowSec + 120;
+  const expirationSec = Math.max(minExpirationSec, nowSec + mandatoryLeadSec + requestedTtlSec + safetyBufferSec);
+  return {
+    nowSec,
+    expirationSec,
+    requestedTtlSec,
+    mandatoryLeadSec,
+    safetyBufferSec,
+    minExpirationSec
+  };
 }
 
 function extractStatus(error: unknown): number {
@@ -1580,6 +2015,70 @@ function serializeError(error: unknown): Record<string, unknown> {
     message: error instanceof Error ? error.message : String(error),
     status: extractStatus(error),
     name: error instanceof Error ? error.name : String(obj.name || "Error")
+  };
+}
+
+function shortErrorMessage(error: unknown): string {
+  const details = serializeError(error);
+  return [details.name, details.status, details.message]
+    .map((value) => String(value || "").trim())
+    .filter((value) => value.length > 0 && value !== "0")
+    .join(":");
+}
+
+function parseTokenPricePayload(payload: unknown, tokenId: string): TokenPriceQuote | null {
+  const root = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const nested =
+    root.data && typeof root.data === "object"
+      ? (root.data as Record<string, unknown>)
+      : Array.isArray(root.data) && root.data.length > 0 && root.data[0] && typeof root.data[0] === "object"
+        ? (root.data[0] as Record<string, unknown>)
+        : Array.isArray(payload) && payload.length > 0 && payload[0] && typeof payload[0] === "object"
+          ? (payload[0] as Record<string, unknown>)
+          : root;
+  const bestBid = pickFiniteNumber(nested, ["bid", "bestBid", "best_bid", "buyPrice", "buy_price"]);
+  const bestAsk = pickFiniteNumber(nested, ["ask", "bestAsk", "best_ask", "sellPrice", "sell_price"]);
+  const directPrice = pickFiniteNumber(nested, ["price", "mid", "midpoint", "mark", "value"]);
+  const derivedMid =
+    bestBid !== null && bestAsk !== null
+      ? clamp((bestBid + bestAsk) / 2, 0.0001, 0.9999)
+      : null;
+  const mid = directPrice !== null ? clamp(directPrice, 0.0001, 0.9999) : derivedMid;
+  if (mid === null) {
+    return null;
+  }
+  const ts =
+    pickFiniteNumber(nested, ["ts", "timestamp", "updatedAt", "updated_at"]) ??
+    Date.now();
+  return {
+    tokenId,
+    price: mid,
+    bestBid,
+    bestAsk,
+    mid,
+    ts: ts > 1e12 ? Math.floor(ts) : Math.floor(ts * 1000),
+    source: "clob_price",
+    fetchFailed: false,
+    failedSides: []
+  };
+}
+
+function parseMarketPricePayload(payload: unknown): { price: number; ts: number } | null {
+  const root = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const nested =
+    root.data && typeof root.data === "object"
+      ? (root.data as Record<string, unknown>)
+      : root;
+  const price = pickFiniteNumber(nested, ["p", "price", "mid", "midpoint", "value"]);
+  if (price === null) {
+    return null;
+  }
+  const ts =
+    pickFiniteNumber(nested, ["t", "ts", "timestamp", "time", "updatedAt", "updated_at"]) ??
+    Date.now();
+  return {
+    price: clamp(price, 0.0001, 0.9999),
+    ts: ts > 1e12 ? Math.floor(ts) : Math.floor(ts * 1000)
   };
 }
 
@@ -1686,7 +2185,7 @@ function normalizeTrade(row: unknown): TradeRow | null {
   const obj = row && typeof row === "object" ? (row as Record<string, unknown>) : {};
   const id = pickString(obj, ["id"]);
   const assetId = pickString(obj, ["asset_id", "assetId"]);
-  const side = normalizeSide(pickString(obj, ["side"]));
+  const side = normalizePolymarketClobSide(pickString(obj, ["side"]));
   if (!id || !assetId || !side) return null;
 
   return {
@@ -1702,10 +2201,17 @@ function normalizeTrade(row: unknown): TradeRow | null {
 }
 
 function normalizeSide(value: string): "BUY" | "SELL" | null {
+  return normalizePolymarketClobSide(value);
+}
+
+function normalizePolymarketClobSide(
+  value: string | null | undefined,
+  fallback: "BUY" | "SELL" | null = null
+): "BUY" | "SELL" | null {
   const normalized = String(value || "").trim().toUpperCase();
   if (normalized === "BUY") return "BUY";
   if (normalized === "SELL") return "SELL";
-  return null;
+  return fallback;
 }
 
 function validateTokenId(tokenId: string): void {
@@ -1732,6 +2238,17 @@ function asNumber(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function pickFiniteNumber(input: unknown, keys: string[]): number | null {
+  const obj = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  for (const key of keys) {
+    const value = Number(obj[key]);
+    if (Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
 function pickString(input: unknown, keys: string[]): string {
   const obj = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
   for (const key of keys) {
@@ -1741,6 +2258,14 @@ function pickString(input: unknown, keys: string[]): string {
     }
   }
   return "";
+}
+
+function parseJsonSafe(value: string): unknown {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
 }
 
 function pickBoolean(input: unknown, keys: string[]): boolean | undefined {

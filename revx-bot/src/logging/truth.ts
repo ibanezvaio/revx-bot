@@ -35,9 +35,17 @@ type PolymarketTruthState = {
   enabled: boolean;
   polyEngineRunning: boolean;
   fetchOk: boolean;
+  warningState: string | null;
+  pollMode: string | null;
+  staleState: string | null;
   lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
   holdReason: string | null;
   currentWindowHoldReason: string | null;
+  holdCategory: string | null;
+  strategyAction: string | null;
+  selectedTokenId: string | null;
+  candidateRefreshed: boolean | null;
+  lastPreorderValidationReason: string | null;
   openTrades: number;
   awaitingResolutionTrades: number;
   resolutionErrorTrades: number;
@@ -55,6 +63,7 @@ type PolymarketTruthState = {
   windowStartTs: number | null;
   windowEndTs: number | null;
   remainingSec: number | null;
+  chosenSide: "YES" | "NO" | null;
   chosenDirection: string | null;
   entriesInWindow: number | null;
   windowRealizedPnlUsd: number | null;
@@ -68,6 +77,19 @@ type PolymarketTruthState = {
   lastFetchErr: string | null;
   lastHttpStatus: number;
   lastUpdateTs: number;
+  threshold: number | null;
+  discoveredAtTs: number | null;
+  marketExpiresAtTs: number | null;
+  lastDiscoverySuccessTs: number | null;
+  lastDecisionTs: number | null;
+  lastSelectedMarketTs: number | null;
+  currentBtcMid: number | null;
+  statusLine: string | null;
+  whyNotTrading: string | null;
+  currentMarketStatus: string | null;
+  currentMarketSlug: string | null;
+  currentMarketRemainingSec: number | null;
+  currentMarketExpiresAt: number | null;
 };
 
 export type TradingTruthSnapshot = {
@@ -105,9 +127,17 @@ export type TradingTruthSnapshot = {
     lastUpdateTs: number;
     lastUpdateAgeSec: number | null;
     mode: "PAPER" | "LIVE";
+    warningState: string | null;
+    pollMode: string | null;
+    staleState: string | null;
     lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
     holdReason: string | null;
     currentWindowHoldReason: string | null;
+    holdCategory: string | null;
+    strategyAction: string | null;
+    selectedTokenId: string | null;
+    candidateRefreshed: boolean | null;
+    lastPreorderValidationReason: string | null;
     openTrades: number;
     awaitingResolutionTrades: number;
     resolutionErrorTrades: number;
@@ -128,6 +158,7 @@ export type TradingTruthSnapshot = {
       windowStartTs: number | null;
       windowEndTs: number | null;
       remainingSec: number | null;
+      chosenSide: "YES" | "NO" | null;
       chosenDirection: string | null;
       entriesInWindow: number | null;
       windowRealizedPnlUsd: number | null;
@@ -149,6 +180,19 @@ export type TradingTruthSnapshot = {
     killSwitch: boolean;
     polyEngineRunning: boolean;
     fetchOk: boolean;
+    threshold: number | null;
+    discoveredAtTs: number | null;
+    marketExpiresAtTs: number | null;
+    currentMarketStatus: string | null;
+    currentMarketSlug: string | null;
+    currentMarketRemainingSec: number | null;
+    currentMarketExpiresAt: number | null;
+    lastDiscoverySuccessTs: number | null;
+    lastDecisionTs: number | null;
+    lastSelectedMarketTs: number | null;
+    currentBtcMid: number | null;
+    statusLine: string | null;
+    whyNotTrading: string | null;
   };
   flags: {
     REVX_MONEY: boolean;
@@ -204,9 +248,17 @@ class TradingTruthReporter {
       enabled: config.polymarket.enabled,
       polyEngineRunning: false,
       fetchOk: false,
+      warningState: null,
+      pollMode: null,
+      staleState: null,
       lastAction: "HOLD",
       holdReason: null,
       currentWindowHoldReason: null,
+      holdCategory: null,
+      strategyAction: null,
+      selectedTokenId: null,
+      candidateRefreshed: null,
+      lastPreorderValidationReason: null,
       openTrades: 0,
       awaitingResolutionTrades: 0,
       resolutionErrorTrades: 0,
@@ -224,6 +276,7 @@ class TradingTruthReporter {
       windowStartTs: null,
       windowEndTs: null,
       remainingSec: null,
+      chosenSide: null,
       chosenDirection: null,
       entriesInWindow: null,
       windowRealizedPnlUsd: null,
@@ -236,7 +289,20 @@ class TradingTruthReporter {
       lastFetchOkTs: 0,
       lastFetchErr: null,
       lastHttpStatus: 0,
-      lastUpdateTs: 0
+      lastUpdateTs: 0,
+      threshold: null,
+      discoveredAtTs: null,
+      marketExpiresAtTs: null,
+      lastDiscoverySuccessTs: null,
+      lastDecisionTs: null,
+      lastSelectedMarketTs: null,
+      currentBtcMid: null,
+      statusLine: null,
+      whyNotTrading: null,
+      currentMarketStatus: null,
+      currentMarketSlug: null,
+      currentMarketRemainingSec: null,
+      currentMarketExpiresAt: null
     };
   }
 
@@ -262,20 +328,49 @@ class TradingTruthReporter {
 
   private emit(ts: number, force: boolean): void {
     const snapshot = this.buildSnapshot(ts);
-    const fingerprint = JSON.stringify({
-      revx: snapshot.revx,
-      poly: snapshot.poly,
-      flags: snapshot.flags
-    });
+    const fingerprint = this.buildEmitFingerprint(snapshot);
     const changed = fingerprint !== this.lastFingerprint;
-    const intervalMs = Math.max(1_000, Number(this.config.truthIntervalMs || 10_000));
-    const dueByInterval = ts - this.lastEmitTs >= intervalMs;
-    if (!force && !changed && !dueByInterval) {
+    if (!force && !changed) {
       return;
     }
     this.lastFingerprint = fingerprint;
     this.lastEmitTs = ts;
     this.logger.info(`TRUTH ${this.buildLine(snapshot)}`);
+  }
+
+  private buildEmitFingerprint(snapshot: TradingTruthSnapshot): string {
+    return JSON.stringify({
+      revx: {
+        buyOpen: snapshot.revx.buyOpen,
+        sellOpen: snapshot.revx.sellOpen,
+        lastOrderAction: snapshot.revx.lastOrderAction,
+        lastVenueOrderId: snapshot.revx.lastVenueOrderId,
+        lastFillTs: snapshot.revx.lastFill?.ts ?? null,
+        lastFillSide: snapshot.revx.lastFill?.side ?? null,
+        blockedReason: snapshot.revx.blocked?.reason ?? null
+      },
+      poly: {
+        status: snapshot.poly.status,
+        warningState: snapshot.poly.warningState,
+        pollMode: snapshot.poly.pollMode,
+        staleState: snapshot.poly.staleState,
+        running: snapshot.poly.polyEngineRunning,
+        fetchOk: snapshot.poly.fetchOk,
+        candidates: snapshot.poly.selection.discoveredCandidatesCount,
+        windows: snapshot.poly.selection.windowsCount,
+        selectedSlug: snapshot.poly.selection.selectedSlug,
+        selectedMarketId: snapshot.poly.selection.selectedMarketId,
+        remainingBucket: remainingSecBucket(snapshot.poly.selection.remainingSec),
+        chosenSide: snapshot.poly.selection.chosenSide,
+        chosenDirection: snapshot.poly.selection.chosenDirection,
+        action: snapshot.poly.lastAction,
+        holdReason: snapshot.poly.currentWindowHoldReason ?? snapshot.poly.holdReason,
+        holdCategory: snapshot.poly.holdCategory,
+        selectedTokenId: snapshot.poly.selectedTokenId,
+        openTrades: snapshot.poly.openTrades
+      },
+      flags: snapshot.flags
+    });
   }
 
   private buildSnapshot(ts: number): TradingTruthSnapshot {
@@ -299,8 +394,49 @@ class TradingTruthReporter {
     const polyLastUpdateTs = toMaybeNumber(this.poly.lastUpdateTs) ?? 0;
     const polyLastUpdateAgeSec =
       polyLastUpdateTs > 0 ? Math.max(0, Math.floor((ts - polyLastUpdateTs) / 1000)) : null;
+    const polyHasActiveSelection =
+      (this.poly.selectedSlug !== null || this.poly.selectedMarketId !== null) &&
+      (toMaybeNumber(this.poly.remainingSec) !== null
+        ? Number(this.poly.remainingSec) > 0
+        : (toMaybeNumber(this.poly.windowEndTs) ?? 0) > ts);
+    const polyHasRuntimeState =
+      this.poly.polyEngineRunning ||
+      this.poly.warningState !== null ||
+      this.poly.finalCandidatesCount !== null ||
+      this.poly.discoveredCandidatesCount !== null ||
+      this.poly.windowsCount !== null ||
+      this.poly.selectedSlug !== null ||
+      this.poly.selectedMarketId !== null ||
+      this.poly.remainingSec !== null ||
+      this.poly.chosenDirection !== null ||
+      this.poly.holdReason === "STARTUP_INCOMPLETE_NO_USABLE_WINDOW" ||
+      this.poly.currentWindowHoldReason === "STARTUP_INCOMPLETE_NO_USABLE_WINDOW" ||
+      this.poly.holdReason === "NO_ACTIVE_BTC5M_MARKET" ||
+      this.poly.currentWindowHoldReason === "NO_ACTIVE_BTC5M_MARKET";
+    const staleVisibility =
+      this.poly.staleState ??
+      (polyLastUpdateTs > 0 && polyLastUpdateAgeSec !== null && polyLastUpdateAgeSec > 30
+        ? polyHasActiveSelection
+          ? "DECISIONING_WITH_CACHED_SELECTION"
+          : "DISCOVERY_STALE"
+        : null);
     const polyStatus: "STARTING" | "RUNNING" | "STALE" =
-      polyLastUpdateTs <= 0 ? "STARTING" : polyLastUpdateAgeSec !== null && polyLastUpdateAgeSec > 30 ? "STALE" : "RUNNING";
+      polyLastUpdateTs <= 0
+        ? polyHasRuntimeState
+          ? "RUNNING"
+          : "STARTING"
+        : polyLastUpdateAgeSec !== null && polyLastUpdateAgeSec > 30 && !polyHasActiveSelection
+          ? "STALE"
+          : "RUNNING";
+    const effectiveWarningState =
+      this.poly.warningState && staleVisibility
+        ? this.poly.warningState.includes("DISCOVERY_STALE")
+          ? this.poly.warningState
+          : `${this.poly.warningState}+DISCOVERY_STALE`
+        : this.poly.warningState ?? (staleVisibility ? "DISCOVERY_STALE" : null);
+    const effectiveLastSelectedMarketTs =
+      toMaybeNumber(this.poly.lastSelectedMarketTs) ??
+      (polyHasActiveSelection ? toMaybeNumber(this.poly.lastUpdateTs) ?? ts : null);
     return {
       ts,
       revx: {
@@ -343,9 +479,17 @@ class TradingTruthReporter {
         lastUpdateTs: polyLastUpdateTs,
         lastUpdateAgeSec: polyLastUpdateAgeSec,
         mode: this.poly.mode,
+        warningState: effectiveWarningState,
+        pollMode: this.poly.pollMode,
+        staleState: staleVisibility,
         lastAction: this.poly.lastAction,
         holdReason: this.poly.holdReason,
         currentWindowHoldReason: this.poly.currentWindowHoldReason,
+        holdCategory: this.poly.holdCategory,
+        strategyAction: this.poly.strategyAction,
+        selectedTokenId: this.poly.selectedTokenId,
+        candidateRefreshed: this.poly.candidateRefreshed,
+        lastPreorderValidationReason: this.poly.lastPreorderValidationReason,
         openTrades: toNonNegativeInt(this.poly.openTrades),
         awaitingResolutionTrades: toNonNegativeInt(this.poly.awaitingResolutionTrades),
         resolutionErrorTrades: toNonNegativeInt(this.poly.resolutionErrorTrades),
@@ -368,6 +512,7 @@ class TradingTruthReporter {
           windowStartTs: toMaybeNumber(this.poly.windowStartTs),
           windowEndTs: toMaybeNumber(this.poly.windowEndTs),
           remainingSec: toMaybeNumber(this.poly.remainingSec),
+          chosenSide: this.poly.chosenSide,
           chosenDirection: this.poly.chosenDirection,
           entriesInWindow: toMaybeNumber(this.poly.entriesInWindow),
           windowRealizedPnlUsd: toMaybeNumber(this.poly.windowRealizedPnlUsd),
@@ -388,7 +533,28 @@ class TradingTruthReporter {
         liveExecutionEnabled: this.poly.liveExecutionEnabled,
         killSwitch: this.poly.killSwitch,
         polyEngineRunning: this.poly.polyEngineRunning,
-        fetchOk: this.poly.fetchOk
+        fetchOk: this.poly.fetchOk,
+        threshold: toMaybeNumber(this.poly.threshold),
+        discoveredAtTs: toMaybeNumber(this.poly.discoveredAtTs),
+        marketExpiresAtTs: toMaybeNumber(this.poly.marketExpiresAtTs),
+        currentMarketStatus: this.poly.currentMarketStatus ?? polyStatus,
+        currentMarketSlug:
+          this.poly.currentMarketSlug ??
+          this.poly.selectedSlug ??
+          this.poly.selectedMarketId,
+        currentMarketRemainingSec:
+          toMaybeNumber(this.poly.currentMarketRemainingSec) ??
+          toMaybeNumber(this.poly.remainingSec),
+        currentMarketExpiresAt:
+          toMaybeNumber(this.poly.currentMarketExpiresAt) ??
+          toMaybeNumber(this.poly.marketExpiresAtTs) ??
+          toMaybeNumber(this.poly.windowEndTs),
+        lastDiscoverySuccessTs: toMaybeNumber(this.poly.lastDiscoverySuccessTs),
+        lastDecisionTs: toMaybeNumber(this.poly.lastDecisionTs),
+        lastSelectedMarketTs: effectiveLastSelectedMarketTs,
+        currentBtcMid: toMaybeNumber(this.poly.currentBtcMid),
+        statusLine: this.poly.statusLine,
+        whyNotTrading: this.poly.whyNotTrading ?? this.poly.currentWindowHoldReason ?? this.poly.holdReason
       },
       flags
     };
@@ -408,6 +574,7 @@ class TradingTruthReporter {
         : "-";
     const selected = safeText(snapshot.poly.selection.selectedSlug || snapshot.poly.selection.selectedMarketId);
     const rem = safeText(snapshot.poly.selection.remainingSec);
+    const side = safeText(snapshot.poly.selection.chosenSide);
     const direction = safeText(snapshot.poly.selection.chosenDirection);
     const entriesInWindow = safeText(snapshot.poly.selection.entriesInWindow);
     const windowPnl = moneyText(snapshot.poly.selection.windowRealizedPnlUsd);
@@ -423,9 +590,11 @@ class TradingTruthReporter {
       )},deltaBtc=${btcText(snapshot.revx.deltas.btc)},lastFill=${lastFillText},blocked=${blockedText})`,
       `POLY(status=${snapshot.poly.status} ageSec=${safeText(snapshot.poly.lastUpdateAgeSec)} ${snapshot.poly.mode} running=${String(snapshot.poly.polyEngineRunning)} fetchOk=${String(
         snapshot.poly.fetchOk
-      )} candidates=${safeText(snapshot.poly.selection.discoveredCandidatesCount)} windows=${safeText(
+      )} warning=${safeText(snapshot.poly.warningState)} poll=${safeText(snapshot.poly.pollMode)} stale=${safeText(snapshot.poly.staleState)} holdCategory=${safeText(
+        snapshot.poly.holdCategory
+      )} tokenId=${safeText(snapshot.poly.selectedTokenId)} candidates=${safeText(snapshot.poly.selection.discoveredCandidatesCount)} windows=${safeText(
         snapshot.poly.selection.windowsCount
-      )} selected=${selected} rem=${rem} direction=${direction} entriesInWindow=${entriesInWindow} realizedPnlWindowUsd=${windowPnl} resolutionSource=${resolutionSource} action=${snapshot.poly.lastAction} hold=${safeText(
+      )} selected=${selected} rem=${rem} side=${side} direction=${direction} entriesInWindow=${entriesInWindow} realizedPnlWindowUsd=${windowPnl} resolutionSource=${resolutionSource} action=${snapshot.poly.lastAction} hold=${safeText(
         snapshot.poly.currentWindowHoldReason ?? snapshot.poly.holdReason
       )},openTrades=${intText(snapshot.poly.openTrades)},awaitingResolution=${intText(
         snapshot.poly.awaitingResolutionTrades
@@ -475,8 +644,15 @@ function toNonNegativeInt(value: unknown): number {
 }
 
 function toMaybeNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function remainingSecBucket(value: unknown): number | null {
+  const seconds = toMaybeNumber(value);
+  if (seconds === null) return null;
+  return Math.max(0, Math.floor(seconds / 15));
 }
 
 function isoSeconds(ts: number): string {

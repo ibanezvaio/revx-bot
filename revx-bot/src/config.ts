@@ -104,6 +104,14 @@ export type PolymarketConfig = {
     enableMakerQuoting: boolean;
     cancelAllOnStart: boolean;
   };
+  live: {
+    minEntryRemainingSec: number;
+    fastPollRemainingSec: number;
+    veryFastPollRemainingSec: number;
+    fastPollMs: number;
+    veryFastPollMs: number;
+    discoveryStaleMs: number;
+  };
   paper: {
     ledgerPath: string;
     slippageBps: number;
@@ -112,6 +120,7 @@ export type PolymarketConfig = {
     maxTradesPerHour: number;
     minEdgeThreshold: number;
     minNetEdge: number;
+    requireExtremeGuardrail: boolean;
     probExtreme: number;
     extremeHighPrice: number;
     extremeLowPrice: number;
@@ -1219,6 +1228,36 @@ export function loadConfig(): BotConfig {
   const polymarketEnableMakerQuoting = boolWithDefault("POLYMARKET_ENABLE_MAKER_QUOTING", false);
   const polymarketCancelAllOnStart = boolWithDefault("POLYMARKET_CANCEL_ALL_ON_START", false);
   const polymarketCancelAllOnStartRaw = optional("POLYMARKET_CANCEL_ALL_ON_START");
+  const polymarketLiveMinEntryRemainingSec = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_MIN_REMAINING_SEC_TO_ENTER", 90),
+    1,
+    300
+  );
+  const polymarketLiveFastPollRemainingSec = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_FAST_POLL_REMAINING_SEC", 120),
+    10,
+    300
+  );
+  const polymarketLiveVeryFastPollRemainingSec = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_VERY_FAST_POLL_REMAINING_SEC", 45),
+    1,
+    180
+  );
+  const polymarketLiveFastPollMs = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_FAST_POLL_MS", 1_000),
+    200,
+    10_000
+  );
+  const polymarketLiveVeryFastPollMs = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_VERY_FAST_POLL_MS", 500),
+    100,
+    10_000
+  );
+  const polymarketLiveDiscoveryStaleMs = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_DISCOVERY_STALE_MS", 30_000),
+    5_000,
+    300_000
+  );
   const polymarketPaperLedgerPath = withDefault(
     "POLYMARKET_PAPER_LEDGER_PATH",
     "data/polymarket-paper-ledger.jsonl"
@@ -1251,6 +1290,10 @@ export function loadConfig(): BotConfig {
     numberWithDefault("POLYMARKET_MIN_NET_EDGE", btc5mPaperModeDefaults ? 0 : 0.001),
     0,
     0.5
+  );
+  const polymarketRequireExtremeGuardrail = boolWithDefault(
+    "POLYMARKET_REQUIRE_EXTREME_GUARDRAIL",
+    false
   );
   const polymarketProbExtreme = clampNumber(
     numberWithDefault("POLYMARKET_PROB_EXTREME", btc5mPaperModeDefaults ? 0.5 : 0.9),
@@ -1409,6 +1452,11 @@ export function loadConfig(): BotConfig {
   }
   if (polymarketEntryMaxRemainingSec < polymarketEntryMinRemainingSec) {
     throw new Error("POLYMARKET_ENTRY_MAX_REMAINING_SEC must be >= POLYMARKET_ENTRY_MIN_REMAINING_SEC");
+  }
+  if (polymarketLiveFastPollRemainingSec < polymarketLiveVeryFastPollRemainingSec) {
+    throw new Error(
+      "POLYMARKET_LIVE_FAST_POLL_REMAINING_SEC must be >= POLYMARKET_LIVE_VERY_FAST_POLL_REMAINING_SEC"
+    );
   }
   if (polymarketExtremeHighPrice <= polymarketExtremeLowPrice) {
     throw new Error("POLYMARKET_EXTREME_HIGH_PRICE must be > POLYMARKET_EXTREME_LOW_PRICE");
@@ -1864,6 +1912,14 @@ export function loadConfig(): BotConfig {
         enableMakerQuoting: polymarketEnableMakerQuoting,
         cancelAllOnStart: polymarketEffectiveCancelAllOnStart
       },
+      live: {
+        minEntryRemainingSec: polymarketLiveMinEntryRemainingSec,
+        fastPollRemainingSec: polymarketLiveFastPollRemainingSec,
+        veryFastPollRemainingSec: polymarketLiveVeryFastPollRemainingSec,
+        fastPollMs: polymarketLiveFastPollMs,
+        veryFastPollMs: polymarketLiveVeryFastPollMs,
+        discoveryStaleMs: polymarketLiveDiscoveryStaleMs
+      },
       paper: {
         ledgerPath: polymarketPaperLedgerPath,
         slippageBps: polymarketPaperSlippageBps,
@@ -1872,6 +1928,7 @@ export function loadConfig(): BotConfig {
         maxTradesPerHour: polymarketPaperMaxTradesPerHour,
         minEdgeThreshold: polymarketPaperMinEdgeThreshold,
         minNetEdge: polymarketMinNetEdge,
+        requireExtremeGuardrail: polymarketRequireExtremeGuardrail,
         probExtreme: polymarketProbExtreme,
         extremeHighPrice: polymarketExtremeHighPrice,
         extremeLowPrice: polymarketExtremeLowPrice,

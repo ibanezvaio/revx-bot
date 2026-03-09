@@ -698,7 +698,7 @@ export class PaperLedger {
     const realized = this.getAllTrades()
       .filter((row) => {
         const status = getPaperTradeStatus(row);
-        return status === "RESOLVED_WIN" || status === "RESOLVED_LOSS" || status === "EXITED_EARLY" || status === "VOID";
+        return status === "RESOLVED_WIN" || status === "RESOLVED_LOSS";
       })
       .sort(
         (a, b) =>

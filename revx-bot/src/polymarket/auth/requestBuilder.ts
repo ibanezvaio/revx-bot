@@ -6,6 +6,7 @@ export type CreateOrderInput = {
   price: number;
   size: number;
   expirationSec: number;
+  feeRateBps?: number;
   tickSize: TickSize;
   negRisk: boolean;
 };
@@ -17,6 +18,7 @@ export function buildCreateOrderInput(input: CreateOrderInput): {
     size: number;
     side: "BUY" | "SELL";
     expiration: number;
+    feeRateBps?: number;
   };
   options: {
     tickSize: TickSize;
@@ -34,7 +36,11 @@ export function buildCreateOrderInput(input: CreateOrderInput): {
   if (!(input.size > 0)) {
     throw new Error("size must be positive");
   }
-  const expiration = Math.max(Math.floor(Date.now() / 1000) + 2, Math.floor(input.expirationSec));
+  const expiration = Math.max(1, Math.floor(input.expirationSec));
+  const feeRateBps =
+    Number.isFinite(Number(input.feeRateBps)) && Number(input.feeRateBps) >= 0
+      ? Math.floor(Number(input.feeRateBps))
+      : undefined;
 
   return {
     userOrder: {
@@ -42,7 +48,8 @@ export function buildCreateOrderInput(input: CreateOrderInput): {
       price,
       size: input.size,
       side: input.side,
-      expiration
+      expiration,
+      ...(feeRateBps !== undefined ? { feeRateBps } : {})
     },
     options: {
       tickSize: input.tickSize,

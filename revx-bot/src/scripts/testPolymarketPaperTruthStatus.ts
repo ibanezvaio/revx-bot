@@ -65,10 +65,10 @@ function buildHarness(ledgerPath: string): {
 
 function makeTick(input: {
   nowTs: number;
-  selectedSlug: string;
-  currentMarketId: string;
-  windowEndTs: number;
-  remainingSec: number;
+  selectedSlug: string | null;
+  currentMarketId: string | null;
+  windowEndTs: number | null;
+  remainingSec: number | null;
   action: "HOLD" | "OPEN";
   holdReason?: string | null;
   holdDetailReason?: string | null;
@@ -88,9 +88,13 @@ function makeTick(input: {
     afterWindowCount: 1,
     finalCandidatesCount: 1,
     acceptedSampleCount: 1,
-    activeWindows: 1,
+    activeWindows: input.selectedSlug || input.currentMarketId ? 1 : 0,
     currentMarketId: input.currentMarketId,
     selectedSlug: input.selectedSlug,
+    windowStart:
+      Number.isFinite(Number(input.windowEndTs)) && input.windowEndTs !== null
+        ? Number(input.windowEndTs) - 5 * 60 * 1000
+        : null,
     windowEnd: input.windowEndTs,
     tauSec: input.remainingSec,
     action: input.action,
@@ -195,6 +199,89 @@ function runRolloverAndTimestampScenario(): void {
     assert(snapshot.poly.holdReason !== "TOO_LATE_FOR_ENTRY", `truth fresh window must not inherit TOO_LATE_FOR_ENTRY, got ${String(snapshot.poly.holdReason)}`);
     assert(Number(runtime.lastUpdateTs) === freshNowTs, `expected runtime lastUpdateTs=${freshNowTs}, got ${String(runtime.lastUpdateTs)}`);
     assert(Number(truthStatus.poly.lastUpdateTs) === freshNowTs, `expected truth-status lastUpdateTs=${freshNowTs}, got ${String(truthStatus.poly.lastUpdateTs)}`);
+  } finally {
+    Date.now = originalDateNow;
+    rmSync(ledgerPath, { force: true });
+  }
+}
+
+function runRolloverClearThenRefreshScenario(): void {
+  const ledgerPath = path.join(tmpdir(), `revx-poly-paper-truth-clear-rollover-${Date.now()}.jsonl`);
+  rmSync(ledgerPath, { force: true });
+  const { engine, engineAny, truth, dashboard } = buildHarness(ledgerPath);
+  const originalDateNow = Date.now;
+  try {
+    const oldNowTs = Date.parse("2026-03-06T12:04:55.000Z");
+    const clearedNowTs = Date.parse("2026-03-06T12:05:01.000Z");
+    const freshNowTs = Date.parse("2026-03-06T12:05:04.000Z");
+
+    engineAny.maybeEmitTickLog(
+      makeTick({
+        nowTs: oldNowTs,
+        selectedSlug: "btc-updown-5m-1772817600",
+        currentMarketId: "paper-market-old",
+        windowEndTs: Date.parse("2026-03-06T12:05:00.000Z"),
+        remainingSec: 5,
+        action: "HOLD",
+        holdReason: "TOO_LATE_FOR_ENTRY",
+        holdDetailReason: "TOO_LATE_FOR_ENTRY",
+        chosenDirection: "DOWN"
+      }) as any
+    );
+
+    engineAny.maybeEmitTickLog(
+      makeTick({
+        nowTs: clearedNowTs,
+        selectedSlug: null,
+        currentMarketId: null,
+        windowEndTs: null,
+        remainingSec: null,
+        action: "HOLD",
+        holdReason: "NO_ACTIVE_BTC5M_MARKET",
+        holdDetailReason: "FETCH_STALE"
+      }) as any
+    );
+
+    Date.now = () => clearedNowTs;
+    const clearedRuntime = engine.getDashboardSnapshot();
+    const clearedSnapshot = truth.getSnapshot(clearedNowTs);
+    const clearedTruthStatus = (dashboard as any).buildTruthStatus();
+
+    assert(clearedRuntime.selection.selectedSlug === null, "cleared runtime should drop expired slug before refresh recovers");
+    assert(clearedRuntime.selection.remainingSec === null, `cleared runtime remainingSec should be null, got ${String(clearedRuntime.selection.remainingSec)}`);
+    assert(clearedRuntime.selection.chosenDirection === null, `cleared runtime direction should be null, got ${String(clearedRuntime.selection.chosenDirection)}`);
+    assert(clearedSnapshot.poly.selection.selectedSlug === null, "cleared truth snapshot should drop expired slug before refresh recovers");
+    assert(clearedSnapshot.poly.selection.remainingSec === null, `cleared truth remainingSec should be null, got ${String(clearedSnapshot.poly.selection.remainingSec)}`);
+    assert(clearedSnapshot.poly.selection.chosenDirection === null, `cleared truth direction should be null, got ${String(clearedSnapshot.poly.selection.chosenDirection)}`);
+    assert(clearedTruthStatus.poly.selection.selectedSlug === null, "truth-status should show empty selection during rollover gap");
+    assert(clearedTruthStatus.poly.selection.remainingSec === null, `truth-status cleared remainingSec should be null, got ${String(clearedTruthStatus.poly.selection.remainingSec)}`);
+    assert(clearedTruthStatus.poly.selection.chosenDirection === null, `truth-status cleared direction should be null, got ${String(clearedTruthStatus.poly.selection.chosenDirection)}`);
+
+    engineAny.maybeEmitTickLog(
+      makeTick({
+        nowTs: freshNowTs,
+        selectedSlug: "btc-updown-5m-1772817900",
+        currentMarketId: "paper-market-new",
+        windowEndTs: Date.parse("2026-03-06T12:10:00.000Z"),
+        remainingSec: 296,
+        action: "HOLD",
+        chosenDirection: "UP",
+        chosenEdge: 0.02,
+        threshold: 0.05
+      }) as any
+    );
+
+    Date.now = () => freshNowTs;
+    const freshRuntime = engine.getDashboardSnapshot();
+    const freshSnapshot = truth.getSnapshot(freshNowTs);
+    const freshTruthStatus = (dashboard as any).buildTruthStatus();
+
+    assert(freshRuntime.selection.selectedSlug === "btc-updown-5m-1772817900", "runtime should publish the new slug immediately after rollover recovery");
+    assert(freshRuntime.selection.chosenDirection === "UP", `runtime should publish fresh direction immediately, got ${String(freshRuntime.selection.chosenDirection)}`);
+    assert(freshSnapshot.poly.selection.selectedSlug === "btc-updown-5m-1772817900", "truth should publish the new slug immediately after rollover recovery");
+    assert(freshSnapshot.poly.selection.chosenDirection === "UP", `truth should publish fresh direction immediately, got ${String(freshSnapshot.poly.selection.chosenDirection)}`);
+    assert(freshTruthStatus.poly.selection.selectedSlug === "btc-updown-5m-1772817900", "truth-status should transition from cleared to the new slug immediately");
+    assert(freshTruthStatus.poly.selection.chosenDirection === "UP", `truth-status should publish fresh direction immediately, got ${String(freshTruthStatus.poly.selection.chosenDirection)}`);
   } finally {
     Date.now = originalDateNow;
     rmSync(ledgerPath, { force: true });
@@ -443,6 +530,7 @@ function runCooldownExpiryFreshnessScenario(): void {
 
 function run(): void {
   runRolloverAndTimestampScenario();
+  runRolloverClearThenRefreshScenario();
   runNetworkWarningScenario();
   runOpenActionScenario();
   runExpiryFreshnessScenario();

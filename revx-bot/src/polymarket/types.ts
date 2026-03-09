@@ -50,6 +50,7 @@ export type BtcWindowMarket = {
   active?: boolean;
   enableOrderBook?: boolean;
   closed?: boolean;
+  archived?: boolean;
   eventSlug?: string;
   yesBidHint?: number;
   yesAskHint?: number;

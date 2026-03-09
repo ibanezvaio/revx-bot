@@ -260,6 +260,25 @@ Safety notes:
 - paper mode on stale oracle enters `ORACLE_STALE` state: new entries are blocked, open trades remain pending, and resolution retries continue (no hard halt)
 - live mode on stale oracle pauses new entries and keeps retrying/recovery in-loop (transient network errors do not trigger global kill-switch)
 
+### Live BTC-5m Rollover + Diagnostics
+
+- Market rollover is wall-clock driven on 5-minute epochs (`floor(nowUtcSec/300)*300`) and live entry is blocked once remaining time is below `POLYMARKET_LIVE_MIN_REMAINING_SEC_TO_ENTER` (default `90`).
+- Poll mode escalates automatically near expiry:
+  - `NORMAL` for `remainingSec > 120`
+  - `FAST` for `remainingSec <= 120` (default `1000ms`)
+  - `VERY_FAST` for `remainingSec <= 45` (default `500ms`)
+- Hold categories in runtime/API/UI:
+  - `STRATEGY`: model/edge/strategy gating
+  - `DATA_HEALTH`: stale/missing market or orderbook/network read-path issues
+  - `EXECUTION`: stale preorder candidate, token mismatch, venue post failure
+  - `AUTH`: signature/authentication failures (for example `INVALID_SIGNATURE`)
+  - `RISK`: notional/exposure/kill-switch risk blocks
+- Invalid-signature debugging:
+  - inspect `POLY_ORDER_ATTEMPT`, `POLY_PREORDER_VALIDATE`, `ORDER_ABORT`, `POLY_ORDER_RESULT`
+  - these logs include signer/funder/signature type/token id/expiration and normalized signing payload summaries (secrets redacted)
+  - payload mutation detection logs as `POLY_ORDER_PAYLOAD_MUTATED`
+- Verbose transport diagnostics are off by default. Enable with `DEBUG_POLY_VERBOSE=true` (or `DEBUG_HTTP=true`) to include deep error objects.
+
 Dashboard:
 - Main dashboard keeps existing behavior.
 - Polymarket paper panel: `http://127.0.0.1:8787/polymarket`

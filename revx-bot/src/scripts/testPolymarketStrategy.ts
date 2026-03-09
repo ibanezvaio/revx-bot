@@ -3,6 +3,7 @@ import { Strategy } from "../polymarket/Strategy";
 import { YesOrderBook } from "../polymarket/types";
 
 process.env.DRY_RUN = "true";
+process.env.POLYMARKET_MODE = "paper";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
