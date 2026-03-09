@@ -228,11 +228,12 @@ export class PolymarketExecution {
         payload.error = serializeErrorDetails(error);
       }
       this.logger.error(payload, "Polymarket order rejected");
+      const normalizedReason = this.normalizeOrderRejectReason(error);
       return {
         action: exitAction,
         accepted: false,
         filledShares: 0,
-        reason: error instanceof Error ? error.message : "ORDER_FAILED"
+        reason: normalizedReason
       };
     } finally {
       this.openOrders.delete(localOrderId);
@@ -495,6 +496,24 @@ export class PolymarketExecution {
 
   private isPolyVerboseDebug(): boolean {
     return this.config.debugHttp || process.env.DEBUG_POLY === "1" || process.env.DEBUG_POLY_VERBOSE === "true";
+  }
+
+  private normalizeOrderRejectReason(error: unknown): string {
+    const summary = shortErrorSummary(error);
+    const upper = summary.toUpperCase();
+    if (upper.includes("SIZE (") && upper.includes("LOWER THAN THE MINIMUM: 5")) {
+      return "ORDER_SIZE_BELOW_MIN_SHARES";
+    }
+    if (upper.includes("NO ORDERBOOK EXISTS") || upper.includes("REQUESTED TOKEN ID")) {
+      return "SIDE_NOT_BOOKABLE";
+    }
+    if (upper.includes("INVALID_SIGNATURE") || upper.includes("SIGNATURE")) {
+      return "ORDER_POST_REJECTED";
+    }
+    if (upper.includes("PRICE") && upper.includes("UNAVAILABLE")) {
+      return "PRICE_UNAVAILABLE";
+    }
+    return "ORDER_POST_REJECTED";
   }
 
   private recordFill(orderId: string, sharesDelta: number, price: number, absolute = false): void {

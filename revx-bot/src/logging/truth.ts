@@ -40,10 +40,26 @@ type PolymarketTruthState = {
   staleState: string | null;
   lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
   holdReason: string | null;
+  blockedBy: string | null;
   currentWindowHoldReason: string | null;
   holdCategory: string | null;
   strategyAction: string | null;
   selectedTokenId: string | null;
+  selectedBookable: boolean | null;
+  selectedTradable: boolean | null;
+  discoveredCurrent: boolean | null;
+  discoveredNext: boolean | null;
+  selectionSource: string | null;
+  selectedFrom: string | null;
+  selectionCommitTs: number | null;
+  liveValidationReason: string | null;
+  lastBookTs: number | null;
+  lastQuoteTs: number | null;
+  currentBucketSlug: string | null;
+  nextBucketSlug: string | null;
+  currentBucketStartSec: number | null;
+  selectedWindowStartSec: number | null;
+  selectedWindowEndSec: number | null;
   candidateRefreshed: boolean | null;
   lastPreorderValidationReason: string | null;
   openTrades: number;
@@ -132,10 +148,26 @@ export type TradingTruthSnapshot = {
     staleState: string | null;
     lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
     holdReason: string | null;
+    blockedBy: string | null;
     currentWindowHoldReason: string | null;
     holdCategory: string | null;
     strategyAction: string | null;
     selectedTokenId: string | null;
+    selectedBookable: boolean | null;
+    selectedTradable: boolean | null;
+    discoveredCurrent: boolean | null;
+    discoveredNext: boolean | null;
+    selectionSource: string | null;
+    selectedFrom: string | null;
+    selectionCommitTs: number | null;
+    liveValidationReason: string | null;
+    lastBookTs: number | null;
+    lastQuoteTs: number | null;
+    currentBucketSlug: string | null;
+    nextBucketSlug: string | null;
+    currentBucketStartSec: number | null;
+    selectedWindowStartSec: number | null;
+    selectedWindowEndSec: number | null;
     candidateRefreshed: boolean | null;
     lastPreorderValidationReason: string | null;
     openTrades: number;
@@ -253,10 +285,26 @@ class TradingTruthReporter {
       staleState: null,
       lastAction: "HOLD",
       holdReason: null,
+      blockedBy: null,
       currentWindowHoldReason: null,
       holdCategory: null,
       strategyAction: null,
       selectedTokenId: null,
+      selectedBookable: null,
+      selectedTradable: null,
+      discoveredCurrent: null,
+      discoveredNext: null,
+      selectionSource: null,
+      selectedFrom: null,
+      selectionCommitTs: null,
+      liveValidationReason: null,
+      lastBookTs: null,
+      lastQuoteTs: null,
+      currentBucketSlug: null,
+      nextBucketSlug: null,
+      currentBucketStartSec: null,
+      selectedWindowStartSec: null,
+      selectedWindowEndSec: null,
       candidateRefreshed: null,
       lastPreorderValidationReason: null,
       openTrades: 0,
@@ -365,6 +413,7 @@ class TradingTruthReporter {
         chosenDirection: snapshot.poly.selection.chosenDirection,
         action: snapshot.poly.lastAction,
         holdReason: snapshot.poly.currentWindowHoldReason ?? snapshot.poly.holdReason,
+        blockedBy: snapshot.poly.blockedBy,
         holdCategory: snapshot.poly.holdCategory,
         selectedTokenId: snapshot.poly.selectedTokenId,
         openTrades: snapshot.poly.openTrades
@@ -417,7 +466,7 @@ class TradingTruthReporter {
       this.poly.staleState ??
       (polyLastUpdateTs > 0 && polyLastUpdateAgeSec !== null && polyLastUpdateAgeSec > 30
         ? polyHasActiveSelection
-          ? "DECISIONING_WITH_CACHED_SELECTION"
+          ? "DISCOVERY_STALE"
           : "DISCOVERY_STALE"
         : null);
     const polyStatus: "STARTING" | "RUNNING" | "STALE" =
@@ -484,10 +533,26 @@ class TradingTruthReporter {
         staleState: staleVisibility,
         lastAction: this.poly.lastAction,
         holdReason: this.poly.holdReason,
+        blockedBy: this.poly.blockedBy,
         currentWindowHoldReason: this.poly.currentWindowHoldReason,
         holdCategory: this.poly.holdCategory,
         strategyAction: this.poly.strategyAction,
         selectedTokenId: this.poly.selectedTokenId,
+        selectedBookable: this.poly.selectedBookable,
+        selectedTradable: this.poly.selectedTradable,
+        discoveredCurrent: this.poly.discoveredCurrent,
+        discoveredNext: this.poly.discoveredNext,
+        selectionSource: this.poly.selectionSource,
+        selectedFrom: this.poly.selectedFrom,
+        selectionCommitTs: toMaybeNumber(this.poly.selectionCommitTs),
+        liveValidationReason: this.poly.liveValidationReason,
+        lastBookTs: toMaybeNumber(this.poly.lastBookTs),
+        lastQuoteTs: toMaybeNumber(this.poly.lastQuoteTs),
+        currentBucketSlug: this.poly.currentBucketSlug,
+        nextBucketSlug: this.poly.nextBucketSlug,
+        currentBucketStartSec: toMaybeNumber(this.poly.currentBucketStartSec),
+        selectedWindowStartSec: toMaybeNumber(this.poly.selectedWindowStartSec),
+        selectedWindowEndSec: toMaybeNumber(this.poly.selectedWindowEndSec),
         candidateRefreshed: this.poly.candidateRefreshed,
         lastPreorderValidationReason: this.poly.lastPreorderValidationReason,
         openTrades: toNonNegativeInt(this.poly.openTrades),
@@ -596,6 +661,8 @@ class TradingTruthReporter {
         snapshot.poly.selection.windowsCount
       )} selected=${selected} rem=${rem} side=${side} direction=${direction} entriesInWindow=${entriesInWindow} realizedPnlWindowUsd=${windowPnl} resolutionSource=${resolutionSource} action=${snapshot.poly.lastAction} hold=${safeText(
         snapshot.poly.currentWindowHoldReason ?? snapshot.poly.holdReason
+      )} blockedBy=${safeText(
+        snapshot.poly.blockedBy
       )},openTrades=${intText(snapshot.poly.openTrades)},awaitingResolution=${intText(
         snapshot.poly.awaitingResolutionTrades
       )},resolutionQueue=${intText(snapshot.poly.resolutionQueueCount)},resolvedTrades=${intText(

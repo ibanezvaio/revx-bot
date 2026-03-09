@@ -113,6 +113,15 @@ type PolymarketRuntimeSnapshot = {
   lastSelectedMarketTs?: number | null;
   threshold?: number | null;
   currentBtcMid?: number | null;
+  minVenueShares?: number | null;
+  desiredShares?: number | null;
+  finalShares?: number | null;
+  desiredNotional?: number | null;
+  finalNotional?: number | null;
+  sizeBumped?: boolean | null;
+  lastNormalizedError?: string | null;
+  pollTrace?: Array<Record<string, unknown>>;
+  rolloverTrace?: Array<Record<string, unknown>>;
   whyNotTrading?: string | null;
   currentMarketStatus?: string | null;
   currentMarketSlug?: string | null;
@@ -122,10 +131,26 @@ type PolymarketRuntimeSnapshot = {
   polyMoney: boolean;
   lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
   holdReason: string | null;
+  blockedBy?: string | null;
   currentWindowHoldReason?: string | null;
   holdCategory?: string | null;
   strategyAction?: string | null;
   selectedTokenId?: string | null;
+  selectedBookable?: boolean;
+  selectedTradable?: boolean;
+  discoveredCurrent?: boolean;
+  discoveredNext?: boolean;
+  selectionSource?: string | null;
+  selectedFrom?: string | null;
+  selectionCommitTs?: number | null;
+  liveValidationReason?: string | null;
+  lastBookTs?: number | null;
+  lastQuoteTs?: number | null;
+  currentBucketSlug?: string | null;
+  nextBucketSlug?: string | null;
+  currentBucketStartSec?: number | null;
+  selectedWindowStartSec?: number | null;
+  selectedWindowEndSec?: number | null;
   candidateRefreshed?: boolean | null;
   lastPreorderValidationReason?: string | null;
   openTradesCount?: number;
@@ -532,17 +557,33 @@ export class DashboardServer {
       toFiniteNumber(runtime?.selection?.remainingSec) ??
       toFiniteNumber(truth?.poly.selection.remainingSec) ??
       toFiniteNumber(tick?.countdownSec);
+    const runtimeSelectedWindowEndSec = toFiniteNumber(
+      (runtime as { selectedWindowEndSec?: number | null } | null)?.selectedWindowEndSec
+    );
+    const truthSelectedWindowEndSec = toFiniteNumber(
+      (truth?.poly as { selectedWindowEndSec?: number | null } | undefined)?.selectedWindowEndSec
+    );
     const rawWindowEndTs =
       toFiniteNumber(runtime?.currentMarketExpiresAt) ??
       toFiniteNumber(runtime?.marketExpiresAtTs) ??
       toFiniteNumber(runtime?.selection?.windowEndTs) ??
+      (runtimeSelectedWindowEndSec !== null ? runtimeSelectedWindowEndSec * 1000 : null) ??
       toFiniteNumber((truth?.poly as { currentMarketExpiresAt?: number | null } | undefined)?.currentMarketExpiresAt) ??
       toFiniteNumber((truth?.poly as { marketExpiresAtTs?: number | null } | undefined)?.marketExpiresAtTs) ??
+      (truthSelectedWindowEndSec !== null ? truthSelectedWindowEndSec * 1000 : null) ??
       toFiniteNumber(truth?.poly.selection.windowEndTs) ??
       toFiniteNumber(tick?.windowEnd);
+    const runtimeSelectedWindowStartSec = toFiniteNumber(
+      (runtime as { selectedWindowStartSec?: number | null } | null)?.selectedWindowStartSec
+    );
+    const truthSelectedWindowStartSec = toFiniteNumber(
+      (truth?.poly as { selectedWindowStartSec?: number | null } | undefined)?.selectedWindowStartSec
+    );
     const rawWindowStartTs =
       toFiniteNumber(runtime?.selection?.windowStartTs) ??
+      (runtimeSelectedWindowStartSec !== null ? runtimeSelectedWindowStartSec * 1000 : null) ??
       toFiniteNumber((truth?.poly.selection as { windowStartTs?: number | null } | undefined)?.windowStartTs) ??
+      (truthSelectedWindowStartSec !== null ? truthSelectedWindowStartSec * 1000 : null) ??
       toFiniteNumber(tick?.windowStart) ??
       (rawWindowEndTs !== null
         ? Math.max(0, rawWindowEndTs - 5 * 60 * 1000)
@@ -553,9 +594,20 @@ export class DashboardServer {
     const isActiveSelection =
       (rawWindowEndTs !== null && rawWindowEndTs > nowTs) ||
       (rawRemainingSec !== null && rawRemainingSec > 0);
+    const currentMarketStatusText = String(currentMarketStatus || "");
+    const statusKeepsSelection =
+      currentMarketStatus !== null &&
+      currentMarketStatusText !== "NO_ACTIVE_BTC5M_MARKET" &&
+      currentMarketStatusText !== "NO_ACTIVE_WINDOWS" &&
+      currentMarketStatusText !== "SELECTION_NOT_COMMITTED" &&
+      currentMarketStatusText !== "EXPIRED_WINDOW" &&
+      currentMarketStatusText !== "STARTUP_INCOMPLETE_NO_USABLE_WINDOW";
     const keepRenderableSelection =
       hasTrackedSelection &&
-      (isActiveSelection || currentMarketStatus === "ROLLOVER_PENDING" || currentMarketStatus === "EXPIRED_PENDING_DISCOVERY");
+      (isActiveSelection ||
+        statusKeepsSelection ||
+        currentMarketStatusText === "ROLLOVER_PENDING" ||
+        currentMarketStatusText === "EXPIRED_PENDING_DISCOVERY");
     const selectedSlug = keepRenderableSelection ? rawSelectedSlug : null;
     const selectedMarketId = keepRenderableSelection ? rawSelectedMarketId : null;
     const remainingSec = keepRenderableSelection
@@ -719,6 +771,11 @@ export class DashboardServer {
       lastAction: summaryLastAction,
       lastActionTs: summaryLastActionTs,
       holdReason: summaryHoldReason,
+      blockedBy:
+        toOptionalString((runtime as { blockedBy?: string | null } | undefined)?.blockedBy) ??
+        toOptionalString((truth?.poly as { blockedBy?: string | null } | undefined)?.blockedBy) ??
+        toOptionalString((tick as { blockedBy?: string | null } | null | undefined)?.blockedBy) ??
+        summaryHoldReason,
       currentWindowHoldReason: summaryHoldReason,
       holdCategory:
         toOptionalString((runtime as { holdCategory?: string | null } | undefined)?.holdCategory) ??
@@ -731,6 +788,62 @@ export class DashboardServer {
         toOptionalString((runtime as { selectedTokenId?: string | null } | undefined)?.selectedTokenId) ??
         toOptionalString((truth?.poly as { selectedTokenId?: string | null } | undefined)?.selectedTokenId) ??
         toOptionalString(tick?.selectedTokenId),
+      selectedBookable:
+        (runtime as { selectedBookable?: boolean | null } | undefined)?.selectedBookable ??
+        (truth?.poly as { selectedBookable?: boolean | null } | undefined)?.selectedBookable ??
+        null,
+      selectedTradable:
+        (runtime as { selectedTradable?: boolean | null } | undefined)?.selectedTradable ??
+        (truth?.poly as { selectedTradable?: boolean | null } | undefined)?.selectedTradable ??
+        null,
+      discoveredCurrent:
+        (runtime as { discoveredCurrent?: boolean | null } | undefined)?.discoveredCurrent ??
+        (truth?.poly as { discoveredCurrent?: boolean | null } | undefined)?.discoveredCurrent ??
+        null,
+      discoveredNext:
+        (runtime as { discoveredNext?: boolean | null } | undefined)?.discoveredNext ??
+        (truth?.poly as { discoveredNext?: boolean | null } | undefined)?.discoveredNext ??
+        null,
+      selectionSource:
+        toOptionalString((runtime as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+        toOptionalString((truth?.poly as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+        null,
+      selectedFrom:
+        toOptionalString((runtime as { selectedFrom?: string | null } | undefined)?.selectedFrom) ??
+        toOptionalString((truth?.poly as { selectedFrom?: string | null } | undefined)?.selectedFrom) ??
+        toOptionalString((runtime as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+        toOptionalString((truth?.poly as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+        null,
+      selectionCommitTs:
+        toFiniteNumber((runtime as { selectionCommitTs?: number | null } | undefined)?.selectionCommitTs) ??
+        toFiniteNumber((truth?.poly as { selectionCommitTs?: number | null } | undefined)?.selectionCommitTs),
+      liveValidationReason:
+        toOptionalString((runtime as { liveValidationReason?: string | null } | undefined)?.liveValidationReason) ??
+        toOptionalString((truth?.poly as { liveValidationReason?: string | null } | undefined)?.liveValidationReason) ??
+        null,
+      lastBookTs:
+        toFiniteNumber((runtime as { lastBookTs?: number | null } | undefined)?.lastBookTs) ??
+        toFiniteNumber((truth?.poly as { lastBookTs?: number | null } | undefined)?.lastBookTs),
+      lastQuoteTs:
+        toFiniteNumber((runtime as { lastQuoteTs?: number | null } | undefined)?.lastQuoteTs) ??
+        toFiniteNumber((truth?.poly as { lastQuoteTs?: number | null } | undefined)?.lastQuoteTs),
+      currentBucketSlug:
+        toOptionalString((runtime as { currentBucketSlug?: string | null } | undefined)?.currentBucketSlug) ??
+        toOptionalString((truth?.poly as { currentBucketSlug?: string | null } | undefined)?.currentBucketSlug) ??
+        null,
+      nextBucketSlug:
+        toOptionalString((runtime as { nextBucketSlug?: string | null } | undefined)?.nextBucketSlug) ??
+        toOptionalString((truth?.poly as { nextBucketSlug?: string | null } | undefined)?.nextBucketSlug) ??
+        null,
+      currentBucketStartSec:
+        toFiniteNumber((runtime as { currentBucketStartSec?: number | null } | undefined)?.currentBucketStartSec) ??
+        toFiniteNumber((truth?.poly as { currentBucketStartSec?: number | null } | undefined)?.currentBucketStartSec),
+      selectedWindowStartSec:
+        toFiniteNumber((runtime as { selectedWindowStartSec?: number | null } | undefined)?.selectedWindowStartSec) ??
+        toFiniteNumber((truth?.poly as { selectedWindowStartSec?: number | null } | undefined)?.selectedWindowStartSec),
+      selectedWindowEndSec:
+        toFiniteNumber((runtime as { selectedWindowEndSec?: number | null } | undefined)?.selectedWindowEndSec) ??
+        toFiniteNumber((truth?.poly as { selectedWindowEndSec?: number | null } | undefined)?.selectedWindowEndSec),
       candidateRefreshed:
         (runtime as { candidateRefreshed?: boolean | null } | undefined)?.candidateRefreshed ??
         (truth?.poly as { candidateRefreshed?: boolean | null } | undefined)?.candidateRefreshed ??
@@ -847,6 +960,26 @@ export class DashboardServer {
         toFiniteNumber(runtime?.currentBtcMid) ??
         toFiniteNumber((truth?.poly as { currentBtcMid?: number | null } | undefined)?.currentBtcMid) ??
         toFiniteNumber(latestPolymarket?.fastMid),
+      minVenueShares:
+        toFiniteNumber((runtime as { minVenueShares?: number | null } | undefined)?.minVenueShares),
+      desiredShares:
+        toFiniteNumber((runtime as { desiredShares?: number | null } | undefined)?.desiredShares),
+      finalShares:
+        toFiniteNumber((runtime as { finalShares?: number | null } | undefined)?.finalShares),
+      desiredNotional:
+        toFiniteNumber((runtime as { desiredNotional?: number | null } | undefined)?.desiredNotional),
+      finalNotional:
+        toFiniteNumber((runtime as { finalNotional?: number | null } | undefined)?.finalNotional),
+      sizeBumped:
+        (runtime as { sizeBumped?: boolean | null } | undefined)?.sizeBumped ?? null,
+      lastNormalizedError:
+        toOptionalString((runtime as { lastNormalizedError?: string | null } | undefined)?.lastNormalizedError),
+      pollTrace: Array.isArray((runtime as { pollTrace?: Array<Record<string, unknown>> } | null)?.pollTrace)
+        ? ((runtime as { pollTrace?: Array<Record<string, unknown>> }).pollTrace || []).slice(0, 20)
+        : [],
+      rolloverTrace: Array.isArray((runtime as { rolloverTrace?: Array<Record<string, unknown>> } | null)?.rolloverTrace)
+        ? ((runtime as { rolloverTrace?: Array<Record<string, unknown>> }).rolloverTrace || []).slice(0, 20)
+        : [],
       whyNotTrading:
         toOptionalString(runtime?.whyNotTrading) ??
         toOptionalString((truth?.poly as { whyNotTrading?: string | null } | undefined)?.whyNotTrading) ??
@@ -873,6 +1006,7 @@ export class DashboardServer {
       selectedSlug:
         toOptionalString(runtime?.currentMarketSlug) ??
         summarySelection.selectedSlug ??
+        summarySelection.selectedMarketId ??
         null,
       selectedMarketId: summarySelection.selectedMarketId ?? null,
       windowStartTs: summarySelection.windowStartTs ?? null,
@@ -3340,6 +3474,10 @@ export class DashboardServer {
         lastAction: truthLastAction,
         lastActionTs: truthLastActionTs,
         holdReason: truthHoldReason,
+        blockedBy:
+          toOptionalString((runtime as { blockedBy?: string | null } | undefined)?.blockedBy) ??
+          toOptionalString((truth.poly as { blockedBy?: string | null }).blockedBy) ??
+          truthHoldReason,
         holdDetailReason: truthHoldDetailReason,
         holdCategory:
           toOptionalString((runtime as { holdCategory?: string | null } | undefined)?.holdCategory) ??
@@ -3348,9 +3486,51 @@ export class DashboardServer {
           toOptionalString((runtime as { strategyAction?: string | null } | undefined)?.strategyAction) ??
           truthLastAction,
         selectedTokenId:
-          toOptionalString((runtime as { selectedTokenId?: string | null } | undefined)?.selectedTokenId),
+          toOptionalString((runtime as { selectedTokenId?: string | null } | undefined)?.selectedTokenId) ??
+          toOptionalString((truth.poly as { selectedTokenId?: string | null }).selectedTokenId),
+        selectedBookable:
+          (runtime as { selectedBookable?: boolean | null } | undefined)?.selectedBookable ??
+          (truth.poly as { selectedBookable?: boolean | null }).selectedBookable ??
+          null,
+        selectedTradable:
+          (runtime as { selectedTradable?: boolean | null } | undefined)?.selectedTradable ??
+          (truth.poly as { selectedTradable?: boolean | null }).selectedTradable ??
+          null,
+        discoveredCurrent:
+          (runtime as { discoveredCurrent?: boolean | null } | undefined)?.discoveredCurrent ??
+          (truth.poly as { discoveredCurrent?: boolean | null }).discoveredCurrent ??
+          null,
+        discoveredNext:
+          (runtime as { discoveredNext?: boolean | null } | undefined)?.discoveredNext ??
+          (truth.poly as { discoveredNext?: boolean | null }).discoveredNext ??
+          null,
+        selectionSource:
+          toOptionalString((runtime as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+          toOptionalString((truth.poly as { selectionSource?: string | null }).selectionSource) ??
+          null,
+        selectedFrom:
+          toOptionalString((runtime as { selectedFrom?: string | null } | undefined)?.selectedFrom) ??
+          toOptionalString((truth.poly as { selectedFrom?: string | null }).selectedFrom) ??
+          toOptionalString((runtime as { selectionSource?: string | null } | undefined)?.selectionSource) ??
+          toOptionalString((truth.poly as { selectionSource?: string | null }).selectionSource) ??
+          null,
+        selectionCommitTs:
+          toFiniteNumber((runtime as { selectionCommitTs?: number | null } | undefined)?.selectionCommitTs) ??
+          toFiniteNumber((truth.poly as { selectionCommitTs?: number | null }).selectionCommitTs),
+        liveValidationReason:
+          toOptionalString((runtime as { liveValidationReason?: string | null } | undefined)?.liveValidationReason) ??
+          toOptionalString((truth.poly as { liveValidationReason?: string | null }).liveValidationReason) ??
+          null,
+        lastBookTs:
+          toFiniteNumber((runtime as { lastBookTs?: number | null } | undefined)?.lastBookTs) ??
+          toFiniteNumber((truth.poly as { lastBookTs?: number | null }).lastBookTs),
+        lastQuoteTs:
+          toFiniteNumber((runtime as { lastQuoteTs?: number | null } | undefined)?.lastQuoteTs) ??
+          toFiniteNumber((truth.poly as { lastQuoteTs?: number | null }).lastQuoteTs),
         candidateRefreshed:
-          (runtime as { candidateRefreshed?: boolean | null } | undefined)?.candidateRefreshed ?? null,
+          (runtime as { candidateRefreshed?: boolean | null } | undefined)?.candidateRefreshed ??
+          (truth.poly as { candidateRefreshed?: boolean | null }).candidateRefreshed ??
+          null,
         lastPreorderValidationReason:
           toOptionalString((runtime as { lastPreorderValidationReason?: string | null } | undefined)?.lastPreorderValidationReason) ??
           toOptionalString((truth.poly as { lastPreorderValidationReason?: string | null }).lastPreorderValidationReason),
@@ -3415,6 +3595,26 @@ export class DashboardServer {
           toFiniteNumber(runtime?.currentBtcMid) ??
           toFiniteNumber((truth.poly as { currentBtcMid?: number | null }).currentBtcMid) ??
           toFiniteNumber(runtime?.latestPolymarket?.fastMid),
+        minVenueShares:
+          toFiniteNumber((runtime as { minVenueShares?: number | null } | undefined)?.minVenueShares),
+        desiredShares:
+          toFiniteNumber((runtime as { desiredShares?: number | null } | undefined)?.desiredShares),
+        finalShares:
+          toFiniteNumber((runtime as { finalShares?: number | null } | undefined)?.finalShares),
+        desiredNotional:
+          toFiniteNumber((runtime as { desiredNotional?: number | null } | undefined)?.desiredNotional),
+        finalNotional:
+          toFiniteNumber((runtime as { finalNotional?: number | null } | undefined)?.finalNotional),
+        sizeBumped:
+          (runtime as { sizeBumped?: boolean | null } | undefined)?.sizeBumped ?? null,
+        lastNormalizedError:
+          toOptionalString((runtime as { lastNormalizedError?: string | null } | undefined)?.lastNormalizedError),
+        pollTrace: Array.isArray((runtime as { pollTrace?: Array<Record<string, unknown>> } | null)?.pollTrace)
+          ? ((runtime as { pollTrace?: Array<Record<string, unknown>> }).pollTrace || []).slice(0, 20)
+          : [],
+        rolloverTrace: Array.isArray((runtime as { rolloverTrace?: Array<Record<string, unknown>> } | null)?.rolloverTrace)
+          ? ((runtime as { rolloverTrace?: Array<Record<string, unknown>> }).rolloverTrace || []).slice(0, 20)
+          : [],
         whyNotTrading:
           truthHoldReason ??
           toOptionalString(runtime?.whyNotTrading) ??
@@ -3430,6 +3630,7 @@ export class DashboardServer {
           toFiniteNumber((truth.poly as { marketExpiresAtTs?: number | null }).marketExpiresAtTs) ??
           selection.windowEndTs,
         selectedSlug: selection.selectedSlug,
+        selectedMarketId: selection.selectedMarketId,
         remainingSec: selection.remainingSec,
         chosenSide: selection.chosenSide,
         openTrades: openTradesCount,
@@ -10445,18 +10646,33 @@ function renderPolymarketDashboardHtml(symbol: string): string {
 
     <section id="pmLiveStrip" class="live-strip">
       <article class="strip-item"><div class="k">Selected Window</div><div class="v" id="liveSelectedWindow">-</div></article>
+      <article class="strip-item"><div class="k">Market ID</div><div class="v" id="liveSelectedMarketId">-</div></article>
+      <article class="strip-item"><div class="k">Token ID</div><div class="v" id="liveSelectedTokenId">-</div></article>
       <article class="strip-item"><div class="k">Direction</div><div class="v" id="liveDirection">-</div></article>
+      <article class="strip-item"><div class="k">Chosen Side</div><div class="v" id="liveChosenSide">-</div></article>
+      <article class="strip-item"><div class="k">Action</div><div class="v" id="liveAction">-</div></article>
+      <article class="strip-item"><div class="k">Hold Reason</div><div class="v" id="liveHoldReason">-</div></article>
+      <article class="strip-item"><div class="k">Blocked By</div><div class="v" id="liveBlockedBy">-</div></article>
+      <article class="strip-item"><div class="k">Hold Category</div><div class="v" id="liveHoldCategory">-</div></article>
       <article class="strip-item"><div class="k">Remaining</div><div class="v" id="liveRemaining">-</div></article>
-      <article class="strip-item"><div class="k">Entries In Window</div><div class="v" id="liveEntriesInWindow">-</div></article>
-      <article class="strip-item"><div class="k">Lifecycle</div><div class="v" id="liveLifecycle">-</div></article>
-      <article class="strip-item"><div class="k">Open Trade</div><div class="v" id="liveOpenTrade">-</div></article>
+      <article class="strip-item"><div class="k">Poll Mode</div><div class="v" id="livePollMode">-</div></article>
+      <article class="strip-item"><div class="k">Selection Source</div><div class="v" id="liveSelectionSource">-</div></article>
+      <article class="strip-item"><div class="k">Validation Reason</div><div class="v" id="liveValidationReason">-</div></article>
+      <article class="strip-item"><div class="k">Bookable / Tradable</div><div class="v" id="liveBookableTradable">-</div></article>
+      <article class="strip-item"><div class="k">Candidate Count</div><div class="v" id="liveCandidateCount">-</div></article>
+      <article class="strip-item"><div class="k">Last Poll Age</div><div class="v" id="liveLastPollAge">-</div></article>
+      <article class="strip-item"><div class="k">Last Selection Commit</div><div class="v" id="liveSelectionCommitTs">-</div></article>
       <article class="strip-item"><div class="k">BTC Start</div><div class="v" id="liveBtcStart">-</div></article>
       <article class="strip-item"><div class="k">BTC Live</div><div class="v" id="liveBtcReference">-</div></article>
       <article class="strip-item"><div class="k">Contract Entry</div><div class="v" id="liveContractEntry">-</div></article>
-      <article class="strip-item"><div class="k">Estimated Live</div><div class="v" id="livePrice">-</div></article>
+      <article class="strip-item"><div class="k">Contract Price / Mid</div><div class="v" id="livePrice">-</div></article>
       <article class="strip-item"><div class="k">Implied Prob</div><div class="v" id="liveImpliedProb">-</div></article>
-      <article class="strip-item"><div class="k">Live Unrealized PnL</div><div class="v" id="liveUnrealizedPnl">-</div></article>
+      <article class="strip-item"><div class="k">Last Quote Time</div><div class="v" id="liveLastQuoteTs">-</div></article>
+      <article class="strip-item"><div class="k">Last Book Time</div><div class="v" id="liveLastBookTs">-</div></article>
+      <article class="strip-item"><div class="k">Entries In Window</div><div class="v" id="liveEntriesInWindow">-</div></article>
       <article class="strip-item"><div class="k">Window Realized PnL</div><div class="v" id="liveWindowPnl">-</div></article>
+      <article class="strip-item"><div class="k">Warning / Stale</div><div class="v" id="liveWarningStale">-</div></article>
+      <article class="strip-item"><div class="k">Why Not Trading</div><div class="v" id="liveWhyNotTrading">-</div></article>
       <article class="strip-item"><div class="k">Live Feed</div><div class="v" id="liveConnection">CONNECTING</div></article>
     </section>
 
@@ -10472,6 +10688,10 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       <article class="card"><div class="k">PnL 24h (USD)</div><div class="v" id="m24hPnl">-</div></article>
       <article class="card"><div class="k">Mode</div><div class="v" id="mMode">-</div></article>
       <article class="card"><div class="k">Last Action</div><div class="v" id="mLastAction">-</div></article>
+      <article class="card"><div class="k">Last Normalized Error</div><div class="v" id="mLastNormalizedError">-</div></article>
+      <article class="card"><div class="k">Min Venue Shares</div><div class="v" id="mMinVenueShares">-</div></article>
+      <article class="card"><div class="k">Final Intended Shares</div><div class="v" id="mFinalShares">-</div></article>
+      <article class="card"><div class="k">Final Intended Notional</div><div class="v" id="mFinalNotional">-</div></article>
       <article class="card"><div class="k">Recent Trades Loaded</div><div class="v" id="mRowsLoaded">-</div></article>
       <article class="card"><div class="k">Last Trade Time</div><div class="v" id="mLastTradeTime">-</div></article>
     </section>
@@ -10481,12 +10701,15 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       <div class="panel-body">
       <div class="kv-grid">
         <div class="kv"><div class="k">Slug</div><div class="v" id="pmSlug">-</div></div>
+        <div class="kv"><div class="k">Market ID</div><div class="v" id="pmMarketId">-</div></div>
         <div class="kv"><div class="k">Countdown</div><div class="v" id="pmCountdown">-</div></div>
         <div class="kv"><div class="k">Model P(UP)</div><div class="v" id="pmPUp">-</div></div>
         <div class="kv"><div class="k">P Base / Boosted</div><div class="v" id="pmPBaseBoost">-</div></div>
         <div class="kv"><div class="k">BTC Start</div><div class="v" id="pmBtcStart">-</div></div>
+        <div class="kv"><div class="k">BTC Mid (Live)</div><div class="v" id="pmBtcMid">-</div></div>
         <div class="kv"><div class="k">BTC Live</div><div class="v" id="pmBtcRef">-</div></div>
         <div class="kv"><div class="k">Estimated Live</div><div class="v" id="pmEstLive">-</div></div>
+        <div class="kv"><div class="k">Chosen Side</div><div class="v" id="pmChosenSide">-</div></div>
         <div class="kv"><div class="k">Direction</div><div class="v" id="pmSide">-</div></div>
         <div class="kv"><div class="k">Entries In Window</div><div class="v" id="pmEntriesInWindow">-</div></div>
         <div class="kv"><div class="k">Window Realized PnL</div><div class="v" id="pmWindowPnl">-</div></div>
@@ -10494,14 +10717,24 @@ function renderPolymarketDashboardHtml(symbol: string): string {
         <div class="kv"><div class="k">Chosen Edge</div><div class="v" id="pmChosenEdge">-</div></div>
         <div class="kv"><div class="k">Net Edge After Costs</div><div class="v" id="pmNetEdge">-</div></div>
         <div class="kv"><div class="k">Trading State</div><div class="v" id="pmTradingState">-</div></div>
+        <div class="kv"><div class="k">Threshold</div><div class="v" id="pmThreshold">-</div></div>
         <div class="kv"><div class="k">Hold Reason</div><div class="v" id="pmHoldReason">-</div></div>
+        <div class="kv"><div class="k">Blocked By</div><div class="v" id="pmBlockedBy">-</div></div>
         <div class="kv"><div class="k">Hold Category</div><div class="v" id="pmHoldCategory">-</div></div>
         <div class="kv"><div class="k">Strategy Action</div><div class="v" id="pmStrategyAction">-</div></div>
         <div class="kv"><div class="k">Poll Mode</div><div class="v" id="pmPollMode">-</div></div>
-        <div class="kv"><div class="k">Warning / Stale</div><div class="v" id="pmWarnStale">-</div></div>
+        <div class="kv"><div class="k">Warning State</div><div class="v" id="pmWarningState">-</div></div>
+        <div class="kv"><div class="k">Stale State</div><div class="v" id="pmStaleState">-</div></div>
         <div class="kv"><div class="k">Market Start</div><div class="v" id="pmMarketStart">-</div></div>
         <div class="kv"><div class="k">Market End</div><div class="v" id="pmMarketEnd">-</div></div>
         <div class="kv"><div class="k">Selected Token</div><div class="v" id="pmSelectedTokenId">-</div></div>
+        <div class="kv"><div class="k">Candidate Count</div><div class="v" id="pmCandidateCount">-</div></div>
+        <div class="kv"><div class="k">Selected Bookable</div><div class="v" id="pmSelectedBookable">-</div></div>
+        <div class="kv"><div class="k">Selected Tradable</div><div class="v" id="pmSelectedTradable">-</div></div>
+        <div class="kv"><div class="k">Selection Source</div><div class="v" id="pmSelectionSource">-</div></div>
+        <div class="kv"><div class="k">Validation Reason</div><div class="v" id="pmLiveValidationReason">-</div></div>
+        <div class="kv"><div class="k">Last Book TS</div><div class="v" id="pmLastBookTs">-</div></div>
+        <div class="kv"><div class="k">Last Quote TS</div><div class="v" id="pmLastQuoteTs">-</div></div>
         <div class="kv"><div class="k">Candidate Refreshed</div><div class="v" id="pmCandidateRefreshed">-</div></div>
         <div class="kv"><div class="k">Preorder Validation</div><div class="v" id="pmPreorderValidation">-</div></div>
       </div>
@@ -10524,6 +10757,13 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       </div>
     </details>
 
+    <section class="panel" id="pmTracePanel">
+      <h3>Polling Trace</h3>
+      <div id="pmPollTrace" class="debug-strip">-</div>
+      <h3>Rollover Trace</h3>
+      <div id="pmRolloverTrace" class="debug-strip">-</div>
+    </section>
+
     <section class="panel">
       <h3>Equity Curve</h3>
       <div class="chart-wrap">
@@ -10532,7 +10772,7 @@ function renderPolymarketDashboardHtml(symbol: string): string {
       <div class="muted" id="eqMeta">-</div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="pmPaperLifecyclePanel">
       <h3>Paper Trade Lifecycle</h3>
       <div class="muted" id="resolvedTotals">wins - | losses - | recent - | win rate - | total pnl -</div>
       <div id="pmTradesDebug" class="debug-strip">lastFetchTs=- | lastHttpStatus=- | lastParseError=- | payloadKeys=- | rowsLength=-</div>
@@ -10837,9 +11077,29 @@ function renderPolymarketDashboardJs(): string {
       if (!node) return;
       const mode = String(summary.mode || "paper").toUpperCase();
       const polyMoney = Boolean(summary.polyMoney);
-      node.textContent = polyMoney ? "POLY LIVE (real money)" : "POLY PAPER (no real money)";
+      const liveStatus = String(summary.currentMarketStatus || summary.status || "").toUpperCase();
+      const normalizedLiveStatus =
+        liveStatus === "RUNNING" ||
+        liveStatus === "DEGRADED" ||
+        liveStatus === "STARTING" ||
+        liveStatus === "NO_ACTIVE_BTC5M_MARKET"
+          ? liveStatus
+          : "RUNNING";
+      node.textContent = polyMoney
+        ? "POLY LIVE (real money) • " + normalizedLiveStatus
+        : "POLY PAPER (no real money)";
       node.className = polyMoney ? "empty-state" : "empty-state soft";
       setText("mMode", mode, polyMoney ? "good" : "");
+
+      const isLiveMode = mode === "LIVE" || polyMoney;
+      const currentPanel = el("pmCurrentPanel");
+      const lagPanel = el("pmLagPanel");
+      const paperLifecyclePanel = el("pmPaperLifecyclePanel");
+      const tracePanel = el("pmTracePanel");
+      if (currentPanel) currentPanel.style.display = isLiveMode ? "none" : "block";
+      if (lagPanel) lagPanel.style.display = isLiveMode ? "none" : "block";
+      if (paperLifecyclePanel) paperLifecyclePanel.style.display = isLiveMode ? "none" : "block";
+      if (tracePanel) tracePanel.style.display = isLiveMode ? "block" : "none";
     }
 
     function getClientAlignedNowTs() {
@@ -10867,7 +11127,20 @@ function renderPolymarketDashboardJs(): string {
     function getLiveSummary(summary) {
       const base = summary && typeof summary === "object" ? Object.assign({}, summary) : {};
       base.serverNowTs = toFinite(base.serverNowTs) || toFinite(state.serverNowTs) || Date.now();
-      base.currentMarketSlug = base.currentMarketSlug != null ? base.currentMarketSlug : (base.selectedSlug != null ? base.selectedSlug : null);
+      base.selectedMarketId =
+        base.selectedMarketId != null
+          ? base.selectedMarketId
+          : base.selection && base.selection.selectedMarketId != null
+            ? base.selection.selectedMarketId
+            : null;
+      base.currentMarketSlug =
+        base.currentMarketSlug != null
+          ? base.currentMarketSlug
+          : base.selectedSlug != null
+            ? base.selectedSlug
+            : base.selectedMarketId != null
+              ? base.selectedMarketId
+              : null;
       base.currentMarketExpiresAt =
         toFinite(base.currentMarketExpiresAt) ??
         toFinite(base.marketExpiresAtTs) ??
@@ -10879,6 +11152,30 @@ function renderPolymarketDashboardJs(): string {
       base.currentMarketStatus = String(base.currentMarketStatus || base.status || "-");
       base.lifecycleStatus = base.pollMode != null ? base.pollMode : base.lifecycleStatus;
       base.whyNotTrading = base.whyNotTrading != null ? base.whyNotTrading : base.holdReason;
+      base.blockedBy = base.blockedBy != null ? base.blockedBy : base.holdReason;
+      base.pollTrace = Array.isArray(base.pollTrace) ? base.pollTrace.slice(0, 20) : [];
+      base.rolloverTrace = Array.isArray(base.rolloverTrace) ? base.rolloverTrace.slice(0, 20) : [];
+      base.discoveredCurrent = base.discoveredCurrent == null ? null : Boolean(base.discoveredCurrent);
+      base.discoveredNext = base.discoveredNext == null ? null : Boolean(base.discoveredNext);
+      base.selectedFrom = base.selectedFrom != null ? String(base.selectedFrom) : (base.selectionSource != null ? String(base.selectionSource) : null);
+      base.selectionCommitTs = toFinite(base.selectionCommitTs);
+      base.minVenueShares = toFinite(base.minVenueShares);
+      base.desiredShares = toFinite(base.desiredShares);
+      base.finalShares = toFinite(base.finalShares);
+      base.desiredNotional = toFinite(base.desiredNotional);
+      base.finalNotional = toFinite(base.finalNotional);
+      base.lastNormalizedError = base.lastNormalizedError != null ? String(base.lastNormalizedError) : null;
+      base.whyNotTradingSummary = [
+        base.blockedBy,
+        base.holdReason,
+        base.liveValidationReason,
+        base.selectedTradable === false ? "NOT_TRADABLE" : null,
+        base.selectedBookable === false ? "NOT_BOOKABLE" : null
+      ]
+        .map((row) => (row == null ? "" : String(row).trim()))
+        .filter((row) => row.length > 0)
+        .slice(0, 4)
+        .join(" | ");
       return base;
     }
 
@@ -11193,6 +11490,7 @@ function renderPolymarketDashboardJs(): string {
         : {};
 
       setText("pmSlug", String(liveSummary.selectedSlug || "-"));
+      setText("pmMarketId", String(liveSummary.selectedMarketId || "-"));
       setText("pmCountdown", secondsText(liveSummary.remainingSec));
       setText(
         "pmPUp",
@@ -11221,46 +11519,79 @@ function renderPolymarketDashboardJs(): string {
           ? priceText(liveMetrics.estimatedContractLivePrice)
           : "-"
       );
+      setText(
+        "pmBtcMid",
+        Number.isFinite(Number(liveSummary.currentBtcMid))
+          ? money(Number(liveSummary.currentBtcMid))
+          : "-"
+      );
+      setText("pmChosenSide", String(liveSummary.chosenSide || "-"));
       setSignalText("pmSide", String(liveSummary.chosenDirection || liveSummary.chosenSide || "-"), liveMetrics ? liveMetrics.signalTone : "neutral");
       setText("pmChosenEdge", edgeText(liveSummary.chosenEdge), Number(liveSummary.chosenEdge || 0) >= 0 ? "good" : "bad");
       setText("pmNetEdge", edgeText(liveSummary.netEdgeAfterCosts), Number(liveSummary.netEdgeAfterCosts || 0) >= 0 ? "good" : "bad");
       const paused = Boolean(liveSummary.tradingPaused);
       const pauseReason = String(liveSummary.pauseReason || "");
       const warningState = String(liveSummary.warningState || "");
+      const staleState = String(liveSummary.staleState || "");
+      const statusRaw = String(liveSummary.currentMarketStatus || liveSummary.status || "").toUpperCase();
+      const normalizedStatus =
+        statusRaw === "STARTING" ||
+        statusRaw === "RUNNING" ||
+        statusRaw === "DEGRADED" ||
+        statusRaw === "NO_ACTIVE_BTC5M_MARKET"
+          ? statusRaw
+          : warningState || staleState || paused
+            ? "DEGRADED"
+            : "RUNNING";
       setText(
         "pmTradingState",
-        liveSummary.currentMarketStatus && liveSummary.currentMarketStatus !== "RUNNING"
-          ? String(liveSummary.currentMarketStatus) + (warningState ? " (" + warningState + ")" : "")
-          : warningState
-            ? ("WARNING" + (warningState ? " (" + warningState + ")" : ""))
-          : paused
-            ? ("PAUSED" + (pauseReason ? " (" + pauseReason + ")" : ""))
-            : "RUNNING",
-        liveSummary.currentMarketStatus && liveSummary.currentMarketStatus !== "RUNNING"
-          ? "warn"
-          : warningState
-            ? "warn"
-            : paused
-              ? "bad"
-              : "good"
+        normalizedStatus,
+        normalizedStatus === "RUNNING" ? "good" : normalizedStatus === "STARTING" ? "" : "warn"
       );
       setText(
         "pmHoldReason",
         String(liveSummary.whyNotTrading || liveSummary.holdReason || "-") +
           (liveSummary.holdDetailReason ? " / " + String(liveSummary.holdDetailReason) : "")
       );
+      setText("pmBlockedBy", String(liveSummary.blockedBy || liveSummary.holdReason || "-"));
       setText("pmHoldCategory", String(liveSummary.holdCategory || "-"));
       setText("pmStrategyAction", String(liveSummary.strategyAction || liveSummary.lastAction || "-"));
       setText("pmPollMode", String(liveSummary.pollMode || liveSummary.lifecycleStatus || "-"));
+      setText("pmWarningState", String(liveSummary.warningState || "-"));
+      setText("pmStaleState", String(liveSummary.staleState || "-"));
       setText(
-        "pmWarnStale",
-        String(liveSummary.warningState || "-") + " / " + String(liveSummary.staleState || "-")
+        "pmThreshold",
+        Number.isFinite(Number(liveSummary.threshold)) ? Number(liveSummary.threshold).toFixed(4) : "-"
       );
       const marketStartTs = toFinite(liveSummary.windowStartTs);
       const marketEndTs = toFinite(liveSummary.currentMarketExpiresAt || liveSummary.windowEndTs);
-      setText("pmMarketStart", Number.isFinite(marketStartTs) ? new Date(Number(marketStartTs)).toLocaleString() : "-");
-      setText("pmMarketEnd", Number.isFinite(marketEndTs) ? new Date(Number(marketEndTs)).toLocaleString() : "-");
+      setText("pmMarketStart", Number.isFinite(marketStartTs) && Number(marketStartTs) > 0 ? new Date(Number(marketStartTs)).toLocaleString() : "-");
+      setText("pmMarketEnd", Number.isFinite(marketEndTs) && Number(marketEndTs) > 0 ? new Date(Number(marketEndTs)).toLocaleString() : "-");
       setText("pmSelectedTokenId", String(liveSummary.selectedTokenId || "-"));
+      setText(
+        "pmCandidateCount",
+        String(
+          Number.isFinite(Number(liveSummary.candidatesCount))
+            ? Math.max(0, Math.floor(Number(liveSummary.candidatesCount)))
+            : "-"
+        )
+      );
+      setText("pmSelectedBookable", liveSummary.selectedBookable == null ? "-" : (liveSummary.selectedBookable ? "YES" : "NO"));
+      setText("pmSelectedTradable", liveSummary.selectedTradable == null ? "-" : (liveSummary.selectedTradable ? "YES" : "NO"));
+      setText("pmSelectionSource", String(liveSummary.selectionSource || "-"));
+      setText("pmLiveValidationReason", String(liveSummary.liveValidationReason || "-"));
+      setText(
+        "pmLastBookTs",
+        Number.isFinite(Number(liveSummary.lastBookTs))
+          ? new Date(Number(liveSummary.lastBookTs)).toLocaleTimeString()
+          : "-"
+      );
+      setText(
+        "pmLastQuoteTs",
+        Number.isFinite(Number(liveSummary.lastQuoteTs))
+          ? new Date(Number(liveSummary.lastQuoteTs)).toLocaleTimeString()
+          : "-"
+      );
       setText(
         "pmCandidateRefreshed",
         liveSummary.candidateRefreshed == null ? "-" : (liveSummary.candidateRefreshed ? "YES" : "NO"),
@@ -11330,7 +11661,6 @@ function renderPolymarketDashboardJs(): string {
       const contractEntryPrice = openTrade ? toFinite(openTrade.contractEntryPrice != null ? openTrade.contractEntryPrice : openTrade.entryPrice) : null;
       const contractLivePrice = liveMetrics ? liveMetrics.estimatedContractLivePrice : null;
       const impliedProbPct = liveMetrics ? liveMetrics.impliedProbPct : null;
-      const unrealizedPnlUsd = liveMetrics ? liveMetrics.unrealizedPnlUsd : null;
       const staleMark = Boolean(liveMetrics && liveMetrics.btcStale);
       const livePriceText = Number.isFinite(contractLivePrice)
         ? priceText(contractLivePrice)
@@ -11338,14 +11668,47 @@ function renderPolymarketDashboardJs(): string {
           ? "\u2014 waiting for quote"
           : "-";
       setText("liveSelectedWindow", String(liveSummary.selectedSlug || "-"));
+      setText("liveSelectedMarketId", String(liveSummary.selectedMarketId || "-"));
+      setText("liveSelectedTokenId", String(liveSummary.selectedTokenId || "-"));
       setSignalText("liveDirection", String(liveSummary.chosenDirection || liveSummary.chosenSide || "-"), liveMetrics ? liveMetrics.signalTone : "neutral");
+      setText("liveChosenSide", String(liveSummary.chosenSide || "-"));
+      setText("liveAction", String(liveSummary.strategyAction || liveSummary.lastAction || "-"));
+      setText("liveHoldReason", String(liveSummary.holdReason || "-"));
+      setText("liveBlockedBy", String(liveSummary.blockedBy || "-"));
+      setText("liveHoldCategory", String(liveSummary.holdCategory || "-"));
       setText("liveRemaining", secondsText(liveSummary.remainingSec));
+      setText("livePollMode", String(liveSummary.pollMode || "-"));
+      setText("liveSelectionSource", String(liveSummary.selectedFrom || liveSummary.selectionSource || "-"));
+      setText("liveValidationReason", String(liveSummary.liveValidationReason || "-"));
+      setText(
+        "liveBookableTradable",
+        String(liveSummary.selectedBookable == null ? "-" : liveSummary.selectedBookable ? "YES" : "NO") +
+          " / " +
+          String(liveSummary.selectedTradable == null ? "-" : liveSummary.selectedTradable ? "YES" : "NO")
+      );
+      setText(
+        "liveCandidateCount",
+        String(Number.isFinite(Number(liveSummary.candidatesCount)) ? Math.max(0, Math.floor(Number(liveSummary.candidatesCount))) : "-")
+      );
+      const latestPollNowIso =
+        Array.isArray(liveSummary.pollTrace) && liveSummary.pollTrace.length > 0
+          ? String((liveSummary.pollTrace[0] && liveSummary.pollTrace[0].nowIso) || "")
+          : "";
+      const latestPollTs = latestPollNowIso ? Date.parse(latestPollNowIso) : NaN;
+      const latestPollAgeSec = Number.isFinite(latestPollTs)
+        ? Math.max(0, Math.floor((getClientAlignedNowTs() - latestPollTs) / 1000))
+        : null;
+      setText("liveLastPollAge", latestPollAgeSec == null ? "-" : String(latestPollAgeSec) + "s");
+      setText(
+        "liveSelectionCommitTs",
+        Number.isFinite(Number(liveSummary.selectionCommitTs))
+          ? new Date(Number(liveSummary.selectionCommitTs)).toLocaleTimeString()
+          : "-"
+      );
       setText(
         "liveEntriesInWindow",
         String(Number.isFinite(Number(liveSummary.entriesInWindow)) ? Math.max(0, Math.floor(Number(liveSummary.entriesInWindow))) : 0)
       );
-      setText("liveLifecycle", String(liveSummary.lifecycleStatus || "-"));
-      setText("liveOpenTrade", openRows.length > 0 ? "YES" : "NO", openRows.length > 0 ? "good" : "");
       setText("liveBtcStart", Number.isFinite(btcStartPrice) ? money(btcStartPrice) : "-");
       setText("liveBtcReference", Number.isFinite(btcReferencePrice) ? money(btcReferencePrice) + (staleMark ? " STALE" : "") : "-");
       setText("liveContractEntry", Number.isFinite(contractEntryPrice) ? priceText(contractEntryPrice) : "-");
@@ -11356,15 +11719,98 @@ function renderPolymarketDashboardJs(): string {
       );
       setText("liveImpliedProb", Number.isFinite(impliedProbPct) ? fmt2.format(impliedProbPct) + "%" : "-");
       setText(
-        "liveUnrealizedPnl",
-        Number.isFinite(unrealizedPnlUsd) ? money(unrealizedPnlUsd) : "-",
-        Number.isFinite(unrealizedPnlUsd) ? (unrealizedPnlUsd >= 0 ? "good" : "bad") : ""
+        "liveLastQuoteTs",
+        Number.isFinite(Number(liveSummary.lastQuoteTs)) && Number(liveSummary.lastQuoteTs) > 0
+          ? new Date(Number(liveSummary.lastQuoteTs)).toLocaleTimeString()
+          : "-"
+      );
+      setText(
+        "liveLastBookTs",
+        Number.isFinite(Number(liveSummary.lastBookTs)) && Number(liveSummary.lastBookTs) > 0
+          ? new Date(Number(liveSummary.lastBookTs)).toLocaleTimeString()
+          : "-"
       );
       setText(
         "liveWindowPnl",
         money(Number(liveSummary.windowRealizedPnlUsd || 0)),
         Number(liveSummary.windowRealizedPnlUsd || 0) >= 0 ? "good" : "bad"
       );
+      setText(
+        "liveWarningStale",
+        String(liveSummary.warningState || "-") + " / " + String(liveSummary.staleState || "-")
+      );
+      setText("liveWhyNotTrading", String(liveSummary.whyNotTradingSummary || liveSummary.whyNotTrading || "-"));
+    }
+
+    function renderTraceRows(rows, formatter) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return "-";
+      }
+      return rows
+        .slice(0, 20)
+        .map((row) => formatter(row && typeof row === "object" ? row : {}))
+        .join("\\n");
+    }
+
+    function renderTraces(summary) {
+      const liveSummary = getLiveSummary(summary);
+      const pollNode = el("pmPollTrace");
+      const rolloverNode = el("pmRolloverTrace");
+      if (pollNode) {
+        pollNode.textContent = renderTraceRows(liveSummary.pollTrace, (row) => {
+          const nowIso = String(row.nowIso || "-");
+          const pollMode = String(row.pollMode || "-");
+          const selectedSlug = String(row.selectedSlug || "-");
+          const selectedTokenId = String(row.selectedTokenId || "-");
+          const remainingSec = toFinite(row.remainingSec);
+          const holdReason = String(row.holdReason || "-");
+          const discoveredCurrent = String(row.discoveredCurrent == null ? "-" : row.discoveredCurrent ? "YES" : "NO");
+          const discoveredNext = String(row.discoveredNext == null ? "-" : row.discoveredNext ? "YES" : "NO");
+          return (
+            nowIso +
+            " | mode=" +
+            pollMode +
+            " | slug=" +
+            selectedSlug +
+            " | token=" +
+            selectedTokenId +
+            " | rem=" +
+            (remainingSec == null ? "-" : String(Math.max(0, Math.floor(remainingSec)))) +
+            " | curr=" +
+            discoveredCurrent +
+            " | next=" +
+            discoveredNext +
+            " | hold=" +
+            holdReason
+          );
+        });
+      }
+      if (rolloverNode) {
+        rolloverNode.textContent = renderTraceRows(liveSummary.rolloverTrace, (row) => {
+          const nowIso = String(row.nowIso || "-");
+          const currentBucketSlug = String(row.currentBucketSlug || "-");
+          const nextBucketSlug = String(row.nextBucketSlug || "-");
+          const nextDiscovered = String(row.nextDiscovered == null ? "-" : row.nextDiscovered ? "YES" : "NO");
+          const nextTradable = String(row.nextTradable == null ? "-" : row.nextTradable ? "YES" : "NO");
+          const remainingSec = toFinite(row.remainingSec);
+          const selectedFrom = String(row.selectedFrom || "-");
+          return (
+            nowIso +
+            " | current=" +
+            currentBucketSlug +
+            " | next=" +
+            nextBucketSlug +
+            " | from=" +
+            selectedFrom +
+            " | nextDiscovered=" +
+            nextDiscovered +
+            " | nextTradable=" +
+            nextTradable +
+            " | rem=" +
+            (remainingSec == null ? "-" : String(Math.max(0, Math.floor(remainingSec))))
+          );
+        });
+      }
     }
 
     const state = {
@@ -11406,6 +11852,7 @@ function renderPolymarketDashboardJs(): string {
       const openRows = normalizeRows(state.payload && Array.isArray(state.payload.openTrades) ? state.payload.openTrades : []);
       renderLiveStrip(summary, openRows);
       renderCurrent(summary);
+      renderTraces(summary);
       renderOpenRows(openRows, summary);
     }
 
@@ -11441,6 +11888,7 @@ function renderPolymarketDashboardJs(): string {
       updateModeBanner(summary);
       renderLiveStrip(summary, openRows);
       renderCurrent(summary);
+      renderTraces(summary);
       renderOpenRows(openRows, summary);
       renderRecentRows(recentRows);
       drawEquity(equityPoints);
@@ -11456,6 +11904,19 @@ function renderPolymarketDashboardJs(): string {
       setText("mTotalPnl", money(summary.pnlTotalUsd || 0), Number(summary.pnlTotalUsd || 0) >= 0 ? "good" : "bad");
       setText("m24hPnl", money(summary.pnl24hUsd || 0), Number(summary.pnl24hUsd || 0) >= 0 ? "good" : "bad");
       setText("mLastAction", String(summary.lastAction || "HOLD"));
+      setText("mLastNormalizedError", String(summary.lastNormalizedError || "-"));
+      setText(
+        "mMinVenueShares",
+        Number.isFinite(Number(summary.minVenueShares)) ? Number(summary.minVenueShares).toFixed(0) : "-"
+      );
+      setText(
+        "mFinalShares",
+        Number.isFinite(Number(summary.finalShares)) ? Number(summary.finalShares).toFixed(6) : "-"
+      );
+      setText(
+        "mFinalNotional",
+        Number.isFinite(Number(summary.finalNotional)) ? money(Number(summary.finalNotional)) : "-"
+      );
       setText("mRowsLoaded", String(openRows.length + recentRows.length));
       const lastTradeTs = Math.max(resolveLastTradeTs(openRows), resolveLastTradeTs(recentRows));
       setText("mLastTradeTime", lastTradeTs > 0 ? new Date(lastTradeTs).toLocaleString() : "-");
@@ -11581,6 +12042,9 @@ function renderPolymarketDashboardJs(): string {
           if (Object.prototype.hasOwnProperty.call(payload, "holdReason")) {
             state.payload.summary.holdReason = payload.holdReason;
           }
+          if (Object.prototype.hasOwnProperty.call(payload, "blockedBy")) {
+            state.payload.summary.blockedBy = payload.blockedBy;
+          }
           if (Object.prototype.hasOwnProperty.call(payload, "holdCategory")) {
             state.payload.summary.holdCategory = payload.holdCategory;
           }
@@ -11589,6 +12053,51 @@ function renderPolymarketDashboardJs(): string {
           }
           if (Object.prototype.hasOwnProperty.call(payload, "selectedTokenId")) {
             state.payload.summary.selectedTokenId = payload.selectedTokenId;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedBookable")) {
+            state.payload.summary.selectedBookable = payload.selectedBookable;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedTradable")) {
+            state.payload.summary.selectedTradable = payload.selectedTradable;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "discoveredCurrent")) {
+            state.payload.summary.discoveredCurrent = payload.discoveredCurrent;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "discoveredNext")) {
+            state.payload.summary.discoveredNext = payload.discoveredNext;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectionSource")) {
+            state.payload.summary.selectionSource = payload.selectionSource;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedFrom")) {
+            state.payload.summary.selectedFrom = payload.selectedFrom;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectionCommitTs")) {
+            state.payload.summary.selectionCommitTs = payload.selectionCommitTs;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "liveValidationReason")) {
+            state.payload.summary.liveValidationReason = payload.liveValidationReason;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "lastBookTs")) {
+            state.payload.summary.lastBookTs = payload.lastBookTs;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "lastQuoteTs")) {
+            state.payload.summary.lastQuoteTs = payload.lastQuoteTs;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "currentBucketSlug")) {
+            state.payload.summary.currentBucketSlug = payload.currentBucketSlug;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "nextBucketSlug")) {
+            state.payload.summary.nextBucketSlug = payload.nextBucketSlug;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "currentBucketStartSec")) {
+            state.payload.summary.currentBucketStartSec = payload.currentBucketStartSec;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedWindowStartSec")) {
+            state.payload.summary.selectedWindowStartSec = payload.selectedWindowStartSec;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedWindowEndSec")) {
+            state.payload.summary.selectedWindowEndSec = payload.selectedWindowEndSec;
           }
           if (Object.prototype.hasOwnProperty.call(payload, "candidateRefreshed")) {
             state.payload.summary.candidateRefreshed = payload.candidateRefreshed;
@@ -11608,9 +12117,66 @@ function renderPolymarketDashboardJs(): string {
           if (Object.prototype.hasOwnProperty.call(payload, "staleState")) {
             state.payload.summary.staleState = payload.staleState;
           }
+          if (Object.prototype.hasOwnProperty.call(payload, "currentMarketStatus")) {
+            state.payload.summary.currentMarketStatus = payload.currentMarketStatus;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "threshold")) {
+            state.payload.summary.threshold = payload.threshold;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "currentBtcMid")) {
+            state.payload.summary.currentBtcMid = payload.currentBtcMid;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "minVenueShares")) {
+            state.payload.summary.minVenueShares = payload.minVenueShares;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "desiredShares")) {
+            state.payload.summary.desiredShares = payload.desiredShares;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "finalShares")) {
+            state.payload.summary.finalShares = payload.finalShares;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "desiredNotional")) {
+            state.payload.summary.desiredNotional = payload.desiredNotional;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "finalNotional")) {
+            state.payload.summary.finalNotional = payload.finalNotional;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "sizeBumped")) {
+            state.payload.summary.sizeBumped = payload.sizeBumped;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "lastNormalizedError")) {
+            state.payload.summary.lastNormalizedError = payload.lastNormalizedError;
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "pollTrace")) {
+            state.payload.summary.pollTrace = Array.isArray(payload.pollTrace) ? payload.pollTrace.slice(0, 20) : [];
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "rolloverTrace")) {
+            state.payload.summary.rolloverTrace = Array.isArray(payload.rolloverTrace) ? payload.rolloverTrace.slice(0, 20) : [];
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "selectedMarketId")) {
+            if (
+              payload.selectedMarketId != null ||
+              String(payload.currentMarketStatus || "").toUpperCase() === "NO_ACTIVE_BTC5M_MARKET"
+            ) {
+              state.payload.summary.selectedMarketId = payload.selectedMarketId;
+            }
+          }
+          if (Object.prototype.hasOwnProperty.call(payload, "currentMarketSlug")) {
+            if (
+              payload.currentMarketSlug != null ||
+              String(payload.currentMarketStatus || "").toUpperCase() === "NO_ACTIVE_BTC5M_MARKET"
+            ) {
+              state.payload.summary.currentMarketSlug = payload.currentMarketSlug;
+            }
+          }
           if (Object.prototype.hasOwnProperty.call(payload, "selectedSlug")) {
-            state.payload.summary.selectedSlug = payload.selectedSlug;
-            state.payload.summary.currentMarketSlug = payload.selectedSlug;
+            if (
+              payload.selectedSlug != null ||
+              String(payload.currentMarketStatus || "").toUpperCase() === "NO_ACTIVE_BTC5M_MARKET"
+            ) {
+              state.payload.summary.selectedSlug = payload.selectedSlug;
+              state.payload.summary.currentMarketSlug = payload.selectedSlug;
+            }
           }
           if (Object.prototype.hasOwnProperty.call(payload, "windowStartTs")) {
             state.payload.summary.windowStartTs = payload.windowStartTs;
@@ -11635,7 +12201,8 @@ function renderPolymarketDashboardJs(): string {
             state.payload.summary.chosenSide = payload.chosenSide;
           }
           if (Object.prototype.hasOwnProperty.call(payload, "holdReason")) {
-            state.payload.summary.whyNotTrading = payload.holdReason;
+            state.payload.summary.whyNotTrading =
+              payload.blockedBy != null ? payload.blockedBy : payload.holdReason;
           }
           if (Object.prototype.hasOwnProperty.call(payload, "entriesInWindow")) {
             state.payload.summary.entriesInWindow = payload.entriesInWindow;
@@ -12132,19 +12699,50 @@ function buildPolymarketActivityEvent(summary: Record<string, unknown>): Record<
     action: summary.lastAction ?? "HOLD",
     lifecycleStatus: summary.lifecycleStatus ?? null,
     holdReason: summary.holdReason ?? null,
+    blockedBy: summary.blockedBy ?? summary.holdReason ?? null,
     holdCategory: summary.holdCategory ?? null,
     strategyAction: summary.strategyAction ?? summary.lastAction ?? null,
     selectedTokenId: summary.selectedTokenId ?? null,
+    selectedBookable: summary.selectedBookable ?? null,
+    selectedTradable: summary.selectedTradable ?? null,
+    discoveredCurrent: summary.discoveredCurrent ?? null,
+    discoveredNext: summary.discoveredNext ?? null,
+    selectionSource: summary.selectionSource ?? null,
+    selectedFrom: summary.selectedFrom ?? summary.selectionSource ?? null,
+    selectionCommitTs: summary.selectionCommitTs ?? null,
+    liveValidationReason: summary.liveValidationReason ?? null,
+    lastBookTs: summary.lastBookTs ?? null,
+    lastQuoteTs: summary.lastQuoteTs ?? null,
+    currentBucketSlug: summary.currentBucketSlug ?? null,
+    nextBucketSlug: summary.nextBucketSlug ?? null,
+    currentBucketStartSec: summary.currentBucketStartSec ?? null,
+    selectedWindowStartSec: summary.selectedWindowStartSec ?? null,
+    selectedWindowEndSec: summary.selectedWindowEndSec ?? null,
     candidateRefreshed: summary.candidateRefreshed ?? null,
     lastPreorderValidationReason: summary.lastPreorderValidationReason ?? null,
+    currentMarketStatus: summary.currentMarketStatus ?? null,
     warningState: summary.warningState ?? null,
     staleState: summary.staleState ?? null,
     pollMode: summary.pollMode ?? null,
+    threshold: summary.threshold ?? null,
+    currentBtcMid: summary.currentBtcMid ?? null,
+    minVenueShares: summary.minVenueShares ?? null,
+    desiredShares: summary.desiredShares ?? null,
+    finalShares: summary.finalShares ?? null,
+    desiredNotional: summary.desiredNotional ?? null,
+    finalNotional: summary.finalNotional ?? null,
+    sizeBumped: summary.sizeBumped ?? null,
+    lastNormalizedError: summary.lastNormalizedError ?? null,
+    pollTrace: Array.isArray(summary.pollTrace) ? summary.pollTrace.slice(0, 20) : null,
+    rolloverTrace: Array.isArray(summary.rolloverTrace) ? summary.rolloverTrace.slice(0, 20) : null,
     remainingSec: summary.remainingSec ?? summary.currentMarketRemainingSec ?? null,
     selectedSlug: summary.selectedSlug ?? null,
+    selectedMarketId: summary.selectedMarketId ?? null,
+    currentMarketSlug: summary.currentMarketSlug ?? summary.selectedSlug ?? summary.selectedMarketId ?? null,
     windowStartTs: summary.windowStartTs ?? null,
     windowEndTs: summary.windowEndTs ?? null,
     chosenDirection: summary.chosenDirection ?? summary.chosenSide ?? null,
+    chosenSide: summary.chosenSide ?? null,
     entriesInWindow: summary.entriesInWindow ?? null,
     realizedPnlWindowUsd: summary.windowRealizedPnlUsd ?? null,
     resolutionSource: summary.resolutionSource ?? null,
@@ -12184,11 +12782,34 @@ function createPolymarketDashboardFingerprint(input: {
     lastAction: input.summary.lastAction ?? null,
     lastActionTs: input.summary.lastActionTs ?? null,
     holdReason: input.summary.holdReason ?? null,
+    blockedBy: input.summary.blockedBy ?? null,
     holdCategory: input.summary.holdCategory ?? null,
     selectedTokenId: input.summary.selectedTokenId ?? null,
+    selectedBookable: input.summary.selectedBookable ?? null,
+    selectedTradable: input.summary.selectedTradable ?? null,
+    discoveredCurrent: input.summary.discoveredCurrent ?? null,
+    discoveredNext: input.summary.discoveredNext ?? null,
+    selectionSource: input.summary.selectionSource ?? null,
+    selectedFrom: input.summary.selectedFrom ?? input.summary.selectionSource ?? null,
+    selectionCommitTs: input.summary.selectionCommitTs ?? null,
+    liveValidationReason: input.summary.liveValidationReason ?? null,
+    lastBookTs: input.summary.lastBookTs ?? null,
+    lastQuoteTs: input.summary.lastQuoteTs ?? null,
     candidateRefreshed: input.summary.candidateRefreshed ?? null,
     lastPreorderValidationReason: input.summary.lastPreorderValidationReason ?? null,
     selectedSlug: input.summary.selectedSlug ?? null,
+    selectedMarketId: input.summary.selectedMarketId ?? null,
+    currentMarketStatus: input.summary.currentMarketStatus ?? null,
+    pollMode: input.summary.pollMode ?? null,
+    threshold: input.summary.threshold ?? null,
+    currentBtcMid: input.summary.currentBtcMid ?? null,
+    minVenueShares: input.summary.minVenueShares ?? null,
+    desiredShares: input.summary.desiredShares ?? null,
+    finalShares: input.summary.finalShares ?? null,
+    desiredNotional: input.summary.desiredNotional ?? null,
+    finalNotional: input.summary.finalNotional ?? null,
+    sizeBumped: input.summary.sizeBumped ?? null,
+    lastNormalizedError: input.summary.lastNormalizedError ?? null,
     windowEndTs: input.summary.windowEndTs ?? null,
     lifecycleStatus: input.summary.lifecycleStatus ?? null,
     chosenDirection: input.summary.chosenDirection ?? null,
@@ -12211,6 +12832,8 @@ function createPolymarketDashboardFingerprint(input: {
     openTrades: input.summary.openTrades ?? null,
     resolvedTrades: input.summary.resolvedTrades ?? null,
     pnlTotalUsd: input.summary.pnlTotalUsd ?? null,
+    pollTrace: Array.isArray(input.summary.pollTrace) ? input.summary.pollTrace.slice(0, 20) : [],
+    rolloverTrace: Array.isArray(input.summary.rolloverTrace) ? input.summary.rolloverTrace.slice(0, 20) : [],
     openRowIds: input.openRows.map((row) => `${String(row.tradeId || row.id || "")}:${String(row.status || "")}:${getPolymarketRowSortTs(row)}`),
     recentRowIds: input.recentRows.map((row) => `${String(row.tradeId || row.id || "")}:${String(row.status || "")}:${getPolymarketRowSortTs(row)}`),
     equityTail: input.equityPoints.slice(-8)

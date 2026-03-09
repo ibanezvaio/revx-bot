@@ -111,10 +111,17 @@ async function run(): Promise<void> {
           chosenSide: "YES",
           chosenDirection: "UP",
           holdReason: "SIDE_NOT_BOOKABLE",
+          blockedBy: "SIDE_NOT_BOOKABLE",
           currentWindowHoldReason: "SIDE_NOT_BOOKABLE",
           holdCategory: "DATA_HEALTH",
           strategyAction: "HOLD",
           selectedTokenId: "live-market-cached-yes",
+          selectedBookable: true,
+          selectedTradable: true,
+          selectionSource: "current_slug",
+          liveValidationReason: "preorder_validated",
+          lastBookTs: ts - 2_000,
+          lastQuoteTs: ts - 1_000,
           candidateRefreshed: true,
           lastPreorderValidationReason: "ok",
           pollMode: "FAST",
@@ -131,14 +138,19 @@ async function run(): Promise<void> {
           `active cached selection should expose DISCOVERY_STALE warning, got ${String(cachedDecisioningPayload.poly.warningState)}`
         );
         assert(
-          String(cachedDecisioningPayload.poly.staleState || "") === "DECISIONING_WITH_CACHED_SELECTION",
-          `active cached selection should expose staleState DECISIONING_WITH_CACHED_SELECTION, got ${String(cachedDecisioningPayload.poly.staleState)}`
+          String(cachedDecisioningPayload.poly.staleState || "") === "DISCOVERY_STALE",
+          `active cached selection should expose staleState DISCOVERY_STALE, got ${String(cachedDecisioningPayload.poly.staleState)}`
         );
         assert(cachedDecisioningPayload.poly.selection.selectedSlug === activeSlug, `active cached selection should preserve selectedSlug, got ${String(cachedDecisioningPayload.poly.selection.selectedSlug)}`);
         assert(cachedDecisioningPayload.poly.selection.chosenSide === "YES", `active cached selection should preserve chosenSide, got ${String(cachedDecisioningPayload.poly.selection.chosenSide)}`);
         assert(cachedDecisioningPayload.poly.selectedSlug === activeSlug, `active cached selection should expose root selectedSlug, got ${String(cachedDecisioningPayload.poly.selectedSlug)}`);
         assert(cachedDecisioningPayload.poly.currentMarketSlug === activeSlug, `active cached selection should expose currentMarketSlug, got ${String(cachedDecisioningPayload.poly.currentMarketSlug)}`);
         assert(cachedDecisioningPayload.poly.chosenSide === "YES", `active cached selection should expose root chosenSide, got ${String(cachedDecisioningPayload.poly.chosenSide)}`);
+        assert(cachedDecisioningPayload.poly.selectedBookable === true, "active cached selection should expose selectedBookable");
+        assert(cachedDecisioningPayload.poly.selectedTradable === true, "active cached selection should expose selectedTradable");
+        assert(cachedDecisioningPayload.poly.selectionSource === "current_slug", `active cached selection should expose selectionSource, got ${String(cachedDecisioningPayload.poly.selectionSource)}`);
+        assert(cachedDecisioningPayload.poly.liveValidationReason === "preorder_validated", `active cached selection should expose liveValidationReason, got ${String(cachedDecisioningPayload.poly.liveValidationReason)}`);
+        assert(cachedDecisioningPayload.poly.blockedBy === "SIDE_NOT_BOOKABLE", `active cached selection should expose blockedBy, got ${String(cachedDecisioningPayload.poly.blockedBy)}`);
         assert(cachedDecisioningPayload.poly.whyNotTrading === "SIDE_NOT_BOOKABLE", `active cached selection should expose whyNotTrading, got ${String(cachedDecisioningPayload.poly.whyNotTrading)}`);
         assert(cachedDecisioningPayload.poly.currentMarketStatus === "RUNNING", `active cached selection should expose currentMarketStatus RUNNING, got ${String(cachedDecisioningPayload.poly.currentMarketStatus)}`);
         assert(Number(cachedDecisioningPayload.poly.currentMarketRemainingSec || 0) > 0, `active cached selection should expose positive currentMarketRemainingSec, got ${String(cachedDecisioningPayload.poly.currentMarketRemainingSec)}`);
@@ -163,7 +175,42 @@ async function run(): Promise<void> {
         assert(cachedSummaryPayload.pollMode === "FAST", `summary payload should expose pollMode, got ${String(cachedSummaryPayload.pollMode)}`);
         assert(cachedSummaryPayload.holdCategory === "DATA_HEALTH", `summary payload should expose holdCategory, got ${String(cachedSummaryPayload.holdCategory)}`);
         assert(cachedSummaryPayload.selectedTokenId === "live-market-cached-yes", `summary payload should expose selectedTokenId, got ${String(cachedSummaryPayload.selectedTokenId)}`);
+        assert(cachedSummaryPayload.selectedBookable === true, "summary payload should expose selectedBookable");
+        assert(cachedSummaryPayload.selectedTradable === true, "summary payload should expose selectedTradable");
+        assert(cachedSummaryPayload.selectionSource === "current_slug", `summary payload should expose selectionSource, got ${String(cachedSummaryPayload.selectionSource)}`);
+        assert(cachedSummaryPayload.liveValidationReason === "preorder_validated", `summary payload should expose liveValidationReason, got ${String(cachedSummaryPayload.liveValidationReason)}`);
+        assert(cachedSummaryPayload.blockedBy === "SIDE_NOT_BOOKABLE", `summary payload should expose blockedBy, got ${String(cachedSummaryPayload.blockedBy)}`);
         assert(cachedSummaryPayload.candidateRefreshed === true, `summary payload should expose candidateRefreshed, got ${String(cachedSummaryPayload.candidateRefreshed)}`);
+        assert(Array.isArray(cachedSummaryPayload.pollTrace), "summary payload should expose pollTrace array");
+        assert(Array.isArray(cachedSummaryPayload.rolloverTrace), "summary payload should expose rolloverTrace array");
+        if (cachedSummaryPayload.pollTrace.length > 0) {
+          assert(
+            String(cachedSummaryPayload.pollTrace[0]?.selectedSlug || "") === activeSlug,
+            `summary payload pollTrace should carry selectedSlug, got ${String(cachedSummaryPayload.pollTrace[0]?.selectedSlug)}`
+          );
+          assert(
+            typeof cachedSummaryPayload.pollTrace[0]?.currentBucketSlug === "string",
+            "summary payload pollTrace should carry currentBucketSlug"
+          );
+        }
+        if (cachedSummaryPayload.rolloverTrace.length > 0) {
+          assert(
+            typeof cachedSummaryPayload.rolloverTrace[0]?.nextBucketSlug === "string",
+            "summary payload rolloverTrace should carry nextBucketSlug"
+          );
+        }
+        assert(
+          cachedSummaryPayload.minVenueShares === null || typeof cachedSummaryPayload.minVenueShares === "number",
+          `summary payload minVenueShares should be nullable number, got ${String(cachedSummaryPayload.minVenueShares)}`
+        );
+        assert(
+          cachedSummaryPayload.finalNotional === null || typeof cachedSummaryPayload.finalNotional === "number",
+          `summary payload finalNotional should be nullable number, got ${String(cachedSummaryPayload.finalNotional)}`
+        );
+        assert(
+          cachedSummaryPayload.lastNormalizedError === null || typeof cachedSummaryPayload.lastNormalizedError === "string",
+          `summary payload lastNormalizedError should be nullable string, got ${String(cachedSummaryPayload.lastNormalizedError)}`
+        );
 
         truth.updatePolymarket({
           ts,

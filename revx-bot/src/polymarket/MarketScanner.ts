@@ -1258,59 +1258,71 @@ function parseTokens(row: RawPolymarketMarket): Array<{ outcome: "yes" | "no" | 
   const raw = row.tokens;
   const outcomeNames = parseOutcomeNames(row);
   const clobTokenIds = parseStringArray((row as Record<string, unknown>).clobTokenIds);
-  if (clobTokenIds.length >= 2) {
-    const mapped: Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> = [
-      { outcome: "yes", tokenId: clobTokenIds[0] },
-      { outcome: "no", tokenId: clobTokenIds[1] }
-    ];
-    for (let idx = 2; idx < clobTokenIds.length; idx += 1) {
-      mapped.push({ outcome: "other", tokenId: clobTokenIds[idx] });
+
+  // Prefer explicit token objects first
+  if (Array.isArray(raw) && raw.some((item) => item && typeof item === "object")) {
+    const out: Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> = [];
+
+    for (const item of raw) {
+      if (!item || typeof item !== "object") continue;
+
+      const obj = item as Record<string, unknown>;
+      const tokenId = pickString(obj, ["token_id", "tokenId", "id", "clob_token_id"]);
+      if (!tokenId) continue;
+
+      const outcomeRaw = pickString(obj, ["outcome", "name", "label"]).toLowerCase();
+
+      const outcome: "yes" | "no" | "other" =
+        outcomeRaw === "yes" || outcomeRaw.includes("up") || outcomeRaw.includes("higher") || outcomeRaw.includes("above")
+          ? "yes"
+          : outcomeRaw === "no" || outcomeRaw.includes("down") || outcomeRaw.includes("lower") || outcomeRaw.includes("below")
+            ? "no"
+            : "other";
+
+      out.push({ outcome, tokenId });
     }
-    return mapped;
+
+    if (out.length > 0) return out;
   }
+
+  // Raw tokens as string array
   if (Array.isArray(raw) && raw.every((item) => typeof item === "string" || typeof item === "number")) {
     return raw
       .map((item, idx) => {
         const tokenId = String(item || "").trim();
         if (!tokenId) return null;
+
         const outcomeRaw = String(outcomeNames[idx] || "").trim().toLowerCase();
+
         const outcome: "yes" | "no" | "other" =
           outcomeRaw === "yes" || outcomeRaw.includes("up") || outcomeRaw.includes("higher") || outcomeRaw.includes("above")
             ? "yes"
             : outcomeRaw === "no" || outcomeRaw.includes("down") || outcomeRaw.includes("lower") || outcomeRaw.includes("below")
               ? "no"
               : "other";
+
         return { outcome, tokenId };
       })
       .filter((row): row is { outcome: "yes" | "no" | "other"; tokenId: string } => row !== null);
   }
-  if (!Array.isArray(raw)) {
-    if (clobTokenIds.length > 0) {
-      return clobTokenIds.map((tokenId, idx) => {
-        const outcomeRaw = String(outcomeNames[idx] || "").trim().toLowerCase();
-        const outcome: "yes" | "no" | "other" =
-          outcomeRaw === "yes" || outcomeRaw.includes("up") || outcomeRaw.includes("higher") || outcomeRaw.includes("above")
-            ? "yes"
-            : outcomeRaw === "no" || outcomeRaw.includes("down") || outcomeRaw.includes("lower") || outcomeRaw.includes("below")
-              ? "no"
-              : "other";
-        return { outcome, tokenId };
-      });
-    }
-    return [];
+
+  // Fallback to clobTokenIds
+  if (clobTokenIds.length > 0) {
+    return clobTokenIds.map((tokenId, idx) => {
+      const outcomeRaw = String(outcomeNames[idx] || "").trim().toLowerCase();
+
+      const outcome: "yes" | "no" | "other" =
+        outcomeRaw === "yes" || outcomeRaw.includes("up") || outcomeRaw.includes("higher") || outcomeRaw.includes("above")
+          ? "yes"
+          : outcomeRaw === "no" || outcomeRaw.includes("down") || outcomeRaw.includes("lower") || outcomeRaw.includes("below")
+            ? "no"
+            : "other";
+
+      return { outcome, tokenId };
+    });
   }
-  const out: Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const obj = item as Record<string, unknown>;
-    const tokenId = pickString(obj, ["token_id", "tokenId", "id", "clob_token_id"]);
-    if (!tokenId) continue;
-    const outcomeRaw = pickString(obj, ["outcome", "name", "label"]).toLowerCase();
-    const outcome: "yes" | "no" | "other" =
-      outcomeRaw === "yes" ? "yes" : outcomeRaw === "no" ? "no" : "other";
-    out.push({ outcome, tokenId });
-  }
-  return out;
+
+  return [];
 }
 
 function parseOutcomeNames(row: RawPolymarketMarket): string[] {

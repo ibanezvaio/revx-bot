@@ -512,6 +512,14 @@ export class MakerStrategy {
     }
   }
 
+  private shouldDisableForcedBaselineWhilePolymarketLive(): boolean {
+    return (
+      this.config.polymarket.enabled &&
+      this.config.polymarket.mode === "live" &&
+      this.config.polymarket.debugDisableRevolutBaselineWhileLive
+    );
+  }
+
   async runSingleCycle(): Promise<void> {
     let cycleErrored = false;
     if (isDebugVerbosity(this.config)) {
@@ -3113,9 +3121,11 @@ export class MakerStrategy {
     let minLevelsFloorApplied = false;
     let overrideApplied = false;
     const overrideReasons: string[] = [];
+    const disableBaselineWhilePolymarketLive = this.shouldDisableForcedBaselineWhilePolymarketLive();
     const pauseDrivenFloorCandidate =
       quotePlan.signalsState === "PAUSE" || quotePlan.newsState === "PAUSE";
     if (
+      !disableBaselineWhilePolymarketLive &&
       !quotePlan.hardHalt &&
       !quotePlan.quoteEnabled &&
       rawTargetLevels.buy <= 0 &&
@@ -3137,6 +3147,7 @@ export class MakerStrategy {
       sellQuoteSizeUsd = clamp(sellQuoteSizeUsd * 0.5, this.config.minQuoteSizeUsd, sellQuoteSizeUsd);
     }
     if (
+      !disableBaselineWhilePolymarketLive &&
       this.config.quotingMinLevelsFloorEnabled &&
       !quotePlan.hardHalt &&
       (quotePlan.quoteEnabled || pauseDrivenFloorCandidate)
@@ -3171,7 +3182,7 @@ export class MakerStrategy {
         }
       }
     }
-    if (!quotePlan.hardHalt && quotePlan.quoteEnabled) {
+    if (!disableBaselineWhilePolymarketLive && !quotePlan.hardHalt && quotePlan.quoteEnabled) {
       const baselineBuy = Math.max(1, effectiveTargetLevels.buy);
       const baselineSell = Math.max(1, effectiveTargetLevels.sell);
       if (baselineBuy !== effectiveTargetLevels.buy || baselineSell !== effectiveTargetLevels.sell) {
@@ -4308,7 +4319,7 @@ export class MakerStrategy {
         whyNotQuotingDetails = why.details;
       }
 
-      if (this.config.quotingForceBaselineWhenEnabled) {
+      if (this.config.quotingForceBaselineWhenEnabled && !disableBaselineWhilePolymarketLive) {
         const baseline = await this.placeForcedBaseline({
           tickerMid: ticker.mid,
           bestBid: ticker.bid,
@@ -4356,6 +4367,11 @@ export class MakerStrategy {
         }
         baselineAckReceived = baseline.ackReceived;
         baselineAckMissing = baseline.ackMissing;
+      } else if (disableBaselineWhilePolymarketLive) {
+        quotePlan.blockedReasons = dedupeStrings([
+          ...quotePlan.blockedReasons,
+          "FORCE_BASELINE_DISABLED_WHILE_POLYMARKET_LIVE"
+        ]);
       }
 
       postReconcileActiveOrders = this.store.getActiveBotOrders(this.config.symbol);

@@ -23,6 +23,29 @@ export class Execution {
     private readonly dryRun: boolean
   ) {}
 
+  private shouldLogVerboseRevxOrders(): boolean {
+    if (this.config.polymarket.enabled && this.config.polymarket.mode === "live") {
+      return this.config.debugHttp || process.env.DEBUG_REVX_ORDER_LOGS === "1";
+    }
+    return true;
+  }
+
+  private logRevxOrderInfo(payload: Record<string, unknown>, message: string): void {
+    if (this.shouldLogVerboseRevxOrders()) {
+      this.logger.info(payload, message);
+      return;
+    }
+    this.logger.debug(payload, message);
+  }
+
+  private logRevxOrderLine(payload: Record<string, unknown>, line: string): void {
+    if (this.shouldLogVerboseRevxOrders()) {
+      this.logger.info(payload, line);
+      return;
+    }
+    this.logger.debug(payload, line);
+  }
+
   getRunId(): string {
     return this.runId;
   }
@@ -214,7 +237,7 @@ export class Execution {
           is_bot: 1
         });
 
-        this.logger.info(
+        this.logRevxOrderInfo(
           {
             side: params.side,
             price: workingPrice,
@@ -225,7 +248,7 @@ export class Execution {
           },
           "Placed post-only maker order"
         );
-        this.logger.info(
+        this.logRevxOrderLine(
           {
             event: "ORDER",
             action: "PLACED",
@@ -412,7 +435,7 @@ export class Execution {
     });
 
     if (this.dryRun) {
-      this.logger.info(
+      this.logRevxOrderInfo(
         {
           side: params.side,
           symbol: params.symbol,
@@ -557,8 +580,8 @@ export class Execution {
           reason: "USER_CANCEL",
           botTag: existing?.bot_tag ?? null
         });
-        this.logger.info({ venueOrderId }, "Cancelled order");
-        this.logger.info(
+        this.logRevxOrderInfo({ venueOrderId }, "Cancelled order");
+        this.logRevxOrderLine(
           {
             event: "ORDER",
             action: "CANCELLED",
@@ -585,11 +608,11 @@ export class Execution {
               reason: "ALREADY_INACTIVE",
               botTag: existing?.bot_tag ?? null
             });
-            this.logger.info(
+            this.logRevxOrderInfo(
               { venueOrderId, status: error.status },
               "Order not found; treated as cancelled"
             );
-            this.logger.info(
+            this.logRevxOrderLine(
               {
                 event: "ORDER",
                 action: "CANCELLED",
@@ -617,11 +640,11 @@ export class Execution {
               reason: "ALREADY_INACTIVE",
               botTag: existing?.bot_tag ?? null
             });
-            this.logger.info(
+            this.logRevxOrderInfo(
               { venueOrderId, status: error.status, responseMessage },
               "Order already inactive; treated as cancelled"
             );
-            this.logger.info(
+            this.logRevxOrderLine(
               {
                 event: "ORDER",
                 action: "CANCELLED",

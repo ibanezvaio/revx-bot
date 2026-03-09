@@ -54,6 +54,21 @@ export class Reconciler {
     private readonly performanceEngine?: PerformanceEngine
   ) {}
 
+  private shouldLogVerboseRevxEvents(): boolean {
+    if (this.config.polymarket.enabled && this.config.polymarket.mode === "live") {
+      return this.config.debugHttp || process.env.DEBUG_REVX_ORDER_LOGS === "1";
+    }
+    return true;
+  }
+
+  private logRevxEventInfo(payload: Record<string, unknown>, message: string): void {
+    if (this.shouldLogVerboseRevxEvents()) {
+      this.logger.info(payload, message);
+      return;
+    }
+    this.logger.debug(payload, message);
+  }
+
   start(): void {
     if (this.timer) return;
     const intervalMs = Math.max(1, this.config.reconcileSeconds) * 1000;
@@ -534,7 +549,7 @@ export class Reconciler {
               reason: `trade ${fill.trade_id}`,
               bot_tag: order.bot_tag ?? "-"
             });
-            this.logger.info(
+            this.logRevxEventInfo(
               {
                 event: "FILL",
                 source: "venue",
@@ -550,7 +565,7 @@ export class Reconciler {
               },
               `REVX_FILL side=${order.side} symbol=${order.symbol} price=${fill.price.toFixed(2)} size=${fill.qty.toFixed(8)} venueOrderId=${fill.venue_order_id} clientOrderId=${order.client_order_id}`
             );
-            this.logger.info(
+            this.logRevxEventInfo(
               {
                 event: "ORDER",
                 action: "FILLED",
@@ -1068,7 +1083,7 @@ export class Reconciler {
                 },
                 "inferred_fill_detected"
               );
-              this.logger.info(
+              this.logRevxEventInfo(
                 {
                   event: "FILL",
                   source: "inferred",
@@ -1083,7 +1098,7 @@ export class Reconciler {
                 },
                 `REVX_FILL side=${side} symbol=${this.config.symbol} price=${inferredPrice.toFixed(2)} size=${sizeBtc.toFixed(8)} venueOrderId=${inferredVenueOrderId} clientOrderId=${inferredClientOrderId}`
               );
-              this.logger.info(
+              this.logRevxEventInfo(
                 {
                   event: "ORDER",
                   action: "FILLED",

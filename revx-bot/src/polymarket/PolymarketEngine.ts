@@ -182,10 +182,27 @@ type LiveCommittedSelection = {
   selectedEpoch: number | null;
   windowStartTs: number | null;
   windowEndTs: number | null;
+  selectedWindowStartSec: number | null;
+  selectedWindowEndSec: number | null;
+  candidateRefreshed: boolean | null;
   chosenDirection: string | null;
   chosenSide: "YES" | "NO" | null;
   yesTokenId: string | null;
   noTokenId: string | null;
+  selectedTokenId: string | null;
+  selectedBookable: boolean;
+  selectedTradable: boolean;
+  discoveredCurrent: boolean;
+  discoveredNext: boolean;
+  selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | "committed";
+  selectedFrom: "current_slug" | "next_slug" | "fallback_discovery" | "committed";
+  liveValidationReason: string | null;
+  lastBookTs: number | null;
+  lastQuoteTs: number | null;
+  selectionCommitTs: number | null;
+  currentBucketSlug: string | null;
+  nextBucketSlug: string | null;
+  currentBucketStartSec: number | null;
   acceptingOrders: boolean | null;
   enableOrderBook: boolean | null;
   selectedReason: string | null;
@@ -197,7 +214,7 @@ type LiveCommittedSelection = {
 
 type PersistedPolymarketSnapshot = {
   status: string | null;
-  staleState: "DECISIONING_WITH_CACHED_SELECTION" | "DISCOVERY_STALE" | null;
+  staleState: "ACTIVE_MARKET_REFRESH_FAILED" | "ACTIVE_MARKET_PRICE_STALE" | "DISCOVERY_STALE" | null;
   pollMode: LivePollMode | null;
   action: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD" | null;
   selectedSlug: string | null;
@@ -209,9 +226,25 @@ type PersistedPolymarketSnapshot = {
   chosenSide: "YES" | "NO" | null;
   chosenDirection: string | null;
   holdReason: string | null;
+  executionBlockedReason: string | null;
   holdCategory: HoldCategory | null;
   strategyAction: string | null;
   selectedTokenId: string | null;
+  selectedBookable: boolean;
+  selectedTradable: boolean;
+  discoveredCurrent: boolean;
+  discoveredNext: boolean;
+  selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+  selectedFrom: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+  selectionCommitTs: number | null;
+  liveValidationReason: string | null;
+  lastBookTs: number | null;
+  lastQuoteTs: number | null;
+  currentBucketSlug: string | null;
+  nextBucketSlug: string | null;
+  currentBucketStartSec: number | null;
+  selectedWindowStartSec: number | null;
+  selectedWindowEndSec: number | null;
   candidateRefreshed: boolean | null;
   lastPreorderValidationReason: string | null;
   warningState: string | null;
@@ -225,6 +258,13 @@ type PersistedPolymarketSnapshot = {
   lastDecisionTs: number | null;
   lastSelectedMarketTs: number | null;
   currentBtcMid: number | null;
+  minVenueShares: number | null;
+  desiredShares: number | null;
+  finalShares: number | null;
+  desiredNotional: number | null;
+  finalNotional: number | null;
+  sizeBumped: boolean | null;
+  lastNormalizedError: string | null;
   statusLine: string | null;
 };
 
@@ -274,6 +314,7 @@ type Btc5mWallClockBucket = {
 
 type LivePreorderValidationReason =
   | "ok"
+  | "token_not_bookable"
   | "stale_market_selection"
   | "stale_token_ids"
   | "token_mismatch"
@@ -301,6 +342,18 @@ type LiveExecutionCandidateValidation = {
   selectedTokenId: string | null;
 };
 
+type LiveMarketTradabilityValidation = {
+  tradable: boolean;
+  tokenId: string | null;
+  bookable: boolean;
+  bestBid: number | null;
+  bestAsk: number | null;
+  mid: number | null;
+  lastBookTs: number | null;
+  lastQuoteTs: number | null;
+  reason: string;
+};
+
 function createPersistedPolymarketSnapshot(): PersistedPolymarketSnapshot {
   return {
     status: null,
@@ -316,9 +369,25 @@ function createPersistedPolymarketSnapshot(): PersistedPolymarketSnapshot {
     chosenSide: null,
     chosenDirection: null,
     holdReason: null,
+    executionBlockedReason: null,
     holdCategory: null,
     strategyAction: null,
     selectedTokenId: null,
+    selectedBookable: false,
+    selectedTradable: false,
+    discoveredCurrent: false,
+    discoveredNext: false,
+    selectionSource: null,
+    selectedFrom: null,
+    selectionCommitTs: null,
+    liveValidationReason: null,
+    lastBookTs: null,
+    lastQuoteTs: null,
+    currentBucketSlug: null,
+    nextBucketSlug: null,
+    currentBucketStartSec: null,
+    selectedWindowStartSec: null,
+    selectedWindowEndSec: null,
     candidateRefreshed: null,
     lastPreorderValidationReason: null,
     warningState: null,
@@ -332,6 +401,13 @@ function createPersistedPolymarketSnapshot(): PersistedPolymarketSnapshot {
     lastDecisionTs: null,
     lastSelectedMarketTs: null,
     currentBtcMid: null,
+    minVenueShares: null,
+    desiredShares: null,
+    finalShares: null,
+    desiredNotional: null,
+    finalNotional: null,
+    sizeBumped: null,
+    lastNormalizedError: null,
     statusLine: null
   };
 }
@@ -453,6 +529,8 @@ export class PolymarketEngine {
   private lastDiscoveryDegradedSignature = "";
   private lastDiscoveryDegradedLogTs = 0;
   private lastSelectorDiagnosticSignature = "";
+  private lastSelectionBugSignature = "";
+  private lastSelectionCommitRecoverySignature = "";
   private lastBookFallbackWarningSignature = "";
   private lastBookFallbackWarningLogTs = 0;
   private lastIntentionalHoldSignature = "";
@@ -460,6 +538,10 @@ export class PolymarketEngine {
   private lastPolyStatusSignature = "";
   private lastPolyRolloverSignature = "";
   private lastUiStatusSignature = "";
+  private lastPolyDebugSignature = "";
+  private readonly polyPollTrace: Array<Record<string, unknown>> = [];
+  private readonly polyRolloverTrace: Array<Record<string, unknown>> = [];
+  private lastRolloverPlanBucketSignature = "";
   private truthLastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD" = "HOLD";
   private truthLastActionTs = 0;
   private truthLastTradeId: string | null = null;
@@ -615,6 +697,7 @@ export class PolymarketEngine {
     this.liveCommittedSelection = null;
     this.lastExpectedCurrentBtc5mSlugLogged = null;
     this.lastDelayedBookConfirmationSignature = "";
+    this.lastSelectionCommitRecoverySignature = "";
     if (
       this.config.polymarket.mode === "live" &&
       this.config.polymarket.execution.cancelAllOnStart &&
@@ -669,6 +752,7 @@ export class PolymarketEngine {
     this.liveCommittedSelection = null;
     this.lastExpectedCurrentBtc5mSlugLogged = null;
     this.lastDelayedBookConfirmationSignature = "";
+    this.lastSelectionCommitRecoverySignature = "";
     if (this.loopPromise) {
       try {
         await this.loopPromise;
@@ -743,6 +827,15 @@ export class PolymarketEngine {
     lastSelectedMarketTs: number | null;
     threshold: number | null;
     currentBtcMid: number | null;
+    minVenueShares: number | null;
+    desiredShares: number | null;
+    finalShares: number | null;
+    desiredNotional: number | null;
+    finalNotional: number | null;
+    sizeBumped: boolean | null;
+    lastNormalizedError: string | null;
+    pollTrace: Array<Record<string, unknown>>;
+    rolloverTrace: Array<Record<string, unknown>>;
     currentMarketSlug: string | null;
     currentMarketRemainingSec: number | null;
     currentMarketExpiresAt: number | null;
@@ -752,10 +845,26 @@ export class PolymarketEngine {
     polyMoney: boolean;
     lastAction: "OPEN" | "CLOSE" | "RESOLVE" | "HOLD";
     holdReason: string | null;
+    blockedBy: string | null;
     currentWindowHoldReason: string | null;
     holdCategory: HoldCategory | null;
     strategyAction: string | null;
     selectedTokenId: string | null;
+    selectedBookable: boolean;
+    selectedTradable: boolean;
+    discoveredCurrent: boolean;
+    discoveredNext: boolean;
+    selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+    selectedFrom: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+    selectionCommitTs: number | null;
+    liveValidationReason: string | null;
+    lastBookTs: number | null;
+    lastQuoteTs: number | null;
+    currentBucketSlug: string | null;
+    nextBucketSlug: string | null;
+    currentBucketStartSec: number | null;
+    selectedWindowStartSec: number | null;
+    selectedWindowEndSec: number | null;
     candidateRefreshed: boolean | null;
     lastPreorderValidationReason: string | null;
     openTradesCount: number;
@@ -1000,6 +1109,15 @@ export class PolymarketEngine {
       lastSelectedMarketTs: persistedSnapshot.lastSelectedMarketTs,
       threshold: persistedSnapshot.threshold,
       currentBtcMid: persistedSnapshot.currentBtcMid,
+      minVenueShares: persistedSnapshot.minVenueShares,
+      desiredShares: persistedSnapshot.desiredShares,
+      finalShares: persistedSnapshot.finalShares,
+      desiredNotional: persistedSnapshot.desiredNotional,
+      finalNotional: persistedSnapshot.finalNotional,
+      sizeBumped: persistedSnapshot.sizeBumped,
+      lastNormalizedError: persistedSnapshot.lastNormalizedError,
+      pollTrace: this.polyPollTrace.slice(0, 20).map((row) => ({ ...row })),
+      rolloverTrace: this.polyRolloverTrace.slice(0, 20).map((row) => ({ ...row })),
       currentMarketSlug: persistedSnapshot.selectedSlug ?? persistedSnapshot.selectedMarketId,
       currentMarketRemainingSec: persistedSnapshot.remainingSec,
       currentMarketExpiresAt: persistedSnapshot.marketExpiresAtTs ?? persistedSnapshot.windowEndTs,
@@ -1013,10 +1131,31 @@ export class PolymarketEngine {
         this.config.polymarket.liveExecutionEnabled,
       lastAction: effectiveLastAction,
       holdReason: currentWindowHoldReason,
+      blockedBy:
+        normalizeHoldReason(
+          persistedSnapshot.executionBlockedReason ||
+            persistedSnapshot.holdReason ||
+            currentWindowHoldReason
+        ) ?? null,
       currentWindowHoldReason,
       holdCategory: persistedSnapshot.holdCategory,
       strategyAction: persistedSnapshot.strategyAction,
       selectedTokenId: persistedSnapshot.selectedTokenId,
+      selectedBookable: Boolean(persistedSnapshot.selectedBookable),
+      selectedTradable: Boolean(persistedSnapshot.selectedTradable),
+      discoveredCurrent: Boolean(persistedSnapshot.discoveredCurrent),
+      discoveredNext: Boolean(persistedSnapshot.discoveredNext),
+      selectionSource: persistedSnapshot.selectionSource,
+      selectedFrom: persistedSnapshot.selectedFrom ?? persistedSnapshot.selectionSource,
+      selectionCommitTs: persistedSnapshot.selectionCommitTs,
+      liveValidationReason: persistedSnapshot.liveValidationReason,
+      lastBookTs: persistedSnapshot.lastBookTs,
+      lastQuoteTs: persistedSnapshot.lastQuoteTs,
+      currentBucketSlug: persistedSnapshot.currentBucketSlug,
+      nextBucketSlug: persistedSnapshot.nextBucketSlug,
+      currentBucketStartSec: persistedSnapshot.currentBucketStartSec,
+      selectedWindowStartSec: persistedSnapshot.selectedWindowStartSec,
+      selectedWindowEndSec: persistedSnapshot.selectedWindowEndSec,
       candidateRefreshed: persistedSnapshot.candidateRefreshed,
       lastPreorderValidationReason: persistedSnapshot.lastPreorderValidationReason,
       openTradesCount: paperResolutionStats.openTradesCount,
@@ -1170,14 +1309,15 @@ export class PolymarketEngine {
     nowTs: number,
     lastUpdateTs: number,
     hasActiveSelection: boolean
-  ): "DECISIONING_WITH_CACHED_SELECTION" | "DISCOVERY_STALE" | null {
+  ): "DISCOVERY_STALE" | null {
+    void hasActiveSelection;
     if (
       !(lastUpdateTs > 0) ||
       nowTs - lastUpdateTs <= Math.max(1_000, Math.floor(this.config.polymarket.live.discoveryStaleMs))
     ) {
       return null;
     }
-    return hasActiveSelection ? "DECISIONING_WITH_CACHED_SELECTION" : "DISCOVERY_STALE";
+    return "DISCOVERY_STALE";
   }
 
   private transitionRuntimeStartupState(
@@ -1267,6 +1407,307 @@ export class PolymarketEngine {
     this.logger.info(payload, event);
   }
 
+  private emitSelectionCommitLine(selection: {
+    selectedSlug: string | null;
+    selectedTokenId: string | null;
+    selectionSource: string | null;
+    remainingSec: number | null;
+    chosenSide: "YES" | "NO" | null;
+    chosenDirection: string | null;
+  }): void {
+    this.logger.info(
+      `POLY_SELECTION_COMMITTED selectedSlug=${String(selection.selectedSlug || "-")} tokenId=${String(
+        selection.selectedTokenId || "-"
+      )} source=${String(selection.selectionSource || "-")} remainingSec=${
+        Number.isFinite(Number(selection.remainingSec)) ? Math.max(0, Math.floor(Number(selection.remainingSec))) : "-"
+      } chosenSide=${String(selection.chosenSide || "-")} chosenDirection=${String(selection.chosenDirection || "-")}`
+    );
+  }
+
+  private emitSelectionBugLine(input: {
+    currentBucketSlug: string | null;
+    nextBucketSlug: string | null;
+    fetchedCount: number;
+    afterWindowCount: number;
+    finalCandidatesCount: number;
+    selectedSlug: string | null;
+    selectedTokenId: string | null;
+    liveValidationReason: string | null;
+    attemptedSlugs: string[];
+  }): void {
+    const signature = JSON.stringify({
+      currentBucketSlug: input.currentBucketSlug,
+      nextBucketSlug: input.nextBucketSlug,
+      fetchedCount: input.fetchedCount,
+      afterWindowCount: input.afterWindowCount,
+      finalCandidatesCount: input.finalCandidatesCount,
+      selectedSlug: input.selectedSlug,
+      selectedTokenId: input.selectedTokenId,
+      liveValidationReason: input.liveValidationReason,
+      attemptedSlugs: input.attemptedSlugs
+    });
+    if (signature === this.lastSelectionBugSignature) {
+      return;
+    }
+    this.lastSelectionBugSignature = signature;
+    this.logger.warn(
+      `POLY_SELECTION_BUG currentBucketSlug=${String(input.currentBucketSlug || "-")} nextBucketSlug=${String(
+        input.nextBucketSlug || "-"
+      )} fetchedCount=${Math.max(0, Math.floor(Number(input.fetchedCount || 0)))} afterWindowCount=${Math.max(
+        0,
+        Math.floor(Number(input.afterWindowCount || 0))
+      )} finalCandidatesCount=${Math.max(0, Math.floor(Number(input.finalCandidatesCount || 0)))} selectedSlug=${String(
+        input.selectedSlug || "-"
+      )} selectedTokenId=${String(input.selectedTokenId || "-")} liveValidationReason=${String(
+        input.liveValidationReason || "-"
+      )} candidateSlugs=${input.attemptedSlugs.length > 0 ? input.attemptedSlugs.join(",") : "-"}`
+    );
+  }
+
+  private emitSelectionCommitRecoveryLine(input: {
+    currentBucketSlug: string | null;
+    validatedSlug: string | null;
+    tokenId: string | null;
+    chosenSide: "YES" | "NO" | null;
+    chosenDirection: string | null;
+    liveValidationReason: string | null;
+  }): void {
+    const signature = JSON.stringify({
+      currentBucketSlug: input.currentBucketSlug,
+      validatedSlug: input.validatedSlug,
+      tokenId: input.tokenId,
+      chosenSide: input.chosenSide,
+      chosenDirection: input.chosenDirection,
+      liveValidationReason: input.liveValidationReason
+    });
+    if (signature === this.lastSelectionCommitRecoverySignature) {
+      return;
+    }
+    this.lastSelectionCommitRecoverySignature = signature;
+    this.logger.warn(
+      `POLY_SELECTION_COMMIT_RECOVERY currentBucketSlug=${String(input.currentBucketSlug || "-")} validatedSlug=${String(
+        input.validatedSlug || "-"
+      )} tokenId=${String(input.tokenId || "-")} chosenSide=${String(input.chosenSide || "-")} chosenDirection=${String(
+        input.chosenDirection || "-"
+      )} liveValidationReason=${String(input.liveValidationReason || "-")}`
+    );
+  }
+
+  private pickDeterministicBtc5mSlug(...values: Array<string | null | undefined>): string | null {
+    for (const value of values) {
+      const text = String(value || "").trim();
+      if (!text) continue;
+      if (parseBtc5mWindowStartSec(text) !== null) {
+        return text;
+      }
+    }
+    for (const value of values) {
+      const text = String(value || "").trim();
+      if (text) return text;
+    }
+    return null;
+  }
+
+  private getMarketDeterministicSlug(
+    market:
+      | {
+          slug?: string | null;
+          eventSlug?: string | null;
+          marketId?: string | null;
+        }
+      | null
+      | undefined
+  ): string | null {
+    if (!market) return null;
+    return this.pickDeterministicBtc5mSlug(market.slug, market.eventSlug, market.marketId || null);
+  }
+
+  private classifyDeterministicWindowFromSlugOrStart(
+    slug: string | null,
+    startSec: number | null,
+    currentBucket: Btc5mWallClockBucket = this.getFreshBtc5mWallClockBucket()
+  ): "current" | "next" | "previous" | "other" {
+    const slugText = String(slug || "").trim();
+    if (slugText) {
+      if (slugText === currentBucket.currentSlug) return "current";
+      if (slugText === currentBucket.nextSlug) return "next";
+      if (slugText === currentBucket.prevSlug) return "previous";
+    }
+    if (startSec !== null) {
+      if (startSec === currentBucket.currentBucketStartSec) return "current";
+      if (startSec === currentBucket.currentBucketStartSec + FIVE_MIN_SEC) return "next";
+      if (startSec === currentBucket.currentBucketStartSec - FIVE_MIN_SEC) return "previous";
+    }
+    return "other";
+  }
+
+  private getCanonicalBtc5mTimingFromSlugOrRow(input: {
+    slug: string | null;
+    rowStartTs: number | null | undefined;
+    rowEndTs: number | null | undefined;
+  }): {
+    startSec: number | null;
+    startTs: number | null;
+    endTs: number | null;
+    source: "slug" | "row" | "none";
+  } {
+    const slugStartSec =
+      this.isDeterministicBtc5mMode() ? parseBtc5mWindowStartSec(input.slug) : null;
+    if (slugStartSec !== null) {
+      return {
+        startSec: slugStartSec,
+        startTs: slugStartSec * 1000,
+        endTs: (slugStartSec + FIVE_MIN_SEC) * 1000,
+        source: "slug"
+      };
+    }
+    const startTs = toMs(input.rowStartTs);
+    const endTs = toMs(input.rowEndTs);
+    if (endTs > 0) {
+      return {
+        startSec: startTs > 0 ? Math.floor(startTs / 1000) : null,
+        startTs: startTs > 0 ? startTs : null,
+        endTs,
+        source: "row"
+      };
+    }
+    return {
+      startSec: null,
+      startTs: startTs > 0 ? startTs : null,
+      endTs: null,
+      source: "none"
+    };
+  }
+
+  private inferSelectionSourceFromStartSec(
+    startSec: number | null,
+    currentBucket: Btc5mWallClockBucket = this.getFreshBtc5mWallClockBucket()
+  ): "current_slug" | "next_slug" | "fallback_discovery" {
+    if (startSec !== null) {
+      if (startSec === currentBucket.currentBucketStartSec) {
+        return "current_slug";
+      }
+      if (startSec === currentBucket.currentBucketStartSec + FIVE_MIN_SEC) {
+        return "next_slug";
+      }
+    }
+    return "fallback_discovery";
+  }
+
+  private recoverLiveSelectionFromValidatedMarket(params: {
+    nowTs: number;
+    market: BtcWindowMarket;
+    selectedTokenId: string | null;
+    chosenSide: "YES" | "NO" | null;
+    chosenDirection: string | null;
+    selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+    liveValidationReason: string | null;
+    logRecovery: boolean;
+  }): (LiveCommittedSelection & { remainingSec: number }) | null {
+    if (this.config.polymarket.mode !== "live") {
+      return null;
+    }
+    const slug = this.getMarketDeterministicSlug(params.market);
+    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const timing = this.getCanonicalBtc5mTimingFromSlugOrRow({
+      slug,
+      rowStartTs: params.market.startTs ?? null,
+      rowEndTs: params.market.endTs ?? null
+    });
+    if (timing.endTs !== null && timing.endTs <= params.nowTs) {
+      return null;
+    }
+    const chosenSide = params.chosenSide ?? "YES";
+    const chosenDirection =
+      params.chosenDirection ??
+      normalizeDirectionalDisplayLabel(params.market.yesDisplayLabel, params.market.question, chosenSide);
+    const selectionSource =
+      params.selectionSource && params.selectionSource !== "committed"
+        ? params.selectionSource
+        : this.inferSelectionSourceFromStartSec(timing.startSec, currentBucket);
+    const discoveredCurrent = selectionSource === "current_slug";
+    const discoveredNext = selectionSource === "next_slug";
+    const liveValidationReason =
+      params.liveValidationReason ??
+      (selectionSource === "current_slug" ? "tradable_current_slug" : "preorder_validated");
+    this.commitLiveSelectedMarket(params.market, params.nowTs, {
+      windowStartTs: timing.startTs ?? params.market.startTs ?? null,
+      windowEndTs: timing.endTs ?? params.market.endTs ?? null,
+      chosenSide,
+      chosenDirection,
+      selectedTokenId: params.selectedTokenId,
+      selectedBookable: Boolean(params.selectedTokenId),
+      selectedTradable: Boolean(params.selectedTokenId),
+      candidateRefreshed: true,
+      discoveredCurrent,
+      discoveredNext,
+      selectionSource,
+      selectedFrom: selectionSource,
+      selectionCommitTs: params.nowTs,
+      liveValidationReason,
+      currentBucketSlug: currentBucket.currentSlug,
+      nextBucketSlug: currentBucket.nextSlug,
+      currentBucketStartSec: currentBucket.currentBucketStartSec
+    });
+    this.updateLiveCommittedSelectionDecision(params.market, params.nowTs, chosenSide, chosenDirection);
+    if (this.liveCommittedSelection) {
+      this.liveCommittedSelection = {
+        ...this.liveCommittedSelection,
+        selectedTokenId: params.selectedTokenId,
+        selectedBookable: Boolean(params.selectedTokenId),
+        selectedTradable: Boolean(params.selectedTokenId),
+        candidateRefreshed: true,
+        discoveredCurrent,
+        discoveredNext,
+        selectionSource,
+        selectedFrom: selectionSource,
+        selectionCommitTs: params.nowTs,
+        liveValidationReason,
+        currentBucketSlug: currentBucket.currentSlug,
+        nextBucketSlug: currentBucket.nextSlug,
+        currentBucketStartSec: currentBucket.currentBucketStartSec,
+        holdReason: null,
+        executionBlockedReason: null,
+        executionBlockedSide: null
+      };
+      this.syncPersistedLiveSelectionState(params.nowTs);
+    }
+    const recovered = this.getActiveLiveCommittedSelection(params.nowTs);
+    if (recovered) {
+      this.persistedPolymarketSnapshot = {
+        ...this.persistedPolymarketSnapshot,
+        selectedSlug: recovered.selectedSlug,
+        selectedMarketId: recovered.selectedMarketId,
+        selectedTokenId: params.selectedTokenId,
+        selectedBookable: Boolean(params.selectedTokenId),
+        selectedTradable: Boolean(params.selectedTokenId),
+        discoveredCurrent,
+        discoveredNext,
+        remainingSec: recovered.remainingSec,
+        chosenSide: recovered.chosenSide,
+        chosenDirection: recovered.chosenDirection,
+        selectionSource,
+        selectedFrom: selectionSource,
+        selectionCommitTs: params.nowTs,
+        liveValidationReason,
+        currentBucketSlug: currentBucket.currentSlug,
+        nextBucketSlug: currentBucket.nextSlug,
+        currentBucketStartSec: currentBucket.currentBucketStartSec
+      };
+      if (params.logRecovery) {
+        this.emitSelectionCommitRecoveryLine({
+          currentBucketSlug: currentBucket.currentSlug,
+          validatedSlug: recovered.selectedSlug,
+          tokenId: params.selectedTokenId,
+          chosenSide: recovered.chosenSide,
+          chosenDirection: recovered.chosenDirection,
+          liveValidationReason
+        });
+      }
+    }
+    return recovered;
+  }
+
   private getCachedUsableLiveSelection(nowTs: number): {
     selectedSlug: string | null;
     remainingSec: number | null;
@@ -1283,9 +1724,7 @@ export class PolymarketEngine {
     if (!looksLikeBtc5mMarket(this.lastUsableLiveSelectedMarket)) return null;
     const currentBucket = this.getFreshBtc5mWallClockBucket();
     const cachedStartSec =
-      parseBtc5mWindowStartSec(
-        this.lastUsableLiveSelectedMarket.eventSlug || this.lastUsableLiveSelectedMarket.slug
-      ) ??
+      parseBtc5mWindowStartSec(this.getMarketDeterministicSlug(this.lastUsableLiveSelectedMarket)) ??
       (Number.isFinite(Number(this.lastUsableLiveSelectedMarket.startTs)) &&
       Number(this.lastUsableLiveSelectedMarket.startTs) > 0
         ? Math.floor(Number(this.lastUsableLiveSelectedMarket.startTs) / 1000)
@@ -1300,7 +1739,7 @@ export class PolymarketEngine {
       return null;
     }
     const selectedSlug =
-      this.lastUsableLiveSelectedMarket.eventSlug || this.lastUsableLiveSelectedMarket.slug || null;
+      this.getMarketDeterministicSlug(this.lastUsableLiveSelectedMarket);
     const remainingSec =
       Number.isFinite(Number(this.lastUsableLiveSelectedMarket.endTs)) &&
       Number(this.lastUsableLiveSelectedMarket.endTs) > nowTs
@@ -1314,15 +1753,20 @@ export class PolymarketEngine {
     nowTs: number,
     overrides: Partial<LiveCommittedSelection> = {}
   ): (LiveCommittedSelection & { remainingSec: number }) | null {
-    const selectedSlug = overrides.selectedSlug ?? market.eventSlug ?? market.slug ?? null;
+    const selectedSlug = overrides.selectedSlug ?? this.getMarketDeterministicSlug(market);
     const selectedMarketId = overrides.selectedMarketId ?? market.marketId ?? null;
+    const canonicalTiming = this.getCanonicalBtc5mTimingFromSlugOrRow({
+      slug: selectedSlug,
+      rowStartTs: overrides.windowStartTs ?? market.startTs ?? null,
+      rowEndTs: overrides.windowEndTs ?? market.endTs ?? null
+    });
     const snapshot = this.getActiveSelectionSnapshot(
       {
         finalCandidatesCount: this.truthSelection.finalCandidatesCount,
         selectedSlug,
         selectedMarketId,
-        windowStartTs: overrides.windowStartTs ?? market.startTs ?? null,
-        windowEndTs: overrides.windowEndTs ?? market.endTs ?? null,
+        windowStartTs: canonicalTiming.startTs ?? overrides.windowStartTs ?? market.startTs ?? null,
+        windowEndTs: canonicalTiming.endTs ?? overrides.windowEndTs ?? market.endTs ?? null,
         remainingSec: null
       },
       nowTs
@@ -1340,11 +1784,40 @@ export class PolymarketEngine {
         snapshot.windowStartTs !== null ? Math.floor(snapshot.windowStartTs / 1000) : parseBtc5mWindowStartSec(snapshot.selectedSlug),
       windowStartTs: snapshot.windowStartTs,
       windowEndTs: snapshot.windowEndTs,
+      selectedWindowStartSec:
+        snapshot.windowStartTs !== null
+          ? Math.floor(snapshot.windowStartTs / 1000)
+          : parseBtc5mWindowStartSec(snapshot.selectedSlug),
+      selectedWindowEndSec:
+        snapshot.windowEndTs !== null ? Math.floor(snapshot.windowEndTs / 1000) : null,
+      candidateRefreshed:
+        overrides.candidateRefreshed !== undefined ? Boolean(overrides.candidateRefreshed) : null,
       remainingSec: snapshot.remainingSec ?? 0,
       chosenDirection,
       chosenSide: overrides.chosenSide ?? null,
       yesTokenId: overrides.yesTokenId ?? market.yesTokenId ?? null,
       noTokenId: overrides.noTokenId ?? market.noTokenId ?? null,
+      selectedTokenId:
+        overrides.selectedTokenId ??
+        ((overrides.chosenSide ?? null) === "NO"
+          ? overrides.noTokenId ?? market.noTokenId ?? null
+          : overrides.yesTokenId ?? market.yesTokenId ?? null),
+      selectedBookable: Boolean(overrides.selectedBookable ?? false),
+      selectedTradable: Boolean(overrides.selectedTradable ?? false),
+      discoveredCurrent: Boolean(overrides.discoveredCurrent ?? false),
+      discoveredNext: Boolean(overrides.discoveredNext ?? false),
+      selectionSource: overrides.selectionSource ?? "committed",
+      selectedFrom: overrides.selectedFrom ?? overrides.selectionSource ?? "committed",
+      selectionCommitTs:
+        Number.isFinite(Number(overrides.selectionCommitTs)) && Number(overrides.selectionCommitTs) > 0
+          ? Number(overrides.selectionCommitTs)
+          : null,
+      liveValidationReason: overrides.liveValidationReason ?? null,
+      lastBookTs: overrides.lastBookTs ?? null,
+      lastQuoteTs: overrides.lastQuoteTs ?? null,
+      currentBucketSlug: overrides.currentBucketSlug ?? null,
+      nextBucketSlug: overrides.nextBucketSlug ?? null,
+      currentBucketStartSec: overrides.currentBucketStartSec ?? null,
       acceptingOrders: overrides.acceptingOrders ?? market.acceptingOrders ?? null,
       enableOrderBook: overrides.enableOrderBook ?? market.enableOrderBook ?? null,
       selectedReason: overrides.selectedReason ?? null,
@@ -1484,6 +1957,452 @@ export class PolymarketEngine {
     return out;
   }
 
+  private async validateLiveTokenBookable(
+    tokenId: string,
+    marketSlug: string | null
+  ): Promise<{ ok: boolean; reason: string | null; lastBookTs: number | null; lastQuoteTs: number | null }> {
+    try {
+      const quote = await this.client.getTokenPriceQuote(tokenId, { slug: marketSlug });
+
+      const hasBid = Number.isFinite(Number(quote.bestBid)) && Number(quote.bestBid) > 0;
+      const hasAsk = Number.isFinite(Number(quote.bestAsk)) && Number(quote.bestAsk) > 0;
+
+      if (hasBid || hasAsk) {
+        return {
+          ok: true,
+          reason: null,
+          lastBookTs: quote.source === "book_mid" ? toMs(quote.ts) : null,
+          lastQuoteTs: toMs(quote.ts)
+        };
+      }
+
+      try {
+        const book = await this.client.getTokenOrderBook(tokenId);
+        const hasBook =
+          (Number.isFinite(Number(book.bestBid)) && Number(book.bestBid) > 0) ||
+          (Number.isFinite(Number(book.bestAsk)) && Number(book.bestAsk) > 0);
+        if (hasBook) {
+          return {
+            ok: true,
+            reason: null,
+            lastBookTs: toMs(book.ts),
+            lastQuoteTs: toMs(quote.ts)
+          };
+        }
+      } catch (bookError) {
+        if (isMissingOrderbookError(bookError)) {
+          this.markReadPathWarning("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN");
+          return {
+            ok: false,
+            reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN",
+            lastBookTs: null,
+            lastQuoteTs: null
+          };
+        }
+      }
+
+      return { ok: false, reason: "empty_live_quote", lastBookTs: null, lastQuoteTs: toMs(quote.ts) };
+    } catch (error) {
+      if (isMissingOrderbookError(error)) {
+        this.markReadPathWarning("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN");
+        return {
+          ok: false,
+          reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN",
+          lastBookTs: null,
+          lastQuoteTs: null
+        };
+      }
+
+      if (isTransientPolymarketError(error)) {
+        this.markReadPathWarning("NETWORK_ERROR");
+        return {
+          ok: false,
+          reason: "transient_quote_failure",
+          lastBookTs: null,
+          lastQuoteTs: null
+        };
+      }
+
+      return { ok: false, reason: "quote_failure", lastBookTs: null, lastQuoteTs: null };
+    }
+  }
+
+  private async validateLiveMarketTradability(params: {
+    market: BtcWindowMarket;
+    chosenSide: "YES" | "NO";
+    nowTs: number;
+    selectionSource: "current_slug" | "next_slug" | "fallback_discovery";
+  }): Promise<LiveMarketTradabilityValidation> {
+    const slug = this.getMarketDeterministicSlug(params.market);
+    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const nowSec = Math.floor(params.nowTs / 1000);
+    if (params.market.enableOrderBook === false || params.market.acceptingOrders === false) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "SIDE_NOT_BOOKABLE"
+      };
+    }
+    if (params.market.active === false || params.market.closed === true || params.market.archived === true) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "market_not_active"
+      };
+    }
+    const canonicalTiming = this.getCanonicalBtc5mTimingFromSlugOrRow({
+      slug,
+      rowStartTs: params.market.startTs ?? null,
+      rowEndTs: params.market.endTs ?? null
+    });
+    const startSec = canonicalTiming.startSec;
+    const endTs = canonicalTiming.endTs;
+    const remainingSec =
+      endTs !== null ? Math.max(0, Math.floor((endTs - params.nowTs) / 1000)) : null;
+    const windowClass = this.classifyDeterministicWindowFromSlugOrStart(slug, startSec, currentBucket);
+    const isCurrentOrNext = windowClass === "current" || windowClass === "next";
+    if (!isCurrentOrNext) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "NON_CURRENT_OR_NEXT_WINDOW"
+      };
+    }
+    if (
+      !Number.isFinite(Number(startSec)) ||
+      !Number.isFinite(Number(endTs)) ||
+      startSec === null ||
+      endTs === null ||
+      nowSec < startSec ||
+      params.nowTs >= endTs
+    ) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "expired_window"
+      };
+    }
+    if (!Number.isFinite(Number(remainingSec)) || Number(remainingSec) <= this.getLiveEntryMinRemainingSec()) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "remaining_below_threshold"
+      };
+    }
+    const tokenId =
+      params.chosenSide === "YES"
+        ? String(params.market.yesTokenId || "").trim() || null
+        : String(params.market.noTokenId || "").trim() || null;
+    if (!tokenId) {
+      return {
+        tradable: false,
+        tokenId: null,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "token_missing_for_side"
+      };
+    }
+
+    const tryOrderBook = async (
+      maybeQuoteTs: number | null
+    ): Promise<LiveMarketTradabilityValidation> => {
+      try {
+        const book = await this.client.getTokenOrderBook(tokenId);
+        const bookBestBid =
+          Number.isFinite(Number(book.bestBid)) && Number(book.bestBid) > 0
+            ? clamp(Number(book.bestBid), 0.0001, 0.9999)
+            : null;
+        const bookBestAsk =
+          Number.isFinite(Number(book.bestAsk)) && Number(book.bestAsk) > 0
+            ? clamp(Number(book.bestAsk), 0.0001, 0.9999)
+            : null;
+        if (bookBestBid !== null || bookBestAsk !== null) {
+          return {
+            tradable: true,
+            tokenId,
+            bookable: true,
+            bestBid: bookBestBid,
+            bestAsk: bookBestAsk,
+            mid: bookBestBid !== null && bookBestAsk !== null ? (bookBestBid + bookBestAsk) / 2 : null,
+            lastBookTs: toMs(book.ts),
+            lastQuoteTs: maybeQuoteTs,
+            reason: `tradable_book_${params.selectionSource}`
+          };
+        }
+        return {
+          tradable: false,
+          tokenId,
+          bookable: false,
+          bestBid: null,
+          bestAsk: null,
+          mid: null,
+          lastBookTs: toMs(book.ts),
+          lastQuoteTs: maybeQuoteTs,
+          reason: "empty_live_quote"
+        };
+      } catch (bookError) {
+        if (isMissingOrderbookError(bookError)) {
+          this.markReadPathWarning("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN");
+          return {
+            tradable: false,
+            tokenId,
+            bookable: false,
+            bestBid: null,
+            bestAsk: null,
+            mid: null,
+            lastBookTs: null,
+            lastQuoteTs: maybeQuoteTs,
+            reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+          };
+        }
+        if (isTransientPolymarketError(bookError)) {
+          this.markReadPathWarning("NETWORK_ERROR");
+          return {
+            tradable: false,
+            tokenId,
+            bookable: false,
+            bestBid: null,
+            bestAsk: null,
+            mid: null,
+            lastBookTs: null,
+            lastQuoteTs: maybeQuoteTs,
+            reason: "transient_quote_failure"
+          };
+        }
+        return {
+          tradable: false,
+          tokenId,
+          bookable: false,
+          bestBid: null,
+          bestAsk: null,
+          mid: null,
+          lastBookTs: null,
+          lastQuoteTs: maybeQuoteTs,
+          reason: "quote_failure"
+        };
+      }
+    };
+
+    try {
+      const quote = await this.client.getTokenPriceQuote(tokenId, { slug });
+      const bestBid =
+        Number.isFinite(Number(quote.bestBid)) && Number(quote.bestBid) > 0
+          ? clamp(Number(quote.bestBid), 0.0001, 0.9999)
+          : null;
+      const bestAsk =
+        Number.isFinite(Number(quote.bestAsk)) && Number(quote.bestAsk) > 0
+          ? clamp(Number(quote.bestAsk), 0.0001, 0.9999)
+          : null;
+      const mid =
+        Number.isFinite(Number(quote.mid)) && Number(quote.mid) > 0
+          ? clamp(Number(quote.mid), 0.0001, 0.9999)
+          : null;
+      if (bestBid !== null || bestAsk !== null) {
+        return {
+          tradable: true,
+          tokenId,
+          bookable: true,
+          bestBid,
+          bestAsk,
+          mid,
+          lastBookTs: quote.source === "book_mid" ? toMs(quote.ts) : null,
+          lastQuoteTs: toMs(quote.ts),
+          reason: `tradable_${params.selectionSource}`
+        };
+      }
+      return await tryOrderBook(toMs(quote.ts));
+    } catch (error) {
+      if (isMissingOrderbookError(error)) {
+        this.markReadPathWarning("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN");
+        return {
+          tradable: false,
+          tokenId,
+          bookable: false,
+          bestBid: null,
+          bestAsk: null,
+          mid: null,
+          lastBookTs: null,
+          lastQuoteTs: null,
+          reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+        };
+      }
+      if (isTransientPolymarketError(error)) {
+        this.markReadPathWarning("NETWORK_ERROR");
+        const bookFallback = await tryOrderBook(null);
+        if (bookFallback.tradable) {
+          return {
+            ...bookFallback,
+            reason: `tradable_book_fallback_${params.selectionSource}`
+          };
+        }
+        return bookFallback.reason === "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+          ? bookFallback
+          : {
+              ...bookFallback,
+              reason: "transient_quote_failure"
+            };
+      }
+      return {
+        tradable: false,
+        tokenId,
+        bookable: false,
+        bestBid: null,
+        bestAsk: null,
+        mid: null,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        reason: "quote_failure"
+      };
+    }
+  }
+
+  private getLiveMinVenueShares(): number {
+    const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || 5);
+    if (!Number.isFinite(envValue)) return 5;
+    return Math.max(1, Math.floor(envValue));
+  }
+
+  private evaluateOrderSizingCheck(params: {
+    selectedSlug: string | null;
+    selectedTokenId: string | null;
+    chosenSide: "YES" | "NO" | null;
+    orderPrice: number | null;
+    requestedBudget: number | null;
+    computedShares: number | null;
+  }): {
+    orderPrice: number;
+    requestedBudget: number;
+    desiredShares: number;
+    finalShares: number;
+    desiredNotional: number;
+    finalNotional: number;
+    minOrderNotional: number;
+    minVenueShares: number;
+    sizeBumped: boolean;
+    clampedToMin: boolean;
+    passes: boolean;
+  } {
+    if (!params.chosenSide) {
+      return {
+        orderPrice: 0,
+        requestedBudget: 0,
+        desiredShares: 0,
+        finalShares: 0,
+        desiredNotional: 0,
+        finalNotional: 0,
+        minOrderNotional: Math.max(0, Number(this.config.polymarket.sizing.minOrderNotional || 0)),
+        minVenueShares: this.getLiveMinVenueShares(),
+        sizeBumped: false,
+        clampedToMin: false,
+        passes: false
+      };
+    }
+    const orderPrice =
+      Number.isFinite(Number(params.orderPrice)) && Number(params.orderPrice) > 0
+        ? clamp(Number(params.orderPrice), 0.0001, 0.9999)
+        : 0;
+    const requestedBudget =
+      Number.isFinite(Number(params.requestedBudget)) && Number(params.requestedBudget) > 0
+        ? Number(params.requestedBudget)
+        : 0;
+    const baseShares =
+      Number.isFinite(Number(params.computedShares)) && Number(params.computedShares) > 0
+        ? Number(params.computedShares)
+        : 0;
+    const desiredShares =
+      baseShares > 0
+        ? baseShares
+        : orderPrice > 0 && requestedBudget > 0
+          ? requestedBudget / orderPrice
+          : 0;
+    const desiredNotional = orderPrice > 0 && desiredShares > 0 ? orderPrice * desiredShares : requestedBudget;
+    const minOrderNotional = Math.max(0, Number(this.config.polymarket.sizing.minOrderNotional || 0));
+    const shouldClampToMin =
+      this.config.polymarket.mode === "live" && desiredNotional > 0 && desiredNotional < minOrderNotional;
+    const minNotionalAdjusted = shouldClampToMin ? minOrderNotional : desiredNotional;
+    const minVenueShares = this.config.polymarket.mode === "live" ? this.getLiveMinVenueShares() : 0;
+    const minNotionalAdjustedShares =
+      orderPrice > 0 && minNotionalAdjusted > 0 ? minNotionalAdjusted / orderPrice : desiredShares;
+    const finalShares =
+      this.config.polymarket.mode === "live"
+        ? Math.max(minNotionalAdjustedShares, minVenueShares)
+        : minNotionalAdjustedShares;
+    const finalNotional = orderPrice > 0 && finalShares > 0 ? orderPrice * finalShares : minNotionalAdjusted;
+    const sizeBumped =
+      this.config.polymarket.mode === "live" &&
+      Number.isFinite(finalShares) &&
+      Number.isFinite(minNotionalAdjustedShares) &&
+      finalShares - minNotionalAdjustedShares > 1e-9;
+    const passes =
+      orderPrice > 0 &&
+      finalShares > 0 &&
+      (this.config.polymarket.mode === "live" ? finalNotional > 0 : finalNotional >= minOrderNotional);
+
+    this.logger.info(
+      `POLY_SIZING_CHECK selectedSlug=${String(params.selectedSlug || "-")} selectedTokenId=${String(
+        params.selectedTokenId || "-"
+      )} chosenSide=${String(params.chosenSide || "-")} orderPrice=${
+        orderPrice > 0 ? orderPrice.toFixed(4) : "-"
+      } requestedBudget=${requestedBudget.toFixed(4)} desiredShares=${desiredShares.toFixed(6)} minVenueShares=${String(
+        minVenueShares || "-"
+      )} finalShares=${finalShares.toFixed(6)} desiredNotional=${desiredNotional.toFixed(
+        4
+      )} finalNotional=${finalNotional.toFixed(4)} minOrderNotional=${minOrderNotional.toFixed(
+        4
+      )} sizeBumped=${String(sizeBumped)} clampedToMin=${String(
+        shouldClampToMin
+      )} passes=${String(passes)}`
+    );
+
+    return {
+      orderPrice,
+      requestedBudget,
+      desiredShares,
+      finalShares,
+      desiredNotional,
+      finalNotional,
+      minOrderNotional,
+      minVenueShares,
+      sizeBumped,
+      clampedToMin: shouldClampToMin,
+      passes
+    };
+  }
+
   private async validateLiveExecutionCandidate(params: {
     nowTs: number;
     market: BtcWindowMarket;
@@ -1493,7 +2412,8 @@ export class PolymarketEngine {
     const nowSec = Math.floor(nowTs / 1000);
     const currentEpochSec = this.getCurrentBtc5mEpochStartSec(nowTs);
     const expectedSlug = slugForTs(currentEpochSec);
-    const selectedSlug = params.market.eventSlug || params.market.slug || this.liveCommittedSelection?.selectedSlug || null;
+    const selectedSlug =
+      this.getMarketDeterministicSlug(params.market) || this.liveCommittedSelection?.selectedSlug || null;
     const pollMode = this.getPersistedPolymarketSnapshot(nowTs).pollMode;
     const minimumRemainingSec = this.getLiveEntryMinRemainingSec();
 
@@ -1530,18 +2450,20 @@ export class PolymarketEngine {
       .filter((row): row is BtcWindowMarket => row !== null);
     const refreshedMarket =
       parsedCandidates.find((row) => {
-        const rowSlug = row.eventSlug || row.slug || null;
+        const rowSlug = this.getMarketDeterministicSlug(row);
         return (
           row.marketId === params.market.marketId ||
           (selectedSlug && rowSlug === selectedSlug)
         );
       }) || null;
-    const marketStartSec =
-      parseBtc5mWindowStartSec(refreshedMarket?.eventSlug || refreshedMarket?.slug) ??
-      (Number.isFinite(Number(refreshedMarket?.startTs)) && Number(refreshedMarket?.startTs) > 0
-        ? Math.floor(Number(refreshedMarket?.startTs) / 1000)
-        : parseBtc5mWindowStartSec(selectedSlug));
-    const marketEndTs = Number(refreshedMarket?.endTs || 0) > 0 ? Number(refreshedMarket?.endTs) : null;
+    const validatedSlug = refreshedMarket?.eventSlug || refreshedMarket?.slug || selectedSlug;
+    const canonicalTiming = this.getCanonicalBtc5mTimingFromSlugOrRow({
+      slug: validatedSlug,
+      rowStartTs: refreshedMarket?.startTs ?? null,
+      rowEndTs: refreshedMarket?.endTs ?? null
+    });
+    const marketStartSec = canonicalTiming.startSec;
+    const marketEndTs = canonicalTiming.endTs;
     const remainingSec =
       marketEndTs !== null ? Math.max(0, Math.floor((marketEndTs - nowTs) / 1000)) : null;
     const validWindow =
@@ -1561,15 +2483,20 @@ export class PolymarketEngine {
       refreshedRow !== null
         ? pickRawBoolean(refreshedRow, ["archived", "is_archived"], false)
         : refreshedMarket?.archived === true;
+    const rowEnableOrderBook =
+      refreshedRow !== null
+        ? pickRawBoolean(refreshedRow, ["enable_order_book", "enableOrderBook"], true)
+        : refreshedMarket?.enableOrderBook !== false;
     const intendedWindowStartSec = marketStartSec;
     const freshestInWindow = parsedCandidates
       .filter((row) => {
-        const startSec =
-          parseBtc5mWindowStartSec(row.eventSlug || row.slug) ??
-          (Number.isFinite(Number(row.startTs)) && Number(row.startTs) > 0
-            ? Math.floor(Number(row.startTs) / 1000)
-            : null);
-        const endTs = Number(row.endTs || 0);
+        const rowTiming = this.getCanonicalBtc5mTimingFromSlugOrRow({
+          slug: this.getMarketDeterministicSlug(row),
+          rowStartTs: row.startTs ?? null,
+          rowEndTs: row.endTs ?? null
+        });
+        const startSec = rowTiming.startSec;
+        const endTs = rowTiming.endTs ?? 0;
         return (
           startSec !== null &&
           intendedWindowStartSec !== null &&
@@ -1586,7 +2513,7 @@ export class PolymarketEngine {
         if (aRank !== bRank) return aRank - bRank;
         return String(a.marketId).localeCompare(String(b.marketId));
       })[0];
-    const freshestSlug = freshestInWindow?.eventSlug || freshestInWindow?.slug || null;
+    const freshestSlug = this.getMarketDeterministicSlug(freshestInWindow ?? null);
     const selectedTokenId =
       params.chosenSide === "YES"
         ? String(refreshedMarket?.yesTokenId || "").trim() || null
@@ -1599,11 +2526,11 @@ export class PolymarketEngine {
     const result: LiveExecutionCandidateValidation = {
       valid: false,
       reason: "ok",
-      selectedSlug,
+      selectedSlug: validatedSlug,
       expectedSlug,
       marketId: refreshedMarket?.marketId ?? params.market.marketId ?? null,
       tokenId: selectedTokenId,
-      marketStartTs: marketStartSec !== null ? marketStartSec * 1000 : null,
+      marketStartTs: canonicalTiming.startTs ?? (marketStartSec !== null ? marketStartSec * 1000 : null),
       marketEndTs,
       remainingSec,
       pollMode,
@@ -1631,6 +2558,10 @@ export class PolymarketEngine {
       result.reason = "market_archived";
       return this.logLivePreorderValidation(result);
     }
+    if (!rowEnableOrderBook) {
+      result.reason = "token_not_bookable";
+      return this.logLivePreorderValidation(result);
+    }
     if (!validWindow) {
       result.reason =
         marketStartSec === null || marketEndTs === null ? "invalid_window" : "expired_window";
@@ -1643,12 +2574,12 @@ export class PolymarketEngine {
     if (
       intendedWindowStartSec !== null &&
       intendedWindowStartSec === currentEpochSec &&
-      selectedSlug !== expectedSlug
+      validatedSlug !== expectedSlug
     ) {
       result.reason = "stale_market_selection";
       return this.logLivePreorderValidation(result);
     }
-    if (freshestSlug && selectedSlug && freshestSlug !== selectedSlug) {
+    if (freshestSlug && validatedSlug && freshestSlug !== validatedSlug) {
       result.reason = "stale_market_selection";
       return this.logLivePreorderValidation(result);
     }
@@ -1671,6 +2602,37 @@ export class PolymarketEngine {
       result.reason = "token_mismatch";
       return this.logLivePreorderValidation(result);
     }
+
+    if (selectedTokenId) {
+      const bookability = await this.validateLiveTokenBookable(selectedTokenId, validatedSlug);
+
+      if (!bookability.ok) {
+        result.reason =
+          String(bookability.reason || "").toUpperCase() === "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+            ? "token_not_bookable"
+            : "token_not_bookable";
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          selectedTokenId,
+          selectedBookable: false,
+          selectedTradable: false,
+          liveValidationReason: bookability.reason ?? "token_not_bookable",
+          lastBookTs: bookability.lastBookTs,
+          lastQuoteTs: bookability.lastQuoteTs
+        };
+        return this.logLivePreorderValidation(result);
+      }
+      this.persistedPolymarketSnapshot = {
+        ...this.persistedPolymarketSnapshot,
+        selectedTokenId,
+        selectedBookable: true,
+        selectedTradable: true,
+        liveValidationReason: "preorder_token_bookable",
+        lastBookTs: bookability.lastBookTs,
+        lastQuoteTs: bookability.lastQuoteTs
+      };
+    }
+
     result.valid = true;
     result.reason = "ok";
     return this.logLivePreorderValidation(result);
@@ -1682,7 +2644,14 @@ export class PolymarketEngine {
     const nowIso = new Date().toISOString();
     this.persistedPolymarketSnapshot = {
       ...this.persistedPolymarketSnapshot,
+      selectedSlug: result.selectedSlug ?? this.persistedPolymarketSnapshot.selectedSlug,
+      selectedMarketId: result.marketId ?? this.persistedPolymarketSnapshot.selectedMarketId,
       selectedTokenId: result.selectedTokenId,
+      selectedTradable: result.valid,
+      remainingSec:
+        Number.isFinite(Number(result.remainingSec)) && Number(result.remainingSec) >= 0
+          ? Math.max(0, Math.floor(Number(result.remainingSec)))
+          : this.persistedPolymarketSnapshot.remainingSec,
       candidateRefreshed: result.candidateRefreshed,
       lastPreorderValidationReason: result.reason
     };
@@ -1743,9 +2712,11 @@ export class PolymarketEngine {
       | "remainingSec"
       | "marketExpiresAtTs"
       | "windowEndTs"
+      | "holdReason"
       | "staleState"
       | "warningState"
       | "status"
+      | "selectedBookable"
     >,
     nowTs: number
   ): LivePollMode | null {
@@ -1753,9 +2724,20 @@ export class PolymarketEngine {
       return null;
     }
     const hasRenderableSelection = Boolean(snapshot.selectedSlug || snapshot.selectedMarketId);
+    const holdReasonText = String(snapshot.holdReason || "")
+      .trim()
+      .toUpperCase();
     const warningText = String(snapshot.warningState || "")
       .trim()
       .toUpperCase();
+    if (
+      !hasRenderableSelection ||
+      holdReasonText.includes("TOKEN_NOT_BOOKABLE") ||
+      holdReasonText.includes("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN") ||
+      snapshot.selectedBookable === false
+    ) {
+      return "VERY_FAST";
+    }
     const staleDiscovery =
       snapshot.staleState === "DISCOVERY_STALE" || warningText.includes("DISCOVERY_STALE");
     if (staleDiscovery && !hasRenderableSelection) {
@@ -1770,21 +2752,39 @@ export class PolymarketEngine {
         ? Math.floor(Number(snapshot.windowStartTs) / 1000)
         : parseBtc5mWindowStartSec(snapshot.selectedSlug);
     const remainingSec = this.getSelectionRemainingSecFromSnapshot(snapshot, nowTs);
+    const committedSelection = this.getActiveLiveCommittedSelection(nowTs);
     const inCurrentBucket =
       hasRenderableSelection &&
       selectedBucketStartSec !== null &&
       selectedBucketStartSec === currentBucket.currentBucketStartSec;
+    if (
+      hasRenderableSelection &&
+      selectedBucketStartSec !== null &&
+      selectedBucketStartSec < currentBucket.currentBucketStartSec
+    ) {
+      return "VERY_FAST";
+    }
     if (inCurrentBucket && remainingSec !== null) {
-      if (remainingSec <= this.config.polymarket.live.veryFastPollRemainingSec) {
+      if (
+        committedSelection &&
+        ((snapshot.selectedMarketId && committedSelection.selectedMarketId === snapshot.selectedMarketId) ||
+          (snapshot.selectedSlug && committedSelection.selectedSlug === snapshot.selectedSlug))
+      ) {
         return "VERY_FAST";
       }
-      if (remainingSec <= this.config.polymarket.live.fastPollRemainingSec) {
+      if (remainingSec <= 45) {
+        return "VERY_FAST";
+      }
+      if (remainingSec <= 90) {
         return "FAST";
       }
       return "NORMAL";
     }
     if (staleDiscovery) {
-      return "DISCOVERY_STALE";
+      if (remainingSec !== null && remainingSec <= 120) {
+        return "VERY_FAST";
+      }
+      return "FAST";
     }
     if (
       hasRenderableSelection &&
@@ -1907,10 +2907,27 @@ export class PolymarketEngine {
       selectedEpoch: Math.floor(expected.windowStartTs / 1000),
       windowStartTs: expected.windowStartTs,
       windowEndTs: expected.windowEndTs,
+      selectedWindowStartSec: Math.floor(expected.windowStartTs / 1000),
+      selectedWindowEndSec: Math.floor(expected.windowEndTs / 1000),
+      candidateRefreshed: matchingExpectedSelection?.candidateRefreshed ?? null,
       chosenDirection: matchingExpectedSelection?.chosenDirection ?? null,
       chosenSide: matchingExpectedSelection?.chosenSide ?? null,
       yesTokenId: matchingExpectedSelection?.yesTokenId ?? null,
       noTokenId: matchingExpectedSelection?.noTokenId ?? null,
+      selectedTokenId: matchingExpectedSelection?.selectedTokenId ?? null,
+      selectedBookable: Boolean(matchingExpectedSelection?.selectedBookable ?? false),
+      selectedTradable: Boolean(matchingExpectedSelection?.selectedTradable ?? false),
+      discoveredCurrent: matchingExpectedSelection?.discoveredCurrent ?? true,
+      discoveredNext: matchingExpectedSelection?.discoveredNext ?? false,
+      selectionSource: matchingExpectedSelection?.selectionSource ?? "committed",
+      selectedFrom: matchingExpectedSelection?.selectedFrom ?? "committed",
+      liveValidationReason: matchingExpectedSelection?.liveValidationReason ?? "awaiting_tradable_candidate",
+      lastBookTs: matchingExpectedSelection?.lastBookTs ?? null,
+      lastQuoteTs: matchingExpectedSelection?.lastQuoteTs ?? null,
+      selectionCommitTs: matchingExpectedSelection?.selectionCommitTs ?? nowTs,
+      currentBucketSlug: expected.currentSlug,
+      nextBucketSlug: expected.nextSlug,
+      currentBucketStartSec: expected.currentBucketStartSec,
       acceptingOrders: matchingExpectedSelection?.acceptingOrders ?? null,
       enableOrderBook: matchingExpectedSelection?.enableOrderBook ?? null,
       selectedReason: options.selectedReason,
@@ -1955,20 +2972,39 @@ export class PolymarketEngine {
     nowTs: number,
     options: {
       selectedReason?: string | null;
+      windowStartTs?: number | null;
+      windowEndTs?: number | null;
       chosenDirection?: string | null;
       chosenSide?: "YES" | "NO" | null;
+      selectedTokenId?: string | null;
+      selectedBookable?: boolean;
+      selectedTradable?: boolean;
+      candidateRefreshed?: boolean | null;
+      discoveredCurrent?: boolean;
+      discoveredNext?: boolean;
+      selectionSource?: "current_slug" | "next_slug" | "fallback_discovery" | "committed";
+      selectedFrom?: "current_slug" | "next_slug" | "fallback_discovery" | "committed";
+      selectionCommitTs?: number | null;
+      liveValidationReason?: string | null;
+      lastBookTs?: number | null;
+      lastQuoteTs?: number | null;
+      currentBucketSlug?: string | null;
+      nextBucketSlug?: string | null;
+      currentBucketStartSec?: number | null;
     } = {}
   ): void {
     if (this.config.polymarket.mode !== "live") return;
     const previous = this.getActiveLiveCommittedSelection(nowTs);
     const next = this.buildLiveCommittedSelection(market, nowTs, {
       selectedReason: options.selectedReason ?? null,
+      windowStartTs: options.windowStartTs ?? null,
+      windowEndTs: options.windowEndTs ?? null,
       chosenDirection:
         options.chosenDirection ??
         (previous &&
         ((previous.selectedMarketId && previous.selectedMarketId === market.marketId) ||
           (previous.selectedSlug &&
-            previous.selectedSlug === (market.eventSlug || market.slug || null)))
+            previous.selectedSlug === this.getMarketDeterministicSlug(market)))
           ? previous.chosenDirection
           : null),
       chosenSide:
@@ -1977,9 +3013,60 @@ export class PolymarketEngine {
           : previous &&
               ((previous.selectedMarketId && previous.selectedMarketId === market.marketId) ||
                 (previous.selectedSlug &&
-                  previous.selectedSlug === (market.eventSlug || market.slug || null)))
+                  previous.selectedSlug === this.getMarketDeterministicSlug(market)))
             ? previous.chosenSide
-            : null
+            : null,
+      selectedTokenId:
+        options.selectedTokenId !== undefined
+          ? options.selectedTokenId
+          : options.chosenSide === "NO"
+            ? market.noTokenId ?? null
+            : options.chosenSide === "YES"
+              ? market.yesTokenId ?? null
+              : previous?.selectedTokenId ?? null,
+      selectedBookable:
+        options.selectedBookable !== undefined
+          ? options.selectedBookable
+          : previous?.selectedBookable ?? false,
+      selectedTradable:
+        options.selectedTradable !== undefined
+          ? options.selectedTradable
+          : previous?.selectedTradable ?? false,
+      candidateRefreshed:
+        options.candidateRefreshed !== undefined
+          ? options.candidateRefreshed
+          : previous?.candidateRefreshed ?? null,
+      discoveredCurrent:
+        options.discoveredCurrent !== undefined
+          ? options.discoveredCurrent
+          : previous?.discoveredCurrent ?? false,
+      discoveredNext:
+        options.discoveredNext !== undefined
+          ? options.discoveredNext
+          : previous?.discoveredNext ?? false,
+      selectionSource: options.selectionSource ?? previous?.selectionSource ?? "committed",
+      selectedFrom: options.selectedFrom ?? options.selectionSource ?? previous?.selectedFrom ?? "committed",
+      selectionCommitTs:
+        options.selectionCommitTs !== undefined
+          ? options.selectionCommitTs
+          : previous?.selectionCommitTs ?? null,
+      liveValidationReason:
+        options.liveValidationReason !== undefined
+          ? options.liveValidationReason
+          : previous?.liveValidationReason ?? null,
+      lastBookTs: options.lastBookTs !== undefined ? options.lastBookTs : previous?.lastBookTs ?? null,
+      lastQuoteTs:
+        options.lastQuoteTs !== undefined ? options.lastQuoteTs : previous?.lastQuoteTs ?? null,
+      currentBucketSlug:
+        options.currentBucketSlug !== undefined
+          ? options.currentBucketSlug
+          : previous?.currentBucketSlug ?? null,
+      nextBucketSlug:
+        options.nextBucketSlug !== undefined ? options.nextBucketSlug : previous?.nextBucketSlug ?? null,
+      currentBucketStartSec:
+        options.currentBucketStartSec !== undefined
+          ? options.currentBucketStartSec
+          : previous?.currentBucketStartSec ?? null
     });
     if (!next) {
       return;
@@ -2037,10 +3124,27 @@ export class PolymarketEngine {
       selectedEpoch: next.selectedEpoch,
       windowStartTs: next.windowStartTs,
       windowEndTs: next.windowEndTs,
+      selectedWindowStartSec: next.selectedWindowStartSec,
+      selectedWindowEndSec: next.selectedWindowEndSec,
+      candidateRefreshed: next.candidateRefreshed,
       chosenDirection: next.chosenDirection,
       chosenSide: next.chosenSide,
       yesTokenId: next.yesTokenId,
       noTokenId: next.noTokenId,
+      selectedTokenId: next.selectedTokenId,
+      selectedBookable: next.selectedBookable,
+      selectedTradable: next.selectedTradable,
+      discoveredCurrent: next.discoveredCurrent,
+      discoveredNext: next.discoveredNext,
+      selectionSource: next.selectionSource,
+      selectedFrom: next.selectedFrom,
+      selectionCommitTs: selectionChanged ? nowTs : next.selectionCommitTs ?? previous?.selectionCommitTs ?? nowTs,
+      liveValidationReason: next.liveValidationReason,
+      lastBookTs: next.lastBookTs,
+      lastQuoteTs: next.lastQuoteTs,
+      currentBucketSlug: next.currentBucketSlug,
+      nextBucketSlug: next.nextBucketSlug,
+      currentBucketStartSec: next.currentBucketStartSec,
       acceptingOrders: next.acceptingOrders,
       enableOrderBook: next.enableOrderBook,
       selectedReason: next.selectedReason,
@@ -2054,6 +3158,21 @@ export class PolymarketEngine {
     this.polyState.selectedSlug = next.selectedSlug;
     this.polyState.selectedMarketId = next.selectedMarketId;
     this.syncPersistedLiveSelectionState(nowTs);
+    if (
+      selectionChanged ||
+      previous?.selectedTokenId !== next.selectedTokenId ||
+      previous?.chosenSide !== next.chosenSide ||
+      previous?.chosenDirection !== next.chosenDirection
+    ) {
+      this.emitSelectionCommitLine({
+        selectedSlug: next.selectedSlug,
+        selectedTokenId: next.selectedTokenId,
+        selectionSource: next.selectionSource,
+        remainingSec: next.remainingSec,
+        chosenSide: next.chosenSide,
+        chosenDirection: next.chosenDirection
+      });
+    }
     if (
       selectionChanged ||
       previous?.chosenDirection !== next.chosenDirection ||
@@ -2090,7 +3209,7 @@ export class PolymarketEngine {
       (current.selectedMarketId && current.selectedMarketId !== market.marketId) ||
       (!current.selectedMarketId &&
         current.selectedSlug &&
-        current.selectedSlug !== (market.eventSlug || market.slug || null))
+        current.selectedSlug !== this.getMarketDeterministicSlug(market))
     ) {
       this.commitLiveSelectedMarket(market, nowTs, { chosenSide, chosenDirection });
       return;
@@ -2169,7 +3288,7 @@ export class PolymarketEngine {
   }): void {
     if (this.config.polymarket.mode !== "live") return;
     const current = this.getActiveLiveCommittedSelection(params.nowTs);
-    const slug = params.market.eventSlug || params.market.slug || null;
+    const slug = this.getMarketDeterministicSlug(params.market);
     const marketMatchesSelection = Boolean(
       current &&
         ((current.selectedMarketId && current.selectedMarketId === params.market.marketId) ||
@@ -2186,9 +3305,14 @@ export class PolymarketEngine {
     }
     this.liveCommittedSelection = {
       ...this.liveCommittedSelection,
-      holdReason: normalizeHoldReason(params.reason),
+      selectedTokenId: null,
+      selectedBookable: false,
+      selectedTradable: false,
+      liveValidationReason:
+        params.reason === "MISSING_ORDERBOOK" ? "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN" : "SIDE_NOT_BOOKABLE",
+      holdReason: normalizeHoldReason("SIDE_NOT_BOOKABLE"),
       warningState: this.runtimeWarningState,
-      executionBlockedReason: params.reason,
+      executionBlockedReason: "SIDE_NOT_BOOKABLE",
       executionBlockedSide: params.side
     };
     this.syncPersistedLiveSelectionState(params.nowTs);
@@ -2291,6 +3415,46 @@ export class PolymarketEngine {
     }
   }
 
+  private demoteLiveSelection(reason: string, nowTs: number): void {
+    this.liveCommittedSelection = null;
+    this.lastUsableLiveSelectedMarket = null;
+    this.selectedTokenIds = [];
+
+    this.polyState.selectedSlug = null;
+    this.polyState.selectedMarketId = null;
+
+    this.persistedPolymarketSnapshot = {
+      ...this.persistedPolymarketSnapshot,
+      selectedSlug: null,
+      selectedMarketId: null,
+      selectedTokenId: null,
+      selectedBookable: false,
+      selectedTradable: false,
+      discoveredCurrent: false,
+      discoveredNext: false,
+      selectionSource: null,
+      selectedFrom: null,
+      selectionCommitTs: null,
+      liveValidationReason: reason,
+      selectedWindowStartSec: null,
+      selectedWindowEndSec: null,
+      holdReason: reason,
+      executionBlockedReason: reason,
+      status: "DEGRADED",
+      pollMode: "VERY_FAST",
+      lastDecisionTs: nowTs
+    };
+
+    this.truthSelection = {
+      ...this.truthSelection,
+      selectedSlug: null,
+      selectedMarketId: null,
+      windowStartTs: null,
+      windowEndTs: null,
+      remainingSec: null
+    };
+  }
+
   private getActiveLiveCommittedSelection(
     nowTs: number
   ): (LiveCommittedSelection & { remainingSec: number }) | null {
@@ -2340,7 +3504,24 @@ export class PolymarketEngine {
       discoveredAtTs: null,
       marketExpiresAtTs: null,
       chosenSide: null,
-      chosenDirection: null
+      chosenDirection: null,
+      selectedTokenId: null,
+      selectedBookable: false,
+      selectedTradable: false,
+      discoveredCurrent: false,
+      discoveredNext: false,
+      selectionSource: null,
+      selectedFrom: null,
+      selectionCommitTs: null,
+      liveValidationReason: null,
+      lastBookTs: null,
+      lastQuoteTs: null,
+      currentBucketSlug: null,
+      nextBucketSlug: null,
+      currentBucketStartSec: null,
+      selectedWindowStartSec: null,
+      selectedWindowEndSec: null,
+      executionBlockedReason: null
     };
   }
 
@@ -2369,6 +3550,11 @@ export class PolymarketEngine {
       remainingSec: 0,
       windowEndTs: marketExpiresAtTs,
       marketExpiresAtTs,
+      selectedBookable: false,
+      selectedTradable: false,
+      discoveredCurrent: this.persistedPolymarketSnapshot.discoveredCurrent,
+      discoveredNext: this.persistedPolymarketSnapshot.discoveredNext,
+      liveValidationReason: "AWAITING_NEXT_MARKET_DISCOVERY",
       holdReason: "AWAITING_NEXT_MARKET_DISCOVERY",
       lastDecisionTs: nowTs,
       statusLine: null
@@ -2378,6 +3564,7 @@ export class PolymarketEngine {
   private syncPersistedPolymarketSelectionState(nowTs: number): void {
     const liveSelection =
       this.config.polymarket.mode === "live" ? this.getActiveLiveCommittedSelection(nowTs) : null;
+    const currentBucket = this.getFreshBtc5mWallClockBucket();
     const baseSelection =
       liveSelection ??
       this.getActiveSelectionSnapshot(
@@ -2419,6 +3606,9 @@ export class PolymarketEngine {
             this.persistedPolymarketSnapshot.holdReason ||
             this.truthHoldReason
         ) ?? null,
+      executionBlockedReason:
+        (liveSelection ? liveSelection.executionBlockedReason : null) ??
+        this.persistedPolymarketSnapshot.executionBlockedReason,
       warningState:
         (liveSelection ? liveSelection.warningState : null) ??
         this.runtimeWarningState ??
@@ -2435,7 +3625,46 @@ export class PolymarketEngine {
       currentBtcMid:
         Number.isFinite(Number(this.latestPolymarketSnapshot?.fastMid)) && Number(this.latestPolymarketSnapshot?.fastMid) > 0
           ? Number(this.latestPolymarketSnapshot?.fastMid)
-          : this.persistedPolymarketSnapshot.currentBtcMid
+          : this.persistedPolymarketSnapshot.currentBtcMid,
+      selectedTokenId:
+        (liveSelection ? liveSelection.selectedTokenId : null) ??
+        this.persistedPolymarketSnapshot.selectedTokenId,
+      selectedBookable:
+        liveSelection ? Boolean(liveSelection.selectedBookable) : this.persistedPolymarketSnapshot.selectedBookable,
+      selectedTradable:
+        liveSelection ? Boolean(liveSelection.selectedTradable) : this.persistedPolymarketSnapshot.selectedTradable,
+      discoveredCurrent:
+        liveSelection ? Boolean(liveSelection.discoveredCurrent) : this.persistedPolymarketSnapshot.discoveredCurrent,
+      discoveredNext:
+        liveSelection ? Boolean(liveSelection.discoveredNext) : this.persistedPolymarketSnapshot.discoveredNext,
+      selectionSource:
+        (liveSelection ? liveSelection.selectionSource : null) ??
+        this.persistedPolymarketSnapshot.selectionSource,
+      selectedFrom:
+        (liveSelection ? liveSelection.selectedFrom : null) ??
+        (liveSelection ? liveSelection.selectionSource : null) ??
+        this.persistedPolymarketSnapshot.selectedFrom ??
+        this.persistedPolymarketSnapshot.selectionSource,
+      selectionCommitTs:
+        (liveSelection ? liveSelection.selectionCommitTs : null) ??
+        this.persistedPolymarketSnapshot.selectionCommitTs,
+      liveValidationReason:
+        (liveSelection ? liveSelection.liveValidationReason : null) ??
+        this.persistedPolymarketSnapshot.liveValidationReason,
+      lastBookTs: (liveSelection ? liveSelection.lastBookTs : null) ?? this.persistedPolymarketSnapshot.lastBookTs,
+      lastQuoteTs:
+        (liveSelection ? liveSelection.lastQuoteTs : null) ?? this.persistedPolymarketSnapshot.lastQuoteTs,
+      currentBucketSlug: currentBucket.currentSlug,
+      nextBucketSlug: currentBucket.nextSlug,
+      currentBucketStartSec: currentBucket.currentBucketStartSec,
+      selectedWindowStartSec:
+        liveSelection?.selectedWindowStartSec ??
+        (baseSelection.windowStartTs !== null ? Math.floor(baseSelection.windowStartTs / 1000) : null),
+      selectedWindowEndSec:
+        liveSelection?.selectedWindowEndSec ??
+        (baseSelection.windowEndTs !== null ? Math.floor(baseSelection.windowEndTs / 1000) : null),
+      candidateRefreshed:
+        liveSelection?.candidateRefreshed ?? this.persistedPolymarketSnapshot.candidateRefreshed
     };
   }
 
@@ -2452,11 +3681,12 @@ export class PolymarketEngine {
     const holdReason = snapshot.holdReason || "-";
     const holdCategory = snapshot.holdCategory || "-";
     const warning = snapshot.warningState || "none";
+    const tradable = snapshot.selectedTradable ? "tradable" : "not-tradable";
     const btcMid =
       Number.isFinite(Number(snapshot.currentBtcMid)) && Number(snapshot.currentBtcMid) > 0
         ? Number(snapshot.currentBtcMid).toFixed(2)
         : "-";
-    return `BTC 5m | ${selected} | ${side} ${direction} | ${remainingSec} | ${action} ${holdReason} (${holdCategory}) | poll ${pollMode} | btc ${btcMid} | warn ${warning}`;
+    return `BTC 5m | ${selected} | ${side} ${direction} | ${remainingSec} | ${action} ${holdReason} (${holdCategory}) | ${tradable} | poll ${pollMode} | btc ${btcMid} | warn ${warning}`;
   }
 
   private getPersistedPolymarketSnapshot(nowTs: number): PersistedPolymarketSnapshot {
@@ -2510,7 +3740,13 @@ export class PolymarketEngine {
       Number(this.polyState.lastFetchOkTs || 0),
       Number(this.polyState.lastUpdateTs || 0)
     );
-    const staleState = this.getSelectionFreshnessWarning(nowTs, lastDiscoverySuccessTs, hasRenderableSelection);
+    const freshnessStaleState = this.getSelectionFreshnessWarning(nowTs, lastDiscoverySuccessTs, hasRenderableSelection);
+    const explicitExecutionStaleState =
+      this.persistedPolymarketSnapshot.staleState === "ACTIVE_MARKET_REFRESH_FAILED" ||
+      this.persistedPolymarketSnapshot.staleState === "ACTIVE_MARKET_PRICE_STALE"
+        ? this.persistedPolymarketSnapshot.staleState
+        : null;
+    const staleState = explicitExecutionStaleState ?? freshnessStaleState;
     const warningState = this.combineWarningStates(
       this.persistedPolymarketSnapshot.warningState ?? this.runtimeWarningState,
       staleState ? "DISCOVERY_STALE" : null
@@ -2574,6 +3810,19 @@ export class PolymarketEngine {
       holdCategory: hasRenderableSelection ? this.persistedPolymarketSnapshot.holdCategory : null,
       strategyAction: this.persistedPolymarketSnapshot.strategyAction,
       selectedTokenId: hasRenderableSelection ? this.persistedPolymarketSnapshot.selectedTokenId : null,
+      selectedBookable: hasRenderableSelection ? this.persistedPolymarketSnapshot.selectedBookable : false,
+      selectedTradable: hasRenderableSelection ? this.persistedPolymarketSnapshot.selectedTradable : false,
+      selectionSource: hasRenderableSelection ? this.persistedPolymarketSnapshot.selectionSource : null,
+      liveValidationReason: this.persistedPolymarketSnapshot.liveValidationReason,
+      lastBookTs: this.persistedPolymarketSnapshot.lastBookTs,
+      lastQuoteTs: this.persistedPolymarketSnapshot.lastQuoteTs,
+      currentBucketSlug: this.persistedPolymarketSnapshot.currentBucketSlug,
+      nextBucketSlug: this.persistedPolymarketSnapshot.nextBucketSlug,
+      currentBucketStartSec: this.persistedPolymarketSnapshot.currentBucketStartSec,
+      selectedWindowStartSec:
+        hasRenderableSelection ? this.persistedPolymarketSnapshot.selectedWindowStartSec : null,
+      selectedWindowEndSec:
+        hasRenderableSelection ? this.persistedPolymarketSnapshot.selectedWindowEndSec : null,
       candidateRefreshed: this.persistedPolymarketSnapshot.candidateRefreshed,
       lastPreorderValidationReason: this.persistedPolymarketSnapshot.lastPreorderValidationReason,
       warningState,
@@ -2612,6 +3861,7 @@ export class PolymarketEngine {
       Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0 ? Math.floor(Number(line.tauSec)) : null;
     const holdReason = normalizeHoldReason(this.deriveCanonicalHoldReason(line) ?? line.holdReason);
     const warningState = String(line.warningState || "").trim().toUpperCase() || null;
+    const staleStateFromLine = String(line.staleState || "").trim().toUpperCase();
     const shouldClearSelection =
       !explicitSelectedSlug &&
       !line.currentMarketId &&
@@ -2681,6 +3931,12 @@ export class PolymarketEngine {
     const status =
       this.runtimeStartupState === "STARTING"
         ? "STARTING"
+        : holdReason === "SELECTION_NOT_COMMITTED"
+          ? "SELECTION_NOT_COMMITTED"
+          : holdReason === "NO_ACTIVE_WINDOWS"
+            ? "NO_ACTIVE_WINDOWS"
+            : holdReason === "EXPIRED_WINDOW"
+              ? "EXPIRED_WINDOW"
         : this.runtimeStartupState === "HOLD_NO_ACTIVE_BTC5M_MARKET" && !hasActiveSelection
           ? "NO_ACTIVE_BTC5M_MARKET"
           : warningState
@@ -2729,7 +3985,9 @@ export class PolymarketEngine {
             : null,
       holdCategory:
         action === "HOLD"
-          ? line.blockedCategory ?? this.persistedPolymarketSnapshot.holdCategory ?? null
+          ? line.blockedCategory ??
+            (holdReason ? classifyHoldCategory(holdReason) : this.persistedPolymarketSnapshot.holdCategory) ??
+            null
           : null,
       strategyAction: this.getTickActionRoot(line.action) || this.persistedPolymarketSnapshot.strategyAction,
       selectedTokenId:
@@ -2737,6 +3995,83 @@ export class PolymarketEngine {
           ? line.selectedTokenId ?? null
           : hasActiveSelection || keepExpiredPendingSelection
             ? this.persistedPolymarketSnapshot.selectedTokenId
+            : null,
+      selectedBookable:
+        line.selectedBookable !== undefined
+          ? Boolean(line.selectedBookable)
+          : hasActiveSelection || keepExpiredPendingSelection
+            ? Boolean(this.persistedPolymarketSnapshot.selectedBookable)
+            : false,
+      selectedTradable:
+        line.selectedTradable !== undefined
+          ? Boolean(line.selectedTradable)
+          : hasActiveSelection || keepExpiredPendingSelection
+            ? Boolean(this.persistedPolymarketSnapshot.selectedTradable)
+            : false,
+      discoveredCurrent:
+        line.discoveredCurrent !== undefined
+          ? Boolean(line.discoveredCurrent)
+          : this.persistedPolymarketSnapshot.discoveredCurrent,
+      discoveredNext:
+        line.discoveredNext !== undefined
+          ? Boolean(line.discoveredNext)
+          : this.persistedPolymarketSnapshot.discoveredNext,
+      selectionSource:
+        line.selectionSource !== undefined
+          ? line.selectionSource
+          : hasActiveSelection || keepExpiredPendingSelection
+            ? this.persistedPolymarketSnapshot.selectionSource
+            : null,
+      selectedFrom:
+        line.selectedFrom !== undefined
+          ? line.selectedFrom
+          : this.persistedPolymarketSnapshot.selectedFrom ??
+            (line.selectionSource !== undefined ? line.selectionSource : this.persistedPolymarketSnapshot.selectionSource),
+      selectionCommitTs:
+        line.selectionCommitTs !== undefined
+          ? line.selectionCommitTs
+          : this.persistedPolymarketSnapshot.selectionCommitTs,
+      liveValidationReason:
+        line.liveValidationReason !== undefined
+          ? line.liveValidationReason
+          : hasActiveSelection || keepExpiredPendingSelection
+            ? this.persistedPolymarketSnapshot.liveValidationReason
+            : this.persistedPolymarketSnapshot.liveValidationReason,
+      lastBookTs:
+        line.lastBookTs !== undefined
+          ? line.lastBookTs
+          : this.persistedPolymarketSnapshot.lastBookTs,
+      lastQuoteTs:
+        line.lastQuoteTs !== undefined
+          ? line.lastQuoteTs
+          : this.persistedPolymarketSnapshot.lastQuoteTs,
+      currentBucketSlug:
+        line.currentBucketSlug !== undefined
+          ? line.currentBucketSlug
+          : this.persistedPolymarketSnapshot.currentBucketSlug,
+      nextBucketSlug:
+        line.nextBucketSlug !== undefined
+          ? line.nextBucketSlug
+          : this.persistedPolymarketSnapshot.nextBucketSlug,
+      currentBucketStartSec:
+        line.currentBucketStartSec !== undefined
+          ? line.currentBucketStartSec
+          : this.persistedPolymarketSnapshot.currentBucketStartSec,
+      selectedWindowStartSec:
+        hasActiveSelection
+          ? resolvedSelection.windowStartTs !== null
+            ? Math.floor(Number(resolvedSelection.windowStartTs) / 1000)
+            : this.persistedPolymarketSnapshot.selectedWindowStartSec
+          : keepExpiredPendingSelection
+            ? this.persistedPolymarketSnapshot.selectedWindowStartSec
+            : null,
+      selectedWindowEndSec:
+        hasActiveSelection
+          ? resolvedSelection.windowEndTs !== null
+            ? Math.floor(Number(resolvedSelection.windowEndTs) / 1000)
+            : this.persistedPolymarketSnapshot.selectedWindowEndSec
+          : keepExpiredPendingSelection
+            ? this.persistedPolymarketSnapshot.selectedWindowEndSec
             : null,
       candidateRefreshed:
         line.candidateRefreshed !== undefined
@@ -2752,6 +4087,14 @@ export class PolymarketEngine {
           ? keepExpiredPendingSelection
             ? "AWAITING_NEXT_MARKET_DISCOVERY"
             : holdReason
+          : null,
+      executionBlockedReason:
+        action === "HOLD"
+          ? normalizeHoldReason(
+              line.blockedBy ||
+                line.holdDetailReason ||
+                this.persistedPolymarketSnapshot.executionBlockedReason
+            )
           : null,
       warningState,
       threshold:
@@ -2798,7 +4141,10 @@ export class PolymarketEngine {
           : Number.isFinite(Number(line.oracleEst)) && Number(line.oracleEst) > 0
             ? Number(line.oracleEst)
             : this.persistedPolymarketSnapshot.currentBtcMid,
-      staleState: null,
+      staleState:
+        staleStateFromLine === "ACTIVE_MARKET_REFRESH_FAILED" || staleStateFromLine === "ACTIVE_MARKET_PRICE_STALE"
+          ? (staleStateFromLine as PersistedPolymarketSnapshot["staleState"])
+          : null,
       statusLine: null
     };
     this.persistedPolymarketSnapshot = this.getPersistedPolymarketSnapshot(tickTs);
@@ -2945,6 +4291,8 @@ export class PolymarketEngine {
       holdReason === "NO_ACTIVE_BTC5M_MARKET" ||
       holdReason === "STARTUP_INCOMPLETE_NO_USABLE_WINDOW" ||
       holdReason === "NO_WINDOWS" ||
+      holdReason === "NO_ACTIVE_WINDOWS" ||
+      holdReason === "SELECTION_NOT_COMMITTED" ||
       holdReason === "NO_CANDIDATES" ||
       holdReason === "NO_DATA" ||
       holdDetailReason === "BTC5M_NOT_FOUND" ||
@@ -3122,6 +4470,9 @@ export class PolymarketEngine {
   } {
     const selectedSlug = input.selectedSlug ?? null;
     const selectedMarketId = input.selectedMarketId ?? null;
+    const slugStartSec = this.isDeterministicBtc5mMode()
+      ? parseBtc5mWindowStartSec(selectedSlug)
+      : null;
     const explicitRemainingSec =
       input.remainingSec !== null &&
       input.remainingSec !== undefined &&
@@ -3130,16 +4481,18 @@ export class PolymarketEngine {
         ? Math.floor(Number(input.remainingSec))
         : null;
     const windowEndTs =
-      Number(input.windowEndTs || 0) > 0
-        ? Number(input.windowEndTs)
-        : explicitRemainingSec !== null
-          ? nowTs + explicitRemainingSec * 1000
-          : null;
+      slugStartSec !== null
+        ? (slugStartSec + FIVE_MIN_SEC) * 1000
+        : Number(input.windowEndTs || 0) > 0
+          ? Number(input.windowEndTs)
+          : explicitRemainingSec !== null
+            ? nowTs + explicitRemainingSec * 1000
+            : null;
     const windowStartTs =
-      Number(input.windowStartTs || 0) > 0
-        ? Number(input.windowStartTs)
-        : parseBtc5mWindowStartSec(selectedSlug) !== null
-          ? Number(parseBtc5mWindowStartSec(selectedSlug)) * 1000
+      slugStartSec !== null
+        ? slugStartSec * 1000
+        : Number(input.windowStartTs || 0) > 0
+          ? Number(input.windowStartTs)
           : windowEndTs !== null
             ? Math.max(0, windowEndTs - FIVE_MIN_SEC * 1000)
             : null;
@@ -3846,8 +5199,10 @@ export class PolymarketEngine {
   }
 
   private getLoopWaitMs(nowTs = Date.now()): number {
-    const baseLoopMs = Math.max(25, this.config.polymarket.loopMs);
-    if (this.config.polymarket.mode !== "live" || !this.isDeterministicBtc5mMode()) {
+    const configuredLoopMs = Math.max(25, this.config.polymarket.loopMs);
+    const liveDeterministic = this.config.polymarket.mode === "live" && this.isDeterministicBtc5mMode();
+    const baseLoopMs = liveDeterministic ? Math.min(configuredLoopMs, 2_000) : configuredLoopMs;
+    if (!liveDeterministic) {
       return baseLoopMs;
     }
     const snapshot = this.getPersistedPolymarketSnapshot(nowTs);
@@ -4079,6 +5434,20 @@ export class PolymarketEngine {
     selectedWindowEnd: number | null;
     selectedAcceptingOrders: boolean | null;
     selectedEnableOrderBook: boolean | null;
+    selectedTokenId: string | null;
+    chosenSide: "YES" | "NO" | null;
+    chosenDirection: string | null;
+    selectedBookable: boolean;
+    selectedTradable: boolean;
+    discoveredCurrent: boolean;
+    discoveredNext: boolean;
+    selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | null;
+    liveValidationReason: string | null;
+    lastBookTs: number | null;
+    lastQuoteTs: number | null;
+    currentBucketSlug: string;
+    nextBucketSlug: string;
+    currentBucketStartSec: number;
     selectedReason: string | null;
     dominantReject: string | null;
     stageCounts: {
@@ -4098,9 +5467,29 @@ export class PolymarketEngine {
     const attemptedSlugs = this.getDeterministicBtc5mSlugCandidates(currentBucket);
     const activeStartSec = currentBucket.currentBucketStartSec;
     const nextStartSec = currentBucket.currentBucketStartSec + FIVE_MIN_SEC;
+    let activeRefreshedSelection:
+      | {
+          selectedMarket: BtcWindowMarket;
+          selectedSlug: string | null;
+          selectedReason: string;
+          chosenSide: "YES" | "NO";
+          chosenDirection: string;
+          selectedTokenId: string | null;
+          selectedBookable: boolean;
+          selectedTradable: boolean;
+          selectionSource: "current_slug" | "next_slug" | "fallback_discovery";
+          liveValidationReason: string;
+          lastBookTs: number | null;
+          lastQuoteTs: number | null;
+          prioritizedWindowCount: number;
+        }
+      | null = null;
     const discoveredRows: Record<string, unknown>[] = [];
     const candidateRows: Array<{ row: Record<string, unknown>; resolvedSlug: string | null; source: string }> = [];
     const seenKeys = new Set<string>();
+    let dominantReject: string | null = "BTC5M_NOT_FOUND";
+    let discoveredCurrent = false;
+    let discoveredNext = false;
     const addCandidateRow = (
       row: Record<string, unknown> | null | undefined,
       source: string,
@@ -4137,249 +5526,523 @@ export class PolymarketEngine {
         return [];
       }
     };
-
-    for (const slug of [currentBucket.currentSlug, currentBucket.nextSlug]) {
-      const rows = await safeListMarketsPage(
-        {
-          limit: 25,
-          slug,
-          active: true,
-          closed: false,
-          archived: false
-        },
-        "slug_lookup"
-      );
-      for (const row of rows) {
-        if (rowMatchesBtc5mSlug(row, slug)) {
-          addCandidateRow(row, "slug_lookup", slug);
-        }
-      }
-    }
-    const previousRows = await safeListMarketsPage(
-      {
-        limit: 25,
-        slug: currentBucket.prevSlug,
-        active: true,
-        closed: false,
-        archived: false
-      },
-      "slug_lookup"
-    );
-    for (const row of previousRows) {
-      if (rowMatchesBtc5mSlug(row, currentBucket.prevSlug)) {
-        addCandidateRow(row, "previous_diagnostic", currentBucket.prevSlug);
-      }
-    }
-
-    const broadRows = await safeListMarketsPage(
-      {
-        limit: 200,
-        active: true,
-        closed: false,
-        archived: false
-      },
-      "active_scan"
-    );
-    for (const row of broadRows) addCandidateRow(row, "active_scan");
-
-    const parsedCandidates = candidateRows
-      .map(({ row, resolvedSlug, source }) => {
-        const slugText =
-          String(
-            resolvedSlug ||
-              pickRawString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) ||
-              ""
+    const parseCandidates = (
+      rows: Array<{ row: Record<string, unknown>; resolvedSlug: string | null; source: string }>
+    ): Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }> =>
+      rows
+        .map(({ row, resolvedSlug, source }) => {
+          const rowSlugText = String(
+            resolvedSlug || pickRawString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || ""
           ).trim();
-        const windowStartSec = parseBtc5mWindowStartSec(slugText);
-        const fallbackWindowEndMs =
-          windowStartSec !== null
-            ? (windowStartSec + FIVE_MIN_SEC) * 1000
-            : nowTs + FIVE_MIN_SEC * 1000;
-        const parsed = parseRawMarketToBtcWindow(
-          row,
-          nowTs,
-          fallbackWindowEndMs,
-          this.lastOracleSnapshot?.price ?? null
+          const windowStartSec = parseBtc5mWindowStartSec(rowSlugText);
+          const fallbackWindowEndMs =
+            windowStartSec !== null ? (windowStartSec + FIVE_MIN_SEC) * 1000 : nowTs + FIVE_MIN_SEC * 1000;
+          const parsed = parseRawMarketToBtcWindow(
+            row,
+            nowTs,
+            fallbackWindowEndMs,
+            this.lastOracleSnapshot?.price ?? null
+          );
+          if (!parsed || !looksLikeBtc5mMarket(parsed)) return null;
+          const market = this.applyWindowState(parsed, nowTs);
+          const candidateSlug = this.pickDeterministicBtc5mSlug(rowSlugText, market.slug, market.eventSlug);
+          const startSec =
+            parseBtc5mWindowStartSec(candidateSlug) ??
+            (Number.isFinite(Number(market.startTs)) && Number(market.startTs) > 0
+              ? Math.floor(Number(market.startTs) / 1000)
+              : null);
+          return {
+            market,
+            source,
+            slug: candidateSlug,
+            startSec
+          };
+        })
+        .filter(
+          (
+            row
+          ): row is { market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null } =>
+            row !== null
         );
-        if (!parsed || !looksLikeBtc5mMarket(parsed)) return null;
-        return {
-          market: this.applyWindowState(parsed, nowTs),
-          source
-        };
-      })
-      .filter(
-        (row): row is { market: BtcWindowMarket; source: string } =>
-          row !== null
-      );
-    const minEntryRemainingSec = this.getLiveEntryMinRemainingSec();
-    const tradingCandidates = parsedCandidates
-      .map(({ market, source }) => {
-        const startSec =
-          parseBtc5mWindowStartSec(market.eventSlug || market.slug) ??
-          (Number.isFinite(Number(market.startTs)) && Number(market.startTs) > 0
-            ? Math.floor(Number(market.startTs) / 1000)
-            : null);
-        const slug = market.eventSlug || market.slug || null;
-        const remainingSec =
-          Number.isFinite(Number(market.endTs)) && Number(market.endTs) > nowTs
-            ? Math.max(0, Math.floor((Number(market.endTs) - nowTs) / 1000))
-            : null;
-        if (
-          startSec === null ||
-          (startSec !== activeStartSec && startSec !== nextStartSec) ||
-          remainingSec === null ||
-          remainingSec <= 0 ||
-          (startSec === activeStartSec && remainingSec <= minEntryRemainingSec)
-        ) {
-          return null;
+
+    const updateDiscoveredBucketFlags = (
+      parsed: Array<{ startSec: number | null; slug: string | null }>
+    ): void => {
+      for (const candidate of parsed) {
+        const bucketClass = this.classifyDeterministicWindowFromSlugOrStart(
+          candidate.slug,
+          candidate.startSec,
+          currentBucket
+        );
+        if (bucketClass === "current") discoveredCurrent = true;
+        if (bucketClass === "next") discoveredNext = true;
+      }
+    };
+
+    const pickTradableCandidate = async (
+      parsed: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }>,
+      sourceLabel: "current_slug" | "next_slug" | "fallback_discovery"
+    ): Promise<{
+      selectedMarket: BtcWindowMarket;
+      selectedSlug: string | null;
+      selectedReason: string;
+      chosenSide: "YES" | "NO";
+      chosenDirection: string;
+      selectedTokenId: string | null;
+      selectedBookable: boolean;
+      selectedTradable: boolean;
+      selectionSource: "current_slug" | "next_slug" | "fallback_discovery";
+      liveValidationReason: string;
+      lastBookTs: number | null;
+      lastQuoteTs: number | null;
+      prioritizedWindowCount: number;
+    } | null> => {
+      const currentCandidates = parsed
+        .filter(
+          (row) =>
+            this.classifyDeterministicWindowFromSlugOrStart(row.slug, row.startSec, currentBucket) === "current"
+        )
+        .sort((a, b) => {
+          const aRank = rankDeterministicBtc5mMarket(a.market, activeStartSec, nowTs);
+          const bRank = rankDeterministicBtc5mMarket(b.market, activeStartSec, nowTs);
+          if (aRank !== bRank) return aRank - bRank;
+          return String(a.market.marketId).localeCompare(String(b.market.marketId));
+        });
+      const nextCandidates = parsed
+        .filter(
+          (row) =>
+            this.classifyDeterministicWindowFromSlugOrStart(row.slug, row.startSec, currentBucket) === "next"
+        )
+        .sort((a, b) => {
+          const aRank = rankDeterministicBtc5mMarket(a.market, activeStartSec, nowTs);
+          const bRank = rankDeterministicBtc5mMarket(b.market, activeStartSec, nowTs);
+          if (aRank !== bRank) return aRank - bRank;
+          return String(a.market.marketId).localeCompare(String(b.market.marketId));
+        });
+      const previousCandidates = parsed
+        .filter(
+          (row) =>
+            this.classifyDeterministicWindowFromSlugOrStart(row.slug, row.startSec, currentBucket) === "previous"
+        )
+        .sort((a, b) => {
+          const aRank = rankDeterministicBtc5mMarket(a.market, activeStartSec, nowTs);
+          const bRank = rankDeterministicBtc5mMarket(b.market, activeStartSec, nowTs);
+          if (aRank !== bRank) return aRank - bRank;
+          return String(a.market.marketId).localeCompare(String(b.market.marketId));
+        });
+      const prioritized = [...currentCandidates, ...nextCandidates, ...previousCandidates];
+      const prioritizedWindowCount = prioritized.length > 0 ? 1 : 0;
+      if (prioritized.length <= 0) {
+        return null;
+      }
+      let fallbackVisibleCandidate: {
+        candidate: { market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null };
+        chosenSide: "YES" | "NO";
+        selectionSource: "current_slug" | "next_slug" | "fallback_discovery";
+        reason: string;
+      } | null = null;
+      for (const candidate of prioritized) {
+        const chosenSideHint =
+          this.liveCommittedSelection?.chosenSide ??
+          this.persistedPolymarketSnapshot.chosenSide ??
+          "YES";
+        const alternateSide: "YES" | "NO" = chosenSideHint === "YES" ? "NO" : "YES";
+        const sideOrder: Array<"YES" | "NO"> = [chosenSideHint, alternateSide];
+        const bucketClass = this.classifyDeterministicWindowFromSlugOrStart(
+          candidate.slug,
+          candidate.startSec,
+          currentBucket
+        );
+        const selectionSource =
+          bucketClass === "current" ? "current_slug" : bucketClass === "next" ? "next_slug" : "fallback_discovery";
+        for (const side of sideOrder) {
+          const tradability = await this.validateLiveMarketTradability({
+            market: candidate.market,
+            chosenSide: side,
+            nowTs,
+            selectionSource
+          });
+          if (!tradability.tradable || !tradability.tokenId || !tradability.bookable) {
+            dominantReject = tradability.reason;
+            if (!fallbackVisibleCandidate) {
+              fallbackVisibleCandidate = {
+                candidate,
+                chosenSide: side,
+                selectionSource,
+                reason: tradability.reason
+              };
+            }
+            if (tradability.reason === "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN") {
+              this.markReadPathWarning("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN");
+            }
+            continue;
+          }
+          return {
+            selectedMarket: candidate.market,
+            selectedSlug: candidate.slug,
+            selectedReason:
+              bucketClass === "current"
+                ? `btc5m_current_bucket_${candidate.source}`
+                : bucketClass === "next"
+                  ? `btc5m_next_bucket_${candidate.source}`
+                  : `btc5m_previous_bucket_${candidate.source}`,
+            chosenSide: side,
+            chosenDirection: normalizeDirectionalDisplayLabel(null, null, side),
+            selectedTokenId: tradability.tokenId,
+            selectedBookable: tradability.bookable,
+            selectedTradable: tradability.tradable,
+            selectionSource,
+            liveValidationReason: tradability.reason,
+            lastBookTs: tradability.lastBookTs,
+            lastQuoteTs: tradability.lastQuoteTs,
+            prioritizedWindowCount
+          };
         }
-        return {
-          market,
-          source,
-          slug,
-          startSec,
-          remainingSec
-        };
-      })
-      .filter(
-        (
-          row
-        ): row is {
-          market: BtcWindowMarket;
-          source: string;
-          slug: string | null;
-          startSec: number;
-          remainingSec: number;
-        } => row !== null
-      );
-    const currentCandidates = tradingCandidates.filter(({ startSec }) => startSec === activeStartSec);
-    const nextCandidates = tradingCandidates.filter(({ startSec }) => startSec === nextStartSec);
-
-    currentCandidates.sort((a, b) => {
-      const aRank = rankDeterministicBtc5mMarket(a.market, activeStartSec, nowTs);
-      const bRank = rankDeterministicBtc5mMarket(b.market, activeStartSec, nowTs);
-      if (aRank !== bRank) return aRank - bRank;
-      return String(a.market.marketId).localeCompare(String(b.market.marketId));
-    });
-    nextCandidates.sort((a, b) => {
-      const aRank = rankDeterministicBtc5mMarket(a.market, activeStartSec, nowTs);
-      const bRank = rankDeterministicBtc5mMarket(b.market, activeStartSec, nowTs);
-      if (aRank !== bRank) return aRank - bRank;
-      return String(a.market.marketId).localeCompare(String(b.market.marketId));
-    });
-
-    let selectedCandidate = currentCandidates[0] ?? null;
-    let fallbackUsed: "none" | "window" | "patterns" | "topActive" = "none";
-    if (!selectedCandidate && nextCandidates[0]) {
-      selectedCandidate = nextCandidates[0];
-      fallbackUsed = selectedCandidate.source === "slug_lookup" ? "window" : "topActive";
-    }
-    const prioritizedWindowCount = currentCandidates[0] || nextCandidates[0] ? 1 : 0;
-
-    if (!selectedCandidate) {
-      const familySearchTerms = [
-        "btc up down 5m",
-        "bitcoin up down 5 minute"
-      ]
-        .map((row) => String(row || "").trim())
-        .filter((row, idx, arr) => row.length > 0 && arr.indexOf(row) === idx);
-      for (const search of familySearchTerms) {
-        const rows = await safeListMarketsPage(
-          {
-            limit: 200,
-            search,
-            active: true,
-            closed: false,
-            archived: false
-          },
-          "search_lookup"
+      }
+      if (fallbackVisibleCandidate) {
+        const fallbackBucketClass = this.classifyDeterministicWindowFromSlugOrStart(
+          fallbackVisibleCandidate.candidate.slug,
+          fallbackVisibleCandidate.candidate.startSec,
+          currentBucket
         );
-        for (const row of rows) addCandidateRow(row, "search_lookup");
+        return {
+          selectedMarket: fallbackVisibleCandidate.candidate.market,
+          selectedSlug: fallbackVisibleCandidate.candidate.slug,
+          selectedReason:
+            fallbackBucketClass === "current"
+              ? `btc5m_current_bucket_${fallbackVisibleCandidate.candidate.source}`
+              : fallbackBucketClass === "next"
+                ? `btc5m_next_bucket_${fallbackVisibleCandidate.candidate.source}`
+                : `btc5m_previous_bucket_${fallbackVisibleCandidate.candidate.source}`,
+          chosenSide: fallbackVisibleCandidate.chosenSide,
+          chosenDirection: normalizeDirectionalDisplayLabel(null, null, fallbackVisibleCandidate.chosenSide),
+          selectedTokenId: null,
+          selectedBookable: false,
+          selectedTradable: false,
+          selectionSource: fallbackVisibleCandidate.selectionSource,
+          liveValidationReason: fallbackVisibleCandidate.reason,
+          lastBookTs: null,
+          lastQuoteTs: null,
+          prioritizedWindowCount
+        };
+      }
+      return null;
+    };
+
+    const activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+    if (
+      activeCommittedSelection &&
+      activeCommittedSelection.selectedSlug &&
+      activeCommittedSelection.remainingSec > this.getLiveEntryMinRemainingSec()
+    ) {
+      const committedSlug = activeCommittedSelection.selectedSlug;
+      try {
+        const row = await this.client.getActiveMarketBySlug(committedSlug);
+        if (row && rowMatchesBtc5mSlug(row, committedSlug)) {
+          addCandidateRow(row as Record<string, unknown>, "active_selected_refresh", committedSlug);
+          const parsedActiveCandidates = parseCandidates(
+            candidateRows.filter((candidate) => candidate.source === "active_selected_refresh")
+          ).filter((candidate) => candidate.startSec === activeStartSec || candidate.startSec === nextStartSec);
+          updateDiscoveredBucketFlags(parsedActiveCandidates);
+          if (parsedActiveCandidates.length > 0) {
+            const activeSelection = await pickTradableCandidate(parsedActiveCandidates, "current_slug");
+            if (activeSelection && activeSelection.selectionSource !== "fallback_discovery") {
+              if (activeSelection.selectedTradable) {
+                this.lastUsableLiveSelectedMarket = { ...activeSelection.selectedMarket };
+                this.persistedPolymarketSnapshot = {
+                  ...this.persistedPolymarketSnapshot,
+                  staleState: null
+                };
+              } else if (
+                activeSelection.liveValidationReason === "transient_quote_failure" ||
+                activeSelection.liveValidationReason === "quote_failure" ||
+                activeSelection.liveValidationReason === "empty_live_quote"
+              ) {
+                this.persistedPolymarketSnapshot = {
+                  ...this.persistedPolymarketSnapshot,
+                  staleState: "ACTIVE_MARKET_PRICE_STALE",
+                  liveValidationReason: "PRICE_REFRESH_FAILED_ACTIVE_MARKET"
+                };
+              } else {
+                this.persistedPolymarketSnapshot = {
+                  ...this.persistedPolymarketSnapshot,
+                  staleState: null
+                };
+              }
+              activeRefreshedSelection = activeSelection;
+              const nearRollover = Number(activeCommittedSelection.remainingSec || 0) <= 90;
+              if (!nearRollover) {
+                const activeAttemptedSlugs = Array.from(new Set([committedSlug, ...attemptedSlugs]));
+                return {
+                  selectedMarket: activeSelection.selectedMarket,
+                  selectedSlug: activeSelection.selectedSlug,
+                  selectedWindowStart: activeSelection.selectedMarket.startTs ?? null,
+                  selectedWindowEnd: activeSelection.selectedMarket.endTs ?? null,
+                  selectedAcceptingOrders: activeSelection.selectedMarket.acceptingOrders ?? null,
+                  selectedEnableOrderBook: activeSelection.selectedMarket.enableOrderBook ?? null,
+                  selectedTokenId: activeSelection.selectedTokenId,
+                  chosenSide: activeSelection.chosenSide,
+                  chosenDirection: activeSelection.chosenDirection,
+                  selectedBookable: activeSelection.selectedBookable,
+                  selectedTradable: activeSelection.selectedTradable,
+                  discoveredCurrent,
+                  discoveredNext,
+                  selectionSource: activeSelection.selectionSource,
+                  liveValidationReason: activeSelection.liveValidationReason,
+                  lastBookTs: activeSelection.lastBookTs,
+                  lastQuoteTs: activeSelection.lastQuoteTs,
+                  currentBucketSlug: currentBucket.currentSlug,
+                  nextBucketSlug: currentBucket.nextSlug,
+                  currentBucketStartSec: currentBucket.currentBucketStartSec,
+                  selectedReason: "btc5m_active_selected_refresh",
+                  dominantReject: activeSelection.selectedTradable ? "OK" : activeSelection.liveValidationReason,
+                  stageCounts: {
+                    fetchedCount: discoveredRows.length,
+                    afterActiveCount: discoveredRows.length,
+                    afterSearchCount: discoveredRows.length,
+                    afterWindowCount: activeSelection.prioritizedWindowCount,
+                    afterPatternCount: activeSelection.prioritizedWindowCount,
+                    finalCandidatesCount: activeSelection.prioritizedWindowCount
+                  },
+                  attemptedSlugs: activeAttemptedSlugs,
+                  fallbackUsed: "none"
+                };
+              }
+            }
+          }
+          dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
+          this.persistedPolymarketSnapshot = {
+            ...this.persistedPolymarketSnapshot,
+            staleState: "ACTIVE_MARKET_REFRESH_FAILED",
+            liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
+          };
+        } else {
+          dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
+          this.persistedPolymarketSnapshot = {
+            ...this.persistedPolymarketSnapshot,
+            staleState: "ACTIVE_MARKET_REFRESH_FAILED",
+            liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
+          };
+        }
+      } catch (error) {
+        this.markReadPathWarning("NETWORK_ERROR");
+        this.maybeLogDeterministicDiscoveryDegraded({
+          warningSource: "active_selected_refresh",
+          error,
+          details: { selectedSlug: committedSlug }
+        });
+        dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          staleState: "ACTIVE_MARKET_REFRESH_FAILED",
+          liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
+        };
       }
     }
-    const selectedMarket = selectedCandidate?.market ?? null;
-    if (selectedMarket && selectedCandidate) {
-      this.lastUsableLiveSelectedMarket = { ...selectedMarket };
-      const selectedSlug = selectedCandidate.slug;
-      const selectedReason =
-        selectedCandidate.startSec === currentBucket.currentBucketStartSec
-          ? `btc5m_current_bucket_${selectedCandidate.source}`
-          : `btc5m_next_bucket_${selectedCandidate.source}`;
+
+    for (const slug of [currentBucket.currentSlug, currentBucket.nextSlug, currentBucket.prevSlug]) {
+      try {
+        const row = await this.client.getActiveMarketBySlug(slug);
+        if (row && rowMatchesBtc5mSlug(row, slug)) {
+          addCandidateRow(row, "direct_slug_lookup", slug);
+        }
+      } catch (error) {
+        this.markReadPathWarning("NETWORK_ERROR");
+        this.maybeLogDeterministicDiscoveryDegraded({
+          warningSource: "direct_slug_lookup",
+          error,
+          details: { slug }
+        });
+      }
+    }
+
+    const parsedDirectCandidates = parseCandidates(candidateRows);
+    updateDiscoveredBucketFlags(parsedDirectCandidates);
+    const directSelection = await pickTradableCandidate(parsedDirectCandidates, "current_slug");
+    const directVisibleSelection = directSelection && !directSelection.selectedTradable ? directSelection : null;
+    const directPrioritizedWindowCount = parsedDirectCandidates.some(
+      (row) =>
+        this.classifyDeterministicWindowFromSlugOrStart(row.slug, row.startSec, currentBucket) !== "other"
+    )
+      ? 1
+      : 0;
+    if (directSelection && directSelection.selectedTradable) {
+      this.lastUsableLiveSelectedMarket = { ...directSelection.selectedMarket };
       return {
-        selectedMarket,
-        selectedSlug,
-        selectedWindowStart: selectedMarket.startTs ?? null,
-        selectedWindowEnd: selectedMarket.endTs ?? null,
-        selectedAcceptingOrders: selectedMarket.acceptingOrders ?? null,
-        selectedEnableOrderBook: selectedMarket.enableOrderBook ?? null,
-        selectedReason,
-        dominantReject: "OK",
+        selectedMarket: directSelection.selectedMarket,
+        selectedSlug: directSelection.selectedSlug,
+        selectedWindowStart: directSelection.selectedMarket.startTs ?? null,
+        selectedWindowEnd: directSelection.selectedMarket.endTs ?? null,
+        selectedAcceptingOrders: directSelection.selectedMarket.acceptingOrders ?? null,
+        selectedEnableOrderBook: directSelection.selectedMarket.enableOrderBook ?? null,
+        selectedTokenId: directSelection.selectedTokenId,
+        chosenSide: directSelection.chosenSide,
+        chosenDirection: directSelection.chosenDirection,
+        selectedBookable: directSelection.selectedBookable,
+        selectedTradable: directSelection.selectedTradable,
+        discoveredCurrent,
+        discoveredNext,
+        selectionSource: directSelection.selectionSource,
+        liveValidationReason: directSelection.liveValidationReason,
+        lastBookTs: directSelection.lastBookTs,
+        lastQuoteTs: directSelection.lastQuoteTs,
+        currentBucketSlug: currentBucket.currentSlug,
+        nextBucketSlug: currentBucket.nextSlug,
+        currentBucketStartSec: currentBucket.currentBucketStartSec,
+        selectedReason: directSelection.selectedReason,
+        dominantReject: directSelection.selectedTradable ? "OK" : directSelection.liveValidationReason,
         stageCounts: {
           fetchedCount: discoveredRows.length,
           afterActiveCount: discoveredRows.length,
           afterSearchCount: discoveredRows.length,
-          afterWindowCount: prioritizedWindowCount,
-          afterPatternCount: prioritizedWindowCount,
-          finalCandidatesCount: prioritizedWindowCount
+          afterWindowCount: directSelection.prioritizedWindowCount,
+          afterPatternCount: directSelection.prioritizedWindowCount,
+          finalCandidatesCount: directSelection.prioritizedWindowCount
         },
         attemptedSlugs,
-        fallbackUsed
-      };
-    }
-
-    const cached =
-      this.lastUsableLiveSelectedMarket &&
-      isDeterministicBtc5mMarketUsableNow(this.lastUsableLiveSelectedMarket, activeStartSec, nowTs) &&
-      looksLikeBtc5mMarket(this.lastUsableLiveSelectedMarket)
-        ? this.applyWindowState({ ...this.lastUsableLiveSelectedMarket }, nowTs)
-        : null;
-    if (cached) {
-      this.markReadPathWarning("NETWORK_ERROR");
-      return {
-        selectedMarket: cached,
-        selectedSlug: cached.eventSlug || cached.slug || null,
-        selectedWindowStart: cached.startTs ?? null,
-        selectedWindowEnd: cached.endTs ?? null,
-        selectedAcceptingOrders: cached.acceptingOrders ?? null,
-        selectedEnableOrderBook: cached.enableOrderBook ?? null,
-        selectedReason: "btc5m_cached_prior_selection",
-        dominantReject: "FETCH_STALE",
-        stageCounts: {
-          fetchedCount: Math.max(1, discoveredRows.length),
-          afterActiveCount: Math.max(1, discoveredRows.length),
-          afterSearchCount: Math.max(1, discoveredRows.length),
-          afterWindowCount: 1,
-          afterPatternCount: 1,
-          finalCandidatesCount: 1
-        },
-        attemptedSlugs,
-        fallbackUsed: "topActive"
+        fallbackUsed: "window"
       };
     }
 
     if (rolloverDemotion.demoted) {
-      const promotedExpected = this.promoteExpectedCurrentBtc5mSelection(nowTs, {
-        selectedReason: "btc5m_expected_current_rollover",
-        previousSelectedSlug: rolloverDemotion.previousSelectedSlug
-      }, currentBucket);
+      this.demoteLiveSelection("ROLLOVER_DEMOTED_PREVIOUS_BUCKET", nowTs);
+    }
+
+    const shouldFallbackToBroadDiscovery = true;
+    if (shouldFallbackToBroadDiscovery) {
+      const broadRows = await safeListMarketsPage(
+        {
+          limit: 200,
+          active: true,
+          closed: false,
+          archived: false
+        },
+        "active_scan"
+      );
+      for (const row of broadRows) {
+        addCandidateRow(row, "active_scan");
+      }
+      const parsedFallbackCandidates = parseCandidates(candidateRows);
+      updateDiscoveredBucketFlags(parsedFallbackCandidates);
+      const fallbackSelection = await pickTradableCandidate(parsedFallbackCandidates, "fallback_discovery");
+      const fallbackPrioritizedWindowCount = parsedFallbackCandidates.some(
+        (row) =>
+          this.classifyDeterministicWindowFromSlugOrStart(row.slug, row.startSec, currentBucket) !== "other"
+      )
+        ? 1
+        : 0;
+      if (fallbackSelection) {
+        if (fallbackSelection.selectedTradable) {
+          this.lastUsableLiveSelectedMarket = { ...fallbackSelection.selectedMarket };
+        }
+        return {
+          selectedMarket: fallbackSelection.selectedMarket,
+          selectedSlug: fallbackSelection.selectedSlug,
+          selectedWindowStart: fallbackSelection.selectedMarket.startTs ?? null,
+          selectedWindowEnd: fallbackSelection.selectedMarket.endTs ?? null,
+          selectedAcceptingOrders: fallbackSelection.selectedMarket.acceptingOrders ?? null,
+          selectedEnableOrderBook: fallbackSelection.selectedMarket.enableOrderBook ?? null,
+          selectedTokenId: fallbackSelection.selectedTokenId,
+          chosenSide: fallbackSelection.chosenSide,
+          chosenDirection: fallbackSelection.chosenDirection,
+          selectedBookable: fallbackSelection.selectedBookable,
+          selectedTradable: fallbackSelection.selectedTradable,
+          discoveredCurrent,
+          discoveredNext,
+          selectionSource: fallbackSelection.selectionSource,
+          liveValidationReason: fallbackSelection.liveValidationReason,
+          lastBookTs: fallbackSelection.lastBookTs,
+          lastQuoteTs: fallbackSelection.lastQuoteTs,
+          currentBucketSlug: currentBucket.currentSlug,
+          nextBucketSlug: currentBucket.nextSlug,
+          currentBucketStartSec: currentBucket.currentBucketStartSec,
+          selectedReason: fallbackSelection.selectedReason,
+          dominantReject: fallbackSelection.selectedTradable ? "OK" : fallbackSelection.liveValidationReason,
+          stageCounts: {
+            fetchedCount: discoveredRows.length,
+            afterActiveCount: discoveredRows.length,
+            afterSearchCount: discoveredRows.length,
+            afterWindowCount: fallbackPrioritizedWindowCount,
+            afterPatternCount: fallbackPrioritizedWindowCount,
+            finalCandidatesCount: fallbackPrioritizedWindowCount
+          },
+          attemptedSlugs,
+          fallbackUsed: "topActive"
+        };
+      }
+    }
+
+    if (directVisibleSelection) {
       return {
-        selectedMarket: null,
-        selectedSlug: promotedExpected.selectedSlug,
-        selectedWindowStart: promotedExpected.selectedWindowStart,
-        selectedWindowEnd: promotedExpected.selectedWindowEnd,
-        selectedAcceptingOrders: null,
-        selectedEnableOrderBook: null,
-        selectedReason: "btc5m_expected_current_rollover",
-        dominantReject: "FETCH_STALE",
+        selectedMarket: directVisibleSelection.selectedMarket,
+        selectedSlug: directVisibleSelection.selectedSlug,
+        selectedWindowStart: directVisibleSelection.selectedMarket.startTs ?? null,
+        selectedWindowEnd: directVisibleSelection.selectedMarket.endTs ?? null,
+        selectedAcceptingOrders: directVisibleSelection.selectedMarket.acceptingOrders ?? null,
+        selectedEnableOrderBook: directVisibleSelection.selectedMarket.enableOrderBook ?? null,
+        selectedTokenId: null,
+        chosenSide: directVisibleSelection.chosenSide,
+        chosenDirection: directVisibleSelection.chosenDirection,
+        selectedBookable: false,
+        selectedTradable: false,
+        discoveredCurrent,
+        discoveredNext,
+        selectionSource: directVisibleSelection.selectionSource,
+        liveValidationReason: directVisibleSelection.liveValidationReason,
+        lastBookTs: null,
+        lastQuoteTs: null,
+        currentBucketSlug: currentBucket.currentSlug,
+        nextBucketSlug: currentBucket.nextSlug,
+        currentBucketStartSec: currentBucket.currentBucketStartSec,
+        selectedReason: directVisibleSelection.selectedReason,
+        dominantReject: directVisibleSelection.liveValidationReason,
         stageCounts: {
           fetchedCount: discoveredRows.length,
           afterActiveCount: discoveredRows.length,
           afterSearchCount: discoveredRows.length,
-          afterWindowCount: prioritizedWindowCount,
-          afterPatternCount: prioritizedWindowCount,
-          finalCandidatesCount: prioritizedWindowCount
+          afterWindowCount: directPrioritizedWindowCount,
+          afterPatternCount: directPrioritizedWindowCount,
+          finalCandidatesCount: directPrioritizedWindowCount
         },
         attemptedSlugs,
+        fallbackUsed: "window"
+      };
+    }
+
+    if (activeRefreshedSelection) {
+      const activeAttemptedSlugs = Array.from(new Set([activeCommittedSelection?.selectedSlug, ...attemptedSlugs].filter(Boolean) as string[]));
+      return {
+        selectedMarket: activeRefreshedSelection.selectedMarket,
+        selectedSlug: activeRefreshedSelection.selectedSlug,
+        selectedWindowStart: activeRefreshedSelection.selectedMarket.startTs ?? null,
+        selectedWindowEnd: activeRefreshedSelection.selectedMarket.endTs ?? null,
+        selectedAcceptingOrders: activeRefreshedSelection.selectedMarket.acceptingOrders ?? null,
+        selectedEnableOrderBook: activeRefreshedSelection.selectedMarket.enableOrderBook ?? null,
+        selectedTokenId: activeRefreshedSelection.selectedTokenId,
+        chosenSide: activeRefreshedSelection.chosenSide,
+        chosenDirection: activeRefreshedSelection.chosenDirection,
+        selectedBookable: activeRefreshedSelection.selectedBookable,
+        selectedTradable: activeRefreshedSelection.selectedTradable,
+        discoveredCurrent,
+        discoveredNext,
+        selectionSource: activeRefreshedSelection.selectionSource,
+        liveValidationReason: activeRefreshedSelection.liveValidationReason,
+        lastBookTs: activeRefreshedSelection.lastBookTs,
+        lastQuoteTs: activeRefreshedSelection.lastQuoteTs,
+        currentBucketSlug: currentBucket.currentSlug,
+        nextBucketSlug: currentBucket.nextSlug,
+        currentBucketStartSec: currentBucket.currentBucketStartSec,
+        selectedReason: "btc5m_active_selected_refresh",
+        dominantReject: activeRefreshedSelection.selectedTradable ? "OK" : activeRefreshedSelection.liveValidationReason,
+        stageCounts: {
+          fetchedCount: discoveredRows.length,
+          afterActiveCount: discoveredRows.length,
+          afterSearchCount: discoveredRows.length,
+          afterWindowCount: activeRefreshedSelection.prioritizedWindowCount,
+          afterPatternCount: activeRefreshedSelection.prioritizedWindowCount,
+          finalCandidatesCount: activeRefreshedSelection.prioritizedWindowCount
+        },
+        attemptedSlugs: activeAttemptedSlugs,
         fallbackUsed: "window"
       };
     }
@@ -4391,18 +6054,32 @@ export class PolymarketEngine {
       selectedWindowEnd: null,
       selectedAcceptingOrders: null,
       selectedEnableOrderBook: null,
+      selectedTokenId: null,
+      chosenSide: null,
+      chosenDirection: null,
+      selectedBookable: false,
+      selectedTradable: false,
+      discoveredCurrent,
+      discoveredNext,
+      selectionSource: null,
+      liveValidationReason: dominantReject,
+      lastBookTs: null,
+      lastQuoteTs: null,
+      currentBucketSlug: currentBucket.currentSlug,
+      nextBucketSlug: currentBucket.nextSlug,
+      currentBucketStartSec: currentBucket.currentBucketStartSec,
       selectedReason: "btc5m_not_found",
-      dominantReject: "BTC5M_NOT_FOUND",
+      dominantReject,
       stageCounts: {
         fetchedCount: discoveredRows.length,
         afterActiveCount: discoveredRows.length,
         afterSearchCount: discoveredRows.length,
-        afterWindowCount: prioritizedWindowCount,
-        afterPatternCount: prioritizedWindowCount,
-        finalCandidatesCount: prioritizedWindowCount
+        afterWindowCount: 0,
+        afterPatternCount: 0,
+        finalCandidatesCount: 0
       },
       attemptedSlugs,
-      fallbackUsed: "topActive"
+      fallbackUsed: shouldFallbackToBroadDiscovery ? "topActive" : "none"
     };
   }
 
@@ -4987,11 +6664,30 @@ export class PolymarketEngine {
     let selectedWindowEnd: number | null = null;
     let selectedAcceptingOrders: boolean | null = null;
     let selectedEnableOrderBook: boolean | null = null;
+    let selectedCommittedTokenId: string | null = null;
+    let selectedBookable = false;
+    let selectedTradable = false;
+    let discoveredCurrent = false;
+    let discoveredNext = false;
+    let selectionSource: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null = null;
+    let selectedFrom: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null = null;
+    let selectionCommitTs: number | null = null;
+    let liveValidationReason: string | null = null;
+    let lastBookTs: number | null = null;
+    let lastQuoteTs: number | null = null;
+    let currentBucketSlug: string | null = null;
+    let nextBucketSlug: string | null = null;
+    let currentBucketStartSec: number | null = null;
     let selectedReason: string | null = "btc5m_slug_event";
     let selectedScore: number | null = null;
     let selectedChosenSide: "YES" | "NO" | null = null;
     let selectedChosenDirection: string | null = null;
     let selectedExecutionBlockedReason: string | null = null;
+    let validatedLiveMarket: BtcWindowMarket | null = null;
+    let validatedLiveTokenId: string | null = null;
+    let validatedLiveChosenSide: "YES" | "NO" | null = null;
+    let validatedLiveChosenDirection: string | null = null;
+    let validatedLiveValidationReason: string | null = null;
     const getSelectedRemainingSec = (): number | null =>
       Number(selectedWindowEnd || 0) > nowTs ? Math.max(0, Math.floor((Number(selectedWindowEnd) - nowTs) / 1000)) : null;
     let dominantReject: string | null = deterministicBtc5mMode ? "BTC5M_NOT_FOUND" : "OK";
@@ -5015,9 +6711,46 @@ export class PolymarketEngine {
       selectedWindowEnd = deterministicSelection.selectedWindowEnd;
       selectedAcceptingOrders = deterministicSelection.selectedAcceptingOrders;
       selectedEnableOrderBook = deterministicSelection.selectedEnableOrderBook;
+      selectedCommittedTokenId = deterministicSelection.selectedTokenId;
+      selectedChosenSide = deterministicSelection.chosenSide;
+      selectedChosenDirection = deterministicSelection.chosenDirection;
+      selectedBookable = deterministicSelection.selectedBookable;
+      selectedTradable = deterministicSelection.selectedTradable;
+      discoveredCurrent = deterministicSelection.discoveredCurrent;
+      discoveredNext = deterministicSelection.discoveredNext;
+      selectionSource = deterministicSelection.selectionSource;
+      selectedFrom = deterministicSelection.selectionSource;
+      liveValidationReason = deterministicSelection.liveValidationReason;
+      lastBookTs = deterministicSelection.lastBookTs;
+      lastQuoteTs = deterministicSelection.lastQuoteTs;
+      currentBucketSlug = deterministicSelection.currentBucketSlug;
+      nextBucketSlug = deterministicSelection.nextBucketSlug;
+      currentBucketStartSec = deterministicSelection.currentBucketStartSec;
       selectedReason = deterministicSelection.selectedReason;
       dominantReject = deterministicSelection.dominantReject;
       stageCounts = deterministicSelection.stageCounts;
+      const validationReasonUpper = String(liveValidationReason || "").trim().toUpperCase();
+      if (selectedTradable && validationReasonUpper.startsWith("TRADABLE_")) {
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          staleState: null
+        };
+      } else if (validationReasonUpper === "REFRESH_FAILED_ACTIVE_MARKET") {
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          staleState: "ACTIVE_MARKET_REFRESH_FAILED"
+        };
+      } else if (
+        validationReasonUpper === "PRICE_REFRESH_FAILED_ACTIVE_MARKET" ||
+        validationReasonUpper === "TRANSIENT_QUOTE_FAILURE" ||
+        validationReasonUpper === "QUOTE_FAILURE" ||
+        validationReasonUpper === "EMPTY_LIVE_QUOTE"
+      ) {
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          staleState: "ACTIVE_MARKET_PRICE_STALE"
+        };
+      }
       markets = selectedMarket ? [selectedMarket] : [];
       this.selectedTokenIds = selectedMarket
         ? [selectedMarket.yesTokenId, selectedMarket.noTokenId].filter(Boolean) as string[]
@@ -5029,7 +6762,26 @@ export class PolymarketEngine {
           (Number.isFinite(Number(selectedMarket.startTs)) && Number(selectedMarket.startTs) > 0
             ? Math.floor(Number(selectedMarket.startTs) / 1000)
             : null);
-        this.commitLiveSelectedMarket(selectedMarket, nowTs, { selectedReason });
+        this.commitLiveSelectedMarket(selectedMarket, nowTs, {
+          selectedReason,
+          chosenSide: selectedChosenSide,
+          chosenDirection: selectedChosenDirection,
+          selectedTokenId: selectedCommittedTokenId,
+          selectedBookable,
+          selectedTradable,
+          discoveredCurrent,
+          discoveredNext,
+          selectionSource: selectionSource ?? "current_slug",
+          selectedFrom: selectedFrom ?? selectionSource ?? "current_slug",
+          selectionCommitTs: nowTs,
+          candidateRefreshed: true,
+          liveValidationReason,
+          lastBookTs,
+          lastQuoteTs,
+          currentBucketSlug,
+          nextBucketSlug,
+          currentBucketStartSec
+        });
         this.maybeLogSelectorDiagnostic("info", "POLY_BTC5M_SELECTED", {
           nowSec: currentBucket.nowSec,
           currentBucketStartSec: currentBucket.currentBucketStartSec,
@@ -5050,12 +6802,70 @@ export class PolymarketEngine {
           marketId: selectedMarket.marketId,
           selectedReason
         });
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          selectedTokenId: selectedCommittedTokenId,
+          selectedBookable,
+          selectedTradable,
+          discoveredCurrent,
+          discoveredNext,
+          selectionSource,
+          selectedFrom: selectedFrom ?? selectionSource,
+          selectionCommitTs: nowTs,
+          liveValidationReason,
+          lastBookTs,
+          lastQuoteTs,
+          currentBucketSlug,
+          nextBucketSlug,
+          currentBucketStartSec,
+          selectedWindowStartSec:
+            Number.isFinite(Number(selectedWindowStart)) && Number(selectedWindowStart) > 0
+              ? Math.floor(Number(selectedWindowStart) / 1000)
+              : null,
+          selectedWindowEndSec:
+            Number.isFinite(Number(selectedWindowEnd)) && Number(selectedWindowEnd) > 0
+              ? Math.floor(Number(selectedWindowEnd) / 1000)
+              : null
+        };
       } else {
-        const activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+        const currentBucket = this.getFreshBtc5mWallClockBucket();
+        let activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+        const activeSelectionBucketStartSec = this.getLiveSelectionCadenceStartSec(activeCommittedSelection);
+        const liveValidationReasonText = String(liveValidationReason || "").trim().toUpperCase();
+        if (
+          activeCommittedSelection &&
+          (activeSelectionBucketStartSec !== null &&
+            activeSelectionBucketStartSec < currentBucket.currentBucketStartSec)
+        ) {
+          this.clearLiveCommittedSelection(nowTs, "NON_CURRENT_CADENCE_BUCKET");
+          activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+        }
+        if (
+          activeCommittedSelection &&
+          (liveValidationReasonText === "EXPIRED_WINDOW" ||
+            liveValidationReasonText === "REMAINING_BELOW_THRESHOLD")
+        ) {
+          this.demoteLiveSelection(liveValidationReasonText, nowTs);
+          activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+        }
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          selectedBookable: false,
+          selectedTradable: false,
+          discoveredCurrent,
+          discoveredNext,
+          selectionSource,
+          selectedFrom: selectedFrom ?? selectionSource,
+          liveValidationReason,
+          lastBookTs,
+          lastQuoteTs,
+          currentBucketSlug,
+          nextBucketSlug,
+          currentBucketStartSec
+        };
         if (!activeCommittedSelection) {
           this.selectedTokenIds = [];
         }
-        const currentBucket = this.getFreshBtc5mWallClockBucket();
         const selectedBucketStartSec = this.getLiveSelectionCadenceStartSec(activeCommittedSelection);
         this.maybeLogSelectorDiagnostic("warn", "POLY_BTC5M_NOT_FOUND", {
           nowSec: currentBucket.nowSec,
@@ -5086,6 +6896,13 @@ export class PolymarketEngine {
       };
     }
     const discoveredCandidates = stageCounts.fetchedCount;
+    if (
+      deterministicBtc5mMode &&
+      stageCounts.afterWindowCount <= 0 &&
+      (dominantReject === null || dominantReject === "BTC5M_NOT_FOUND")
+    ) {
+      dominantReject = "NO_ACTIVE_WINDOWS";
+    }
     const effectiveMinWindowSec = sniperMinRemainingSec;
     const effectiveMaxWindowSec = sniperMaxRemainingSec;
     const windowRejectCounters = createWindowRejectCounters();
@@ -5103,7 +6920,7 @@ export class PolymarketEngine {
       ? [
           {
             marketId: selectedMarket.marketId,
-            slug: selectedMarket.eventSlug || selectedMarket.slug || selectedMarket.marketId,
+            slug: this.getMarketDeterministicSlug(selectedMarket) || selectedMarket.marketId,
             windowStartField: "startTs",
             windowStartParseNote: "milliseconds",
             windowStartRaw: String(selectedMarket.startTs || ""),
@@ -5121,16 +6938,164 @@ export class PolymarketEngine {
     this.polyState.fetchedCount = stageCounts.fetchedCount;
     this.polyState.afterWindowCount = stageCounts.afterWindowCount;
     this.polyState.finalCandidatesCount = stageCounts.finalCandidatesCount;
-    const activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+    let activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
     if (activeCommittedSelection) {
       selectedSlug = activeCommittedSelection.selectedSlug;
       selectedWindowStart = activeCommittedSelection.windowStartTs;
       selectedWindowEnd = activeCommittedSelection.windowEndTs;
       selectedAcceptingOrders = activeCommittedSelection.acceptingOrders;
       selectedEnableOrderBook = activeCommittedSelection.enableOrderBook;
+      selectedCommittedTokenId = activeCommittedSelection.selectedTokenId;
+      selectedBookable = activeCommittedSelection.selectedBookable;
+      selectedTradable = activeCommittedSelection.selectedTradable;
+      discoveredCurrent = activeCommittedSelection.discoveredCurrent;
+      discoveredNext = activeCommittedSelection.discoveredNext;
+      selectionSource = activeCommittedSelection.selectionSource;
+      selectedFrom = activeCommittedSelection.selectedFrom;
+      selectionCommitTs = activeCommittedSelection.selectionCommitTs;
+      liveValidationReason = activeCommittedSelection.liveValidationReason;
+      lastBookTs = activeCommittedSelection.lastBookTs;
+      lastQuoteTs = activeCommittedSelection.lastQuoteTs;
+      currentBucketSlug = activeCommittedSelection.currentBucketSlug;
+      nextBucketSlug = activeCommittedSelection.nextBucketSlug;
+      currentBucketStartSec = activeCommittedSelection.currentBucketStartSec;
       selectedChosenSide = activeCommittedSelection.chosenSide;
       selectedChosenDirection = activeCommittedSelection.chosenDirection;
       selectedExecutionBlockedReason = activeCommittedSelection.executionBlockedReason;
+    }
+    let selectionCommitInvariantBroken =
+      this.config.polymarket.mode === "live" &&
+      (stageCounts.afterWindowCount > 0 || stageCounts.finalCandidatesCount > 0) &&
+      !(activeCommittedSelection && (activeCommittedSelection.selectedSlug || activeCommittedSelection.selectedMarketId));
+    if (selectionCommitInvariantBroken) {
+      const recoverMarket = selectedMarket ?? validatedLiveMarket;
+      const recoverTokenId = selectedCommittedTokenId ?? validatedLiveTokenId;
+      const recoverChosenSide = selectedChosenSide ?? validatedLiveChosenSide;
+      const recoverChosenDirection = selectedChosenDirection ?? validatedLiveChosenDirection;
+      const recoverLiveValidationReason = liveValidationReason ?? validatedLiveValidationReason;
+      const recoverReasonUpper = String(recoverLiveValidationReason || "").trim().toUpperCase();
+      const recoverableValidation =
+        recoverReasonUpper.startsWith("TRADABLE_") ||
+        recoverReasonUpper === "PREORDER_VALIDATED" ||
+        recoverReasonUpper === "TRADABLE_CURRENT_SLUG";
+      const recoverMarketSlug = recoverMarket ? this.getMarketDeterministicSlug(recoverMarket) : null;
+      const recoverBucketClass = recoverMarket
+        ? this.classifyDeterministicWindowFromSlugOrStart(
+            recoverMarketSlug,
+            this.getCanonicalBtc5mTimingFromSlugOrRow({
+              slug: recoverMarketSlug,
+              rowStartTs: recoverMarket.startTs ?? null,
+              rowEndTs: recoverMarket.endTs ?? null
+            }).startSec
+          )
+        : "other";
+      const recoverIsCurrentOrNext = recoverBucketClass === "current" || recoverBucketClass === "next";
+      const derivedRecoverTokenId =
+        recoverTokenId ??
+        (recoverChosenSide === "NO"
+          ? String(recoverMarket?.noTokenId || "").trim() || null
+          : String(recoverMarket?.yesTokenId || "").trim() || null);
+      if (
+        recoverMarket &&
+        derivedRecoverTokenId &&
+        (selectedTradable || recoverableValidation || recoverIsCurrentOrNext)
+      ) {
+        const recoveredSelection = this.recoverLiveSelectionFromValidatedMarket({
+          nowTs,
+          market: recoverMarket,
+          selectedTokenId: derivedRecoverTokenId,
+          chosenSide: recoverChosenSide,
+          chosenDirection: recoverChosenDirection,
+          selectionSource:
+            selectionSource && selectionSource !== "committed"
+              ? selectionSource
+              : this.inferSelectionSourceFromStartSec(
+                  this.getCanonicalBtc5mTimingFromSlugOrRow({
+                    slug: this.getMarketDeterministicSlug(recoverMarket),
+                    rowStartTs: recoverMarket.startTs ?? null,
+                    rowEndTs: recoverMarket.endTs ?? null
+                  }).startSec
+                ),
+          liveValidationReason: recoverLiveValidationReason || "tradable_current_slug",
+          logRecovery: true
+        });
+        if (recoveredSelection) {
+          activeCommittedSelection = recoveredSelection;
+          selectedSlug = recoveredSelection.selectedSlug;
+          selectedWindowStart = recoveredSelection.windowStartTs;
+          selectedWindowEnd = recoveredSelection.windowEndTs;
+          selectedAcceptingOrders = recoveredSelection.acceptingOrders;
+          selectedEnableOrderBook = recoveredSelection.enableOrderBook;
+          selectedCommittedTokenId = recoveredSelection.selectedTokenId;
+          selectedBookable = recoveredSelection.selectedBookable;
+          selectedTradable = recoveredSelection.selectedTradable;
+          discoveredCurrent = recoveredSelection.discoveredCurrent;
+          discoveredNext = recoveredSelection.discoveredNext;
+          selectionSource = recoveredSelection.selectionSource;
+          selectedFrom = recoveredSelection.selectedFrom;
+          selectionCommitTs = recoveredSelection.selectionCommitTs;
+          liveValidationReason = recoveredSelection.liveValidationReason;
+          lastBookTs = recoveredSelection.lastBookTs;
+          lastQuoteTs = recoveredSelection.lastQuoteTs;
+          currentBucketSlug = recoveredSelection.currentBucketSlug;
+          nextBucketSlug = recoveredSelection.nextBucketSlug;
+          currentBucketStartSec = recoveredSelection.currentBucketStartSec;
+          selectedChosenSide = recoveredSelection.chosenSide;
+          selectedChosenDirection = recoveredSelection.chosenDirection;
+          selectedExecutionBlockedReason = recoveredSelection.executionBlockedReason;
+          selectionCommitInvariantBroken = false;
+        }
+      }
+    }
+    if (selectionCommitInvariantBroken) {
+      const selectorInvariantReason = "SELECTION_NOT_COMMITTED";
+      const priorLiveValidationReason = liveValidationReason;
+      dominantReject = selectorInvariantReason;
+      liveValidationReason = priorLiveValidationReason || selectorInvariantReason;
+      selectedExecutionBlockedReason = selectorInvariantReason;
+      selectedMarket = null;
+      markets = [];
+      selectedSlug = null;
+      selectedWindowStart = null;
+      selectedWindowEnd = null;
+      selectedAcceptingOrders = null;
+      selectedEnableOrderBook = null;
+      selectedCommittedTokenId = null;
+      selectedChosenSide = null;
+      selectedChosenDirection = null;
+      selectedBookable = false;
+      selectedTradable = false;
+      this.selectedTokenIds = [];
+      this.persistedPolymarketSnapshot = {
+        ...this.persistedPolymarketSnapshot,
+        status: selectorInvariantReason,
+        holdReason: selectorInvariantReason,
+        executionBlockedReason: selectorInvariantReason,
+        liveValidationReason,
+        selectedSlug: null,
+        selectedMarketId: null,
+        selectedTokenId: null,
+        selectedBookable: false,
+        selectedTradable: false,
+        discoveredCurrent: false,
+        discoveredNext: false,
+        selectedFrom: null,
+        selectionCommitTs: null,
+        pollMode: "VERY_FAST",
+        lastDecisionTs: nowTs
+      };
+      this.emitSelectionBugLine({
+        currentBucketSlug,
+        nextBucketSlug,
+        fetchedCount: stageCounts.fetchedCount,
+        afterWindowCount: stageCounts.afterWindowCount,
+        finalCandidatesCount: stageCounts.finalCandidatesCount,
+        selectedSlug: activeCommittedSelection?.selectedSlug ?? null,
+        selectedTokenId: activeCommittedSelection?.selectedTokenId ?? null,
+        liveValidationReason: priorLiveValidationReason || liveValidationReason,
+        attemptedSlugs: deterministicAttemptedSlugs
+      });
+      activeCommittedSelection = null;
     }
     this.polyState.selectedSlug = selectedSlug ?? null;
     this.polyState.selectedMarketId =
@@ -5356,6 +7321,10 @@ export class PolymarketEngine {
               : hydratedMarkets.length === 0
               ? this.paperLedger.getOpenTrades().length > 0
                 ? "AWAITING_RESOLUTION"
+                : dominantReject === "SELECTION_NOT_COMMITTED"
+                  ? "SELECTION_NOT_COMMITTED"
+                  : dominantReject === "NO_ACTIVE_WINDOWS"
+                    ? "NO_ACTIVE_WINDOWS"
                 : dominantReject === "EXPIRED_WINDOW"
                   ? "EXPIRED_WINDOW"
                   : dominantReject === "BTC5M_NOT_FOUND"
@@ -5493,7 +7462,6 @@ export class PolymarketEngine {
         slug: market?.eventSlug || market?.slug
       });
     };
-
     for (const market of hydratedMarkets) {
       const marketEndMs = toMs(market.endTs);
       const tauSec = Math.max(0, Math.floor((marketEndMs - nowTs) / 1000));
@@ -5683,6 +7651,17 @@ export class PolymarketEngine {
       const costPenaltyProb = sharedDecision.costPenaltyProb;
       const chosenEdge = sharedDecision.chosenEdge;
       const netEdgeAfterCosts = sharedDecision.netEdgeAfterCosts;
+      const liveExecutionPenaltyProb =
+        !paperMode && this.config.polymarket.mode === "live"
+          ? Math.max(0, Number(this.config.polymarket.execution.takerPriceBuffer || 0)) / 10_000
+          : 0;
+      const netEdgeAfterExecutionBuffer = netEdgeAfterCosts - liveExecutionPenaltyProb;
+      const strategyWouldTradeAfterExecutionBuffer =
+        paperMode || this.config.polymarket.mode !== "live"
+          ? sharedDecision.paperWouldTrade
+          : sharedDecision.paperWouldTrade &&
+            netEdgeAfterExecutionBuffer >
+              Math.max(0, Number(this.config.polymarket.paper.minNetEdge || 0));
       const signedEdge = sharedDecision.signedEdge;
       const stalenessEdge = sharedDecision.stalenessEdge;
       const conviction = sharedDecision.conviction;
@@ -5788,10 +7767,35 @@ export class PolymarketEngine {
             remainingDailyLossBudget: this.risk.getRemainingDailyLossBudget()
           })
         : { notionalUsd: 0, shares: 0, kellyFraction: 0 };
+      const sizingCheck = this.evaluateOrderSizingCheck({
+        selectedSlug: market.eventSlug || market.slug || null,
+        selectedTokenId,
+        chosenSide: desiredSide,
+        orderPrice: desiredSide ? sidePrice : null,
+        requestedBudget: size.notionalUsd,
+        computedShares: size.shares
+      });
+      const desiredOrderNotionalUsd = sizingCheck.desiredNotional;
+      const finalOrderNotionalUsd = sizingCheck.finalNotional;
+      const finalOrderShares = sizingCheck.finalShares;
+      if (!paperMode) {
+        this.persistedPolymarketSnapshot = {
+          ...this.persistedPolymarketSnapshot,
+          minVenueShares: sizingCheck.minVenueShares,
+          desiredShares: sizingCheck.desiredShares,
+          finalShares: sizingCheck.finalShares,
+          desiredNotional: sizingCheck.desiredNotional,
+          finalNotional: sizingCheck.finalNotional,
+          sizeBumped: sizingCheck.sizeBumped
+        };
+      }
 
       let action = decisionAction;
-      let executedSize = size.notionalUsd;
-      let canAttemptTrade = sharedDecision.paperWouldTrade && size.notionalUsd > 0;
+      let executedSize = finalOrderNotionalUsd;
+      let canAttemptTrade =
+        strategyWouldTradeAfterExecutionBuffer &&
+        finalOrderNotionalUsd > 0 &&
+        finalOrderShares > 0;
       let blockReason = sharedDecision.blockedBy || "";
       let strategyBlock = sharedDecision.strategyBlock;
       let dataHealthBlock = sharedDecision.dataHealthBlock;
@@ -5809,14 +7813,39 @@ export class PolymarketEngine {
         }
       };
       const applyResultBlockReason = (reason: string): void => {
-        setBlocked(reason, classifyHoldCategory(reason));
+        const normalizedReason = this.normalizeLiveBlockReason(reason);
+        setBlocked(normalizedReason, classifyHoldCategory(normalizedReason));
+        if (!paperMode) {
+          this.persistedPolymarketSnapshot = {
+            ...this.persistedPolymarketSnapshot,
+            lastNormalizedError: normalizedReason
+          };
+        }
       };
 
-      if (sharedDecision.paperWouldTrade && !(size.notionalUsd > 0)) {
-        const notionalText = Number(size.notionalUsd || 0).toFixed(4);
-        const minNotionalText = Number(this.config.polymarket.sizing.minOrderNotional || 0).toFixed(4);
+      if (
+        !paperMode &&
+        canAttemptTrade &&
+        sizingCheck.sizeBumped &&
+        (finalOrderNotionalUsd > remainingWindowBudget + 1e-9 ||
+          finalOrderNotionalUsd > remainingExposureBudget + 1e-9)
+      ) {
+        applyResultBlockReason("ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED");
+      }
+
+      if (!paperMode && sharedDecision.paperWouldTrade && !strategyWouldTradeAfterExecutionBuffer) {
+        setBlocked("EDGE_BELOW_THRESHOLD_EXECUTION_BUFFER", "STRATEGY");
+      }
+
+      if (paperMode && sharedDecision.paperWouldTrade && !sizingCheck.passes) {
+        const notionalText = Number(finalOrderNotionalUsd || 0).toFixed(4);
+        const minNotionalText = Number(sizingCheck.minOrderNotional || 0).toFixed(4);
         setBlocked(
-          `SIZE_BELOW_MIN_NOTIONAL notionalUsd=${notionalText} minNotionalUsd=${minNotionalText}`,
+          `SIZE_BELOW_MIN_NOTIONAL effectiveNotionalUsd=${notionalText} minNotionalUsd=${minNotionalText} side=${String(
+            desiredSide || "-"
+          )} orderPrice=${sizingCheck.orderPrice > 0 ? sizingCheck.orderPrice.toFixed(4) : "-"} shares=${sizingCheck.finalShares.toFixed(
+            6
+          )}`,
           "RISK"
         );
       }
@@ -5851,14 +7880,27 @@ export class PolymarketEngine {
       }
       if (!paperMode) {
         if (yesPriceFetchFailed || noPriceFetchFailed) {
-          setBlocked("PRICE_FETCH_FAILED", "DATA_HEALTH");
-          selectedExecutionBlockedReason = "PRICE_FETCH_FAILED";
+          const activeSelectionForMarket =
+            Boolean(selectedMarket?.marketId === market.marketId) &&
+            Boolean(this.getActiveLiveCommittedSelection(nowTs));
+          const livePriceRefreshReason = activeSelectionForMarket
+            ? "PRICE_REFRESH_FAILED_ACTIVE_MARKET"
+            : "PRICE_FETCH_FAILED";
+          setBlocked(livePriceRefreshReason, "DATA_HEALTH");
+          selectedExecutionBlockedReason = livePriceRefreshReason;
+          this.persistedPolymarketSnapshot = {
+            ...this.persistedPolymarketSnapshot,
+            staleState: activeSelectionForMarket ? "ACTIVE_MARKET_PRICE_STALE" : this.persistedPolymarketSnapshot.staleState,
+            liveValidationReason: activeSelectionForMarket
+              ? "PRICE_REFRESH_FAILED_ACTIVE_MARKET"
+              : this.persistedPolymarketSnapshot.liveValidationReason
+          };
           if (selectedMarket?.marketId === market.marketId) {
             this.markReadPathWarning("NETWORK_ERROR");
             this.persistLiveCommittedSelectionStatus(nowTs, {
               chosenSide,
               chosenDirection,
-              holdReason: "PRICE_FETCH_FAILED",
+              holdReason: livePriceRefreshReason,
               warningState: "NETWORK_ERROR"
             });
           }
@@ -5930,7 +7972,7 @@ export class PolymarketEngine {
             this.logger.warn(
               {
                 marketId: market.marketId,
-                slug: market.eventSlug || market.slug || null,
+                slug: this.getMarketDeterministicSlug(market),
                 oracleState,
                 oracleSource,
                 oracleTs,
@@ -5943,7 +7985,7 @@ export class PolymarketEngine {
           const check = this.risk.checkNewOrder({
             tauSec,
             oracleAgeMs,
-            projectedOrderNotionalUsd: size.notionalUsd,
+            projectedOrderNotionalUsd: finalOrderNotionalUsd,
             openOrders: openOrderCount,
             totalExposureUsd,
             concurrentWindows
@@ -5959,7 +8001,11 @@ export class PolymarketEngine {
             ) {
               await this.execution.cancelAll(check.reason);
             }
-            applyResultBlockReason(check.reason || "RISK_BLOCKED");
+            if (!paperMode && sizingCheck.sizeBumped && finalOrderNotionalUsd > desiredOrderNotionalUsd) {
+              applyResultBlockReason("ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED");
+            } else {
+              applyResultBlockReason(check.reason || "RISK_BLOCKED");
+            }
           } else if (paperMode) {
             const accepted = this.executePaperTrade({
               marketId: market.marketId,
@@ -5978,17 +8024,17 @@ export class PolymarketEngine {
               pBoosted: calibrated.pBoosted,
               boostApplied: calibrated.boostApplied,
               boostReason: calibrated.boostReason,
-              requestedNotionalUsd: size.notionalUsd,
+              requestedNotionalUsd: finalOrderNotionalUsd,
               ts: nowTs
             });
             action = accepted ? (decisionAction === "BUY_NO" ? "BUY_NO" : "BUY_YES") : "HOLD";
-            executedSize = accepted ? size.notionalUsd : 0;
+            executedSize = accepted ? finalOrderNotionalUsd : 0;
             if (!accepted) {
               applyResultBlockReason("PAPER_TRADE_REJECTED");
             }
-          } else if (decisionAction === "BUY_NO") {
-            setBlocked("LIVE_NO_SIDE_DISABLED", "STRATEGY");
-          } else {
+        } else if (decisionAction === "BUY_NO") {
+          setBlocked("LIVE_NO_SIDE_DISABLED", "STRATEGY");
+        } else {
             const preorder = await this.validateLiveExecutionCandidate({
               nowTs,
               market,
@@ -5997,9 +8043,22 @@ export class PolymarketEngine {
             selectedTokenId = preorder.selectedTokenId ?? selectedTokenId;
             candidateRefreshed = preorder.candidateRefreshed;
             if (!preorder.valid || !preorder.refreshedMarket || !preorder.selectedTokenId) {
-              const preorderReason = `PREORDER_${String(preorder.reason || "discovery_failed").toUpperCase()}`;
+              const preorderReason =
+                preorder.reason === "token_not_bookable" &&
+                this.persistedPolymarketSnapshot.liveValidationReason === "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+                  ? "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+                  : preorder.reason === "discovery_failed"
+                    ? "REFRESH_FAILED_ACTIVE_MARKET"
+                  : `PREORDER_${String(preorder.reason || "discovery_failed").toUpperCase()}`;
               setBlocked(preorderReason, classifyHoldCategory(preorderReason));
               selectedExecutionBlockedReason = preorderReason;
+              if (preorderReason === "REFRESH_FAILED_ACTIVE_MARKET") {
+                this.persistedPolymarketSnapshot = {
+                  ...this.persistedPolymarketSnapshot,
+                  staleState: "ACTIVE_MARKET_REFRESH_FAILED",
+                  liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
+                };
+              }
               if (
                 preorder.reason === "stale_market_selection" ||
                 preorder.reason === "stale_token_ids" ||
@@ -6016,22 +8075,104 @@ export class PolymarketEngine {
                   warningState: this.runtimeWarningState ?? null
                 });
               }
-              this.clearLiveCommittedSelection(nowTs, preorderReason);
+              if (preorder.reason === "token_not_bookable") {
+                if (this.liveCommittedSelection) {
+                  this.liveCommittedSelection = {
+                    ...this.liveCommittedSelection,
+                    selectedTokenId: null,
+                    selectedBookable: false,
+                    selectedTradable: false,
+                    liveValidationReason: this.persistedPolymarketSnapshot.liveValidationReason || preorderReason,
+                    holdReason: normalizeHoldReason("SIDE_NOT_BOOKABLE"),
+                    executionBlockedReason: "SIDE_NOT_BOOKABLE",
+                    executionBlockedSide: chosenSide === "NO" ? "NO" : "YES"
+                  };
+                  this.syncPersistedLiveSelectionState(nowTs);
+                }
+              } else if (
+                preorder.reason === "stale_market_selection" ||
+                preorder.reason === "expired_window" ||
+                preorder.reason === "market_closed" ||
+                preorder.reason === "market_archived"
+              ) {
+                this.demoteLiveSelection(preorder.reason, Date.now());
+              } else {
+                this.clearLiveCommittedSelection(nowTs, preorderReason);
+              }
             } else {
               const freshMarket = preorder.refreshedMarket;
               this.selectedTokenIds = [freshMarket.yesTokenId, freshMarket.noTokenId].filter(Boolean) as string[];
-              const result = await this.execution.executeBuyYes({
-                marketId: freshMarket.marketId,
-                tokenId: preorder.selectedTokenId,
-                yesAsk: decision.yesAsk,
-                notionalUsd: size.notionalUsd,
-                tickSize: freshMarket.tickSize,
-                negRisk: freshMarket.negRisk
+              validatedLiveMarket = freshMarket;
+              validatedLiveTokenId = preorder.selectedTokenId;
+              validatedLiveChosenSide = "YES";
+              validatedLiveChosenDirection = chosenDirection;
+              validatedLiveValidationReason = "preorder_validated";
+              const recoveredSelection = this.recoverLiveSelectionFromValidatedMarket({
+                nowTs,
+                market: freshMarket,
+                selectedTokenId: preorder.selectedTokenId,
+                chosenSide: "YES",
+                chosenDirection,
+                selectionSource:
+                  selectionSource && selectionSource !== "committed"
+                    ? selectionSource
+                    : this.inferSelectionSourceFromStartSec(
+                        this.getCanonicalBtc5mTimingFromSlugOrRow({
+                          slug: this.getMarketDeterministicSlug(freshMarket),
+                          rowStartTs: freshMarket.startTs ?? null,
+                          rowEndTs: freshMarket.endTs ?? null
+                        }).startSec
+                      ),
+                liveValidationReason: "preorder_validated",
+                logRecovery: !this.getActiveLiveCommittedSelection(nowTs)
               });
-              action = result.accepted ? "BUY_YES" : "HOLD";
-              executedSize = result.accepted ? size.notionalUsd : 0;
-              if (!result.accepted) {
-                applyResultBlockReason(result.reason || "LIVE_REJECTED");
+              if (recoveredSelection) {
+                selectedSlug = recoveredSelection.selectedSlug;
+                selectedWindowStart = recoveredSelection.windowStartTs;
+                selectedWindowEnd = recoveredSelection.windowEndTs;
+                selectedCommittedTokenId = recoveredSelection.selectedTokenId;
+                selectedBookable = recoveredSelection.selectedBookable;
+                selectedTradable = recoveredSelection.selectedTradable;
+                selectionSource = recoveredSelection.selectionSource;
+                liveValidationReason = recoveredSelection.liveValidationReason;
+                selectedChosenSide = recoveredSelection.chosenSide;
+                selectedChosenDirection = recoveredSelection.chosenDirection;
+              }
+              const executionYesBook = await this.getImpliedYesBook(freshMarket, {
+                isSelectedMarket: true,
+                remainingSec: preorder.remainingSec ?? remainingSec
+              });
+              const executableYesAsk =
+                executionYesBook.bookable && Number.isFinite(Number(executionYesBook.yesAsk)) && Number(executionYesBook.yesAsk) > 0
+                  ? clamp(Number(executionYesBook.yesAsk), 0.0001, 0.9999)
+                  : null;
+              if (executableYesAsk === null) {
+                setBlocked("SIDE_NOT_BOOKABLE", "DATA_HEALTH");
+                selectedExecutionBlockedReason = "SIDE_NOT_BOOKABLE";
+                this.markLiveSelectedMarketExecutionBlocked({
+                  market: freshMarket,
+                  nowTs,
+                  side: "YES",
+                  reason: executionYesBook.source === "missing" ? "MISSING_ORDERBOOK" : "SIDE_NOT_BOOKABLE",
+                  source: executionYesBook.source,
+                  tokenId: preorder.selectedTokenId
+                });
+                action = "HOLD";
+                executedSize = 0;
+              } else {
+                const result = await this.execution.executeBuyYes({
+                  marketId: freshMarket.marketId,
+                  tokenId: preorder.selectedTokenId,
+                  yesAsk: executableYesAsk,
+                  notionalUsd: finalOrderNotionalUsd,
+                  tickSize: freshMarket.tickSize,
+                  negRisk: freshMarket.negRisk
+                });
+                action = result.accepted ? "BUY_YES" : "HOLD";
+                executedSize = result.accepted ? finalOrderNotionalUsd : 0;
+                if (!result.accepted) {
+                  applyResultBlockReason(result.reason || "LIVE_REJECTED");
+                }
               }
             }
           }
@@ -6042,17 +8183,58 @@ export class PolymarketEngine {
       }
       if (action === "HOLD" && !blockReason) {
         if (strategyBlock || dataHealthBlock) {
-          blockReason = dataHealthBlock || strategyBlock || "HOLD_UNSPECIFIED";
-        } else if (!(size.notionalUsd > 0)) {
-          const notionalText = Number(size.notionalUsd || 0).toFixed(4);
-          const minNotionalText = Number(this.config.polymarket.sizing.minOrderNotional || 0).toFixed(4);
-          blockReason = `SIZE_BELOW_MIN_NOTIONAL notionalUsd=${notionalText} minNotionalUsd=${minNotionalText}`;
+          blockReason = dataHealthBlock || strategyBlock || "EDGE_BELOW_THRESHOLD";
+        } else if (paperMode && !sizingCheck.passes) {
+          const notionalText = Number(finalOrderNotionalUsd || 0).toFixed(4);
+          const minNotionalText = Number(sizingCheck.minOrderNotional || 0).toFixed(4);
+          blockReason = `SIZE_BELOW_MIN_NOTIONAL effectiveNotionalUsd=${notionalText} minNotionalUsd=${minNotionalText}`;
           strategyBlock = blockReason;
           blockedCategory = "RISK";
         } else {
-          blockReason = "HOLD_UNSPECIFIED";
-          strategyBlock = "HOLD_UNSPECIFIED";
-          blockedCategory = "STRATEGY";
+          const liveValidationUpper = String(liveValidationReason || "").trim().toUpperCase();
+          const normalizedSelectedBlock =
+            normalizeHoldReason(selectedExecutionBlockedReason || this.persistedPolymarketSnapshot.executionBlockedReason || "") || null;
+          if (
+            !paperMode &&
+            (liveValidationUpper === "PRICE_REFRESH_FAILED_ACTIVE_MARKET" ||
+              liveValidationUpper === "QUOTE_FAILURE" ||
+              liveValidationUpper === "TRANSIENT_QUOTE_FAILURE" ||
+              liveValidationUpper === "EMPTY_LIVE_QUOTE" ||
+              this.persistedPolymarketSnapshot.staleState === "ACTIVE_MARKET_PRICE_STALE")
+          ) {
+            blockReason = "PRICE_FETCH_FAILED";
+          } else if (
+            !paperMode &&
+            (liveValidationUpper === "REFRESH_FAILED_ACTIVE_MARKET" ||
+              this.persistedPolymarketSnapshot.staleState === "ACTIVE_MARKET_REFRESH_FAILED")
+          ) {
+            blockReason = "ACTIVE_MARKET_REFRESH_FAILED";
+          } else if (normalizedSelectedBlock) {
+            blockReason = normalizedSelectedBlock;
+          } else if (!paperMode && remainingSec <= this.getLiveEntryMinRemainingSec()) {
+            blockReason = "TOO_LATE_FOR_ENTRY";
+          } else if (!paperMode && (!selectedTokenId || !selectedBookable || !selectedTradable)) {
+            blockReason = "SIDE_NOT_BOOKABLE";
+          } else if (!paperMode && this.execution.getPositions().some((position) => position.marketId === market.marketId)) {
+            blockReason = "EXIT_NOT_TRIGGERED";
+          } else {
+            blockReason = "EDGE_BELOW_THRESHOLD";
+          }
+          const normalizedBlockReason = normalizeHoldReason(blockReason) || "EDGE_BELOW_THRESHOLD";
+          blockReason = normalizedBlockReason;
+          blockedCategory =
+            normalizedBlockReason === "SIDE_NOT_BOOKABLE" ||
+            normalizedBlockReason === "ACTIVE_MARKET_REFRESH_FAILED" ||
+            normalizedBlockReason === "PRICE_FETCH_FAILED"
+              ? "DATA_HEALTH"
+              : normalizedBlockReason === "SIZE_BELOW_MIN_NOTIONAL"
+                ? "RISK"
+                : "STRATEGY";
+          if (blockedCategory === "DATA_HEALTH") {
+            dataHealthBlock = normalizedBlockReason;
+          } else {
+            strategyBlock = normalizedBlockReason;
+          }
         }
       }
       if (action === "HOLD" && blockReason) {
@@ -6111,7 +8293,61 @@ export class PolymarketEngine {
         blockedCategory: action === "HOLD" ? blockedCategory : null,
         strategyBlock: action === "HOLD" ? strategyBlock : null,
         dataHealthBlock: action === "HOLD" ? dataHealthBlock : null,
+        staleState:
+          action === "HOLD" &&
+          (blockReason === "REFRESH_FAILED_ACTIVE_MARKET" ||
+            String(liveValidationReason || "").trim().toUpperCase() === "REFRESH_FAILED_ACTIVE_MARKET")
+            ? "ACTIVE_MARKET_REFRESH_FAILED"
+            : action === "HOLD" &&
+                (blockReason === "PRICE_REFRESH_FAILED_ACTIVE_MARKET" ||
+                  blockReason === "PRICE_FETCH_FAILED_ACTIVE_MARKET" ||
+                  String(liveValidationReason || "").trim().toUpperCase() === "PRICE_REFRESH_FAILED_ACTIVE_MARKET")
+              ? "ACTIVE_MARKET_PRICE_STALE"
+              : null,
         selectedTokenId,
+        selectedBookable:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.selectedBookable
+            : selectedBookable,
+        selectedTradable:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.selectedTradable
+            : selectedTradable,
+        discoveredCurrent:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.discoveredCurrent
+            : discoveredCurrent,
+        discoveredNext:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.discoveredNext
+            : discoveredNext,
+        selectionSource:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.selectionSource
+            : selectionSource,
+        selectedFrom:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.selectedFrom
+            : selectedFrom,
+        selectionCommitTs:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.selectionCommitTs
+            : selectionCommitTs,
+        liveValidationReason:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.liveValidationReason
+            : liveValidationReason,
+        lastBookTs:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.lastBookTs
+            : lastBookTs,
+        lastQuoteTs:
+          selectedMarket?.marketId === market.marketId
+            ? this.persistedPolymarketSnapshot.lastQuoteTs
+            : lastQuoteTs,
+        currentBucketSlug,
+        nextBucketSlug,
+        currentBucketStartSec,
         candidateRefreshed,
         size: executedSize,
         openTrades: openTradesCount,
@@ -6135,7 +8371,7 @@ export class PolymarketEngine {
       this.writeDecisionLog({
         ts: new Date(nowTs).toISOString(),
         marketId: market.marketId,
-        slug: market.eventSlug || market.slug || selectedSlug || undefined,
+        slug: this.getMarketDeterministicSlug(market) || selectedSlug || undefined,
         selectedSlug: selectedSlug || null,
         candidatesCount: discoveredCandidates,
         windowsCount: stageCounts.afterWindowCount,
@@ -6204,14 +8440,52 @@ export class PolymarketEngine {
       tickLog.forceTradeFired = true;
       tickLog.forceTradeMode = forceTradeMode;
     }
+    let finalCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
+    if (this.config.polymarket.mode === "live") {
+      if (finalCommittedSelection) {
+        tickLog.currentMarketId = finalCommittedSelection.selectedMarketId;
+        tickLog.tauSec = finalCommittedSelection.remainingSec;
+        tickLog.selectedSlug = finalCommittedSelection.selectedSlug;
+        tickLog.windowStart = finalCommittedSelection.windowStartTs;
+        tickLog.windowEnd = finalCommittedSelection.windowEndTs;
+        tickLog.acceptingOrders = finalCommittedSelection.acceptingOrders;
+        tickLog.enableOrderBook = finalCommittedSelection.enableOrderBook;
+        tickLog.chosenSide = finalCommittedSelection.chosenSide;
+        tickLog.chosenDirection = finalCommittedSelection.chosenDirection;
+        tickLog.selectedTokenId = finalCommittedSelection.selectedTokenId;
+        tickLog.discoveredCurrent = finalCommittedSelection.discoveredCurrent;
+        tickLog.discoveredNext = finalCommittedSelection.discoveredNext;
+        tickLog.selectionSource = finalCommittedSelection.selectionSource;
+        tickLog.selectedFrom = finalCommittedSelection.selectedFrom;
+        tickLog.selectionCommitTs = finalCommittedSelection.selectionCommitTs;
+      } else if (
+        !this.persistedPolymarketSnapshot.selectedSlug &&
+        !this.persistedPolymarketSnapshot.selectedMarketId
+      ) {
+        tickLog.currentMarketId = null;
+        tickLog.tauSec = null;
+        tickLog.selectedSlug = null;
+        tickLog.windowStart = null;
+        tickLog.windowEnd = null;
+        tickLog.acceptingOrders = null;
+        tickLog.enableOrderBook = null;
+        tickLog.chosenSide = null;
+        tickLog.chosenDirection = null;
+        tickLog.selectedTokenId = null;
+      }
+    }
     if (!processedEvaluatedMarket) {
-      const finalCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
       tickLog.rejectCountsByStage = cloneRejectCountsByStage(rejectCountsByStage);
       tickLog.dominantReject = dominantReject;
       tickLog.sampleRejected = sampleRejected.slice(0, 5);
       tickLog.holdDetailReason = selectedExecutionBlockedReason ?? dominantReject;
       tickLog.selectedTokenId = this.persistedPolymarketSnapshot.selectedTokenId;
       tickLog.candidateRefreshed = this.persistedPolymarketSnapshot.candidateRefreshed;
+      tickLog.discoveredCurrent = this.persistedPolymarketSnapshot.discoveredCurrent;
+      tickLog.discoveredNext = this.persistedPolymarketSnapshot.discoveredNext;
+      tickLog.selectionSource = this.persistedPolymarketSnapshot.selectionSource;
+      tickLog.selectedFrom = this.persistedPolymarketSnapshot.selectedFrom;
+      tickLog.selectionCommitTs = this.persistedPolymarketSnapshot.selectionCommitTs;
       if (finalCommittedSelection) {
         tickLog.currentMarketId = finalCommittedSelection.selectedMarketId;
         tickLog.tauSec = finalCommittedSelection.remainingSec;
@@ -6228,6 +8502,93 @@ export class PolymarketEngine {
             : finalCommittedSelection.yesTokenId;
       }
       tickLog.holdReason = this.deriveCanonicalHoldReason(tickLog);
+      const unresolvedHoldReason = String(tickLog.holdDetailReason || tickLog.holdReason || "").trim().toUpperCase();
+      if (unresolvedHoldReason.includes("REFRESH_FAILED_ACTIVE_MARKET")) {
+        tickLog.staleState = "ACTIVE_MARKET_REFRESH_FAILED";
+      } else if (
+        unresolvedHoldReason.includes("PRICE_REFRESH_FAILED_ACTIVE_MARKET") ||
+        unresolvedHoldReason.includes("PRICE_FETCH_FAILED_ACTIVE_MARKET")
+      ) {
+        tickLog.staleState = "ACTIVE_MARKET_PRICE_STALE";
+      }
+    }
+    if (
+      this.config.polymarket.mode === "live" &&
+      (Number(tickLog.afterWindowCount || 0) > 0 || Number(tickLog.finalCandidatesCount || 0) > 0) &&
+      !tickLog.selectedSlug &&
+      !tickLog.currentMarketId
+    ) {
+      const recoveryValidationReason =
+        liveValidationReason ?? validatedLiveValidationReason ?? this.persistedPolymarketSnapshot.liveValidationReason;
+      const recoveryValidationUpper = String(recoveryValidationReason || "").trim().toUpperCase();
+      const canRecoverFromValidation =
+        recoveryValidationUpper.startsWith("TRADABLE_") || recoveryValidationUpper === "PREORDER_VALIDATED";
+      if (!finalCommittedSelection && canRecoverFromValidation) {
+        const recoverMarket = validatedLiveMarket ?? selectedMarket;
+        const recoverChosenSide = validatedLiveChosenSide ?? selectedChosenSide;
+        const recoverTokenId =
+          validatedLiveTokenId ??
+          selectedCommittedTokenId ??
+          (recoverChosenSide === "NO"
+            ? String(recoverMarket?.noTokenId || "").trim() || null
+            : String(recoverMarket?.yesTokenId || "").trim() || null);
+        const recoverChosenDirection = validatedLiveChosenDirection ?? selectedChosenDirection;
+        if (recoverMarket && recoverTokenId) {
+          finalCommittedSelection = this.recoverLiveSelectionFromValidatedMarket({
+            nowTs,
+            market: recoverMarket,
+            selectedTokenId: recoverTokenId,
+            chosenSide: recoverChosenSide,
+            chosenDirection: recoverChosenDirection,
+            selectionSource:
+              selectionSource && selectionSource !== "committed"
+                ? selectionSource
+                : this.inferSelectionSourceFromStartSec(
+                    this.getCanonicalBtc5mTimingFromSlugOrRow({
+                      slug: this.getMarketDeterministicSlug(recoverMarket),
+                      rowStartTs: recoverMarket.startTs ?? null,
+                      rowEndTs: recoverMarket.endTs ?? null
+                    }).startSec
+                  ),
+            liveValidationReason: recoveryValidationReason || "preorder_validated",
+            logRecovery: true
+          });
+          if (finalCommittedSelection) {
+            tickLog.currentMarketId = finalCommittedSelection.selectedMarketId;
+            tickLog.tauSec = finalCommittedSelection.remainingSec;
+            tickLog.selectedSlug = finalCommittedSelection.selectedSlug;
+            tickLog.windowStart = finalCommittedSelection.windowStartTs;
+            tickLog.windowEnd = finalCommittedSelection.windowEndTs;
+            tickLog.acceptingOrders = finalCommittedSelection.acceptingOrders;
+            tickLog.enableOrderBook = finalCommittedSelection.enableOrderBook;
+            tickLog.chosenSide = finalCommittedSelection.chosenSide;
+            tickLog.chosenDirection = finalCommittedSelection.chosenDirection;
+            tickLog.selectedTokenId = finalCommittedSelection.selectedTokenId;
+            liveValidationReason = finalCommittedSelection.liveValidationReason ?? liveValidationReason;
+          }
+        }
+      }
+      if (!tickLog.selectedSlug && !tickLog.currentMarketId) {
+        tickLog.action = "HOLD";
+        tickLog.holdDetailReason = "SELECTION_NOT_COMMITTED";
+        tickLog.dominantReject = "SELECTION_NOT_COMMITTED";
+        tickLog.holdReason = "SELECTION_NOT_COMMITTED";
+        tickLog.blockedBy = "SELECTION_NOT_COMMITTED";
+        tickLog.blockedCategory = "EXECUTION";
+        tickLog.strategyBlock = "SELECTION_NOT_COMMITTED";
+        tickLog.dataHealthBlock = null;
+        this.emitSelectionBugLine({
+          currentBucketSlug: currentBucketSlug ?? this.persistedPolymarketSnapshot.currentBucketSlug,
+          nextBucketSlug: nextBucketSlug ?? this.persistedPolymarketSnapshot.nextBucketSlug,
+          fetchedCount: Number(tickLog.fetchedCount ?? stageCounts.fetchedCount ?? 0),
+          afterWindowCount: Number(tickLog.afterWindowCount ?? stageCounts.afterWindowCount ?? 0),
+          finalCandidatesCount: Number(tickLog.finalCandidatesCount ?? stageCounts.finalCandidatesCount ?? 0),
+          selectedSlug: null,
+          selectedTokenId: tickLog.selectedTokenId ?? this.persistedPolymarketSnapshot.selectedTokenId,
+          liveValidationReason: liveValidationReason ?? this.persistedPolymarketSnapshot.liveValidationReason,
+          attemptedSlugs: deterministicAttemptedSlugs
+        });
+      }
     }
     this.maybeEmitTickLog(tickLog);
 
@@ -6704,6 +9065,56 @@ export class PolymarketEngine {
     }
     const raw = String(error || "error").trim();
     return raw || "error";
+  }
+
+  private normalizeLiveBlockReason(reason: string | null | undefined): string {
+    const raw = String(reason || "").trim();
+    const upper = raw.toUpperCase();
+    if (!upper) {
+      return "HOLD_UNSPECIFIED";
+    }
+    if (upper.includes("SIZE (") && upper.includes("LOWER THAN THE MINIMUM: 5")) {
+      return "ORDER_SIZE_BELOW_MIN_SHARES";
+    }
+    if (upper.includes("ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED")) {
+      return "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED";
+    }
+    if (upper.includes("ORDER_SIZE_BELOW_MIN_SHARES")) {
+      return "ORDER_SIZE_BELOW_MIN_SHARES";
+    }
+    if (
+      upper.includes("PRICE_FETCH_FAILED") ||
+      upper.includes("PRICE_REFRESH_FAILED_ACTIVE_MARKET") ||
+      upper.includes("QUOTE_FAILURE") ||
+      upper.includes("TRANSIENT_QUOTE_FAILURE") ||
+      upper.includes("EMPTY_LIVE_QUOTE")
+    ) {
+      return "PRICE_UNAVAILABLE";
+    }
+    if (upper.includes("NO ORDERBOOK EXISTS") || upper.includes("MISSING_ORDERBOOK")) {
+      return "SIDE_NOT_BOOKABLE";
+    }
+    if (upper.includes("INVALID_SIGNATURE")) {
+      return "ORDER_POST_REJECTED";
+    }
+    if (upper.includes("ORDER_FAILED") || upper.includes("LIVE_REJECTED")) {
+      return "ORDER_POST_REJECTED";
+    }
+    const normalized = normalizeHoldReason(raw);
+    if (!normalized) {
+      return "HOLD_UNSPECIFIED";
+    }
+    if (
+      normalized === "PRICE_FETCH_FAILED" ||
+      normalized === "PRICE_REFRESH_FAILED_ACTIVE_MARKET" ||
+      normalized === "ACTIVE_MARKET_PRICE_STALE"
+    ) {
+      return "PRICE_UNAVAILABLE";
+    }
+    if (normalized === "LIVE_REJECTED" || normalized === "ORDER_FAILED") {
+      return "ORDER_POST_REJECTED";
+    }
+    return normalized;
   }
 
   private normalizeTransientErrorSignature(error: unknown): string {
@@ -8154,7 +10565,7 @@ export class PolymarketEngine {
     const cachedTokenSnapshot = this.getCachedTokenBookSnapshot(market.yesTokenId, nowTs);
     try {
       const quote = await this.client.getTokenPriceQuote(market.yesTokenId, {
-        slug: market.eventSlug || market.slug || null
+        slug: this.getMarketDeterministicSlug(market)
       });
       const bid =
         Number.isFinite(Number(quote.bestBid)) && Number(quote.bestBid) > 0
@@ -8373,14 +10784,26 @@ export class PolymarketEngine {
         priceFetchFailed: quote.fetchFailed
       };
     } catch (error) {
-      if (isTransientPolymarketError(error)) {
+      const transient = isTransientPolymarketError(error);
+      const missingOrderbook = isMissingOrderbookError(error);
+      if (transient) {
         this.markReadPathWarning("NETWORK_ERROR");
       }
+      const inferredNoAsk =
+        Number.isFinite(Number(fallbackNoAsk)) && Number(fallbackNoAsk) > 0
+          ? clamp(Number(fallbackNoAsk), 0.0001, 0.9999)
+          : Number.NaN;
+      const cachedNoAsk =
+        cachedSnapshot && Number.isFinite(Number(cachedSnapshot.bestAsk)) && Number(cachedSnapshot.bestAsk) > 0
+          ? clamp(Number(cachedSnapshot.bestAsk), 0.0001, 0.9999)
+          : null;
+      const resolvedNoAsk = cachedNoAsk ?? (Number.isFinite(inferredNoAsk) ? inferredNoAsk : null);
+      const canUseFallback = resolvedNoAsk !== null && resolvedNoAsk > 0;
       return {
-        noAsk: clamp(cachedSnapshot?.bestAsk ?? fallbackNoAsk, 0.0001, 0.9999),
+        noAsk: resolvedNoAsk !== null ? resolvedNoAsk : clamp(fallbackNoAsk, 0.0001, 0.9999),
         topAskSize: 1_000_000,
-        source: cachedSnapshot ? "cached" : "inferred",
-        priceFetchFailed: true
+        source: cachedNoAsk !== null ? "cached" : missingOrderbook ? "missing" : "inferred",
+        priceFetchFailed: !canUseFallback
       };
     }
   }
@@ -8689,6 +11112,8 @@ export class PolymarketEngine {
         line.holdReason = null;
         line.holdDetailReason = null;
       }
+      this.emitPolyPollLine(line, tickTs);
+      this.emitRolloverTraceLine(line, tickTs);
       this.updateRuntimeStartupStateFromTick(line, tickTs);
       if (
         actionRoot === "HOLD" &&
@@ -8770,6 +11195,8 @@ export class PolymarketEngine {
       line.holdReason = null;
       line.holdDetailReason = null;
     }
+    this.emitPolyPollLine(line, tickTs);
+    this.emitRolloverTraceLine(line, tickTs);
     this.updateRuntimeStartupStateFromTick(line, tickTs);
     if (
       actionRoot === "HOLD" &&
@@ -8901,12 +11328,20 @@ export class PolymarketEngine {
     if (explicitHoldReason === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
     if (explicitHoldReason === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
     if (
-      explicitHoldReason === "NON_EXTREME_PRICE" ||
-      explicitHoldReason === "MODEL_NOT_EXTREME" ||
-      explicitHoldReason === "SIDE_NOT_BOOKABLE" ||
-      explicitHoldReason === "MISSING_ORDERBOOK"
+      explicitHoldReason === "PRICE_UNAVAILABLE" ||
+      explicitHoldReason === "ORDER_POST_REJECTED" ||
+      explicitHoldReason === "ORDER_SIZE_BELOW_MIN_SHARES" ||
+      explicitHoldReason === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED" ||
+      explicitHoldReason === "NON_CURRENT_OR_NEXT_WINDOW" ||
+      explicitHoldReason === "AWAITING_NEXT_MARKET_DISCOVERY"
     ) {
       return explicitHoldReason;
+    }
+    if (explicitHoldReason === "NON_EXTREME_PRICE" || explicitHoldReason === "MODEL_NOT_EXTREME") {
+      return "NON_EXTREME_PRICE";
+    }
+    if (explicitHoldReason === "SIDE_NOT_BOOKABLE" || explicitHoldReason === "MISSING_ORDERBOOK") {
+      return "SIDE_NOT_BOOKABLE";
     }
     if (explicitHoldReason === "EXPIRED_WINDOW") {
       return "EXPIRED_WINDOW";
@@ -8923,12 +11358,28 @@ export class PolymarketEngine {
     if (detailReason === "BTC5M_NOT_FOUND") {
       return "NO_ACTIVE_BTC5M_MARKET";
     }
+    if (detailReason === "NO_ACTIVE_WINDOWS") {
+      return "NO_ACTIVE_WINDOWS";
+    }
+    if (detailReason === "SELECTION_NOT_COMMITTED") {
+      return "SELECTION_NOT_COMMITTED";
+    }
     if (detailReason === "NO_NEW_ORDERS_FINAL_SECONDS") {
       return "NO_NEW_ORDERS_FINAL_SECONDS";
     }
     if (detailReason === "OPEN_POSITION_IN_WINDOW") return "OPEN_POSITION_IN_WINDOW";
     if (detailReason === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
     if (detailReason === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
+    if (
+      detailReason === "PRICE_UNAVAILABLE" ||
+      detailReason === "ORDER_POST_REJECTED" ||
+      detailReason === "ORDER_SIZE_BELOW_MIN_SHARES" ||
+      detailReason === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED" ||
+      detailReason === "NON_CURRENT_OR_NEXT_WINDOW" ||
+      detailReason === "AWAITING_NEXT_MARKET_DISCOVERY"
+    ) {
+      return detailReason;
+    }
     if (detailReason === "EXPIRED_WINDOW") {
       return "EXPIRED_WINDOW";
     }
@@ -8973,19 +11424,23 @@ export class PolymarketEngine {
     if (normalizedDetail === "EXPIRED_WINDOW") {
       return "EXPIRED_WINDOW";
     }
+    if (normalizedDetail === "NO_ACTIVE_WINDOWS") {
+      return "NO_ACTIVE_WINDOWS";
+    }
+    if (normalizedDetail === "SELECTION_NOT_COMMITTED") {
+      return "SELECTION_NOT_COMMITTED";
+    }
     if (normalizedDetail === "NO_NEW_ORDERS_FINAL_SECONDS") {
       return "NO_NEW_ORDERS_FINAL_SECONDS";
     }
     if (normalizedDetail === "OPEN_POSITION_IN_WINDOW") return "OPEN_POSITION_IN_WINDOW";
     if (normalizedDetail === "REENTRY_COOLDOWN") return "REENTRY_COOLDOWN";
     if (normalizedDetail === "TOO_LATE_FOR_ENTRY") return "TOO_LATE_FOR_ENTRY";
-    if (
-      normalizedDetail === "NON_EXTREME_PRICE" ||
-      normalizedDetail === "MODEL_NOT_EXTREME" ||
-      normalizedDetail === "SIDE_NOT_BOOKABLE" ||
-      normalizedDetail === "MISSING_ORDERBOOK"
-    ) {
-      return normalizedDetail;
+    if (normalizedDetail === "NON_EXTREME_PRICE" || normalizedDetail === "MODEL_NOT_EXTREME") {
+      return "NON_EXTREME_PRICE";
+    }
+    if (normalizedDetail === "SIDE_NOT_BOOKABLE" || normalizedDetail === "MISSING_ORDERBOOK") {
+      return "SIDE_NOT_BOOKABLE";
     }
     if (normalizedDetail === "SIZE_BELOW_MIN_NOTIONAL") {
       return "SIZE_BELOW_MIN_NOTIONAL";
@@ -9026,7 +11481,7 @@ export class PolymarketEngine {
 
     const afterWindowCount = Number(line.afterWindowCount ?? this.polyState.afterWindowCount ?? 0);
     if (afterWindowCount <= 0) {
-      return "NO_ACTIVE_BTC5M_MARKET";
+      return "NO_ACTIVE_WINDOWS";
     }
 
     const finalCandidatesCount = Number(line.finalCandidatesCount ?? this.truthSelection.finalCandidatesCount ?? 0);
@@ -9061,7 +11516,7 @@ export class PolymarketEngine {
       return "EDGE_BELOW_THRESHOLD";
     }
 
-    if (normalizedDetail && normalizedDetail !== "HOLD_GENERIC") {
+    if (normalizedDetail && normalizedDetail !== "HOLD_UNSPECIFIED") {
       return normalizedDetail;
     }
 
@@ -9069,7 +11524,7 @@ export class PolymarketEngine {
       return oracleState;
     }
 
-    return "HOLD_GENERIC";
+    return "HOLD_UNSPECIFIED";
   }
 
   private maybeWarnNoData(holdReason: string | null, nowTs: number): void {
@@ -9157,6 +11612,147 @@ export class PolymarketEngine {
     this.logger.warn(loggerPayload, message);
   }
 
+  private pushTraceRow(buffer: Array<Record<string, unknown>>, row: Record<string, unknown>, maxRows = 20): void {
+    buffer.unshift(row);
+    if (buffer.length > maxRows) {
+      buffer.length = maxRows;
+    }
+  }
+
+  private emitPolyPollLine(line: TickLogLine, nowTs: number): void {
+    if (this.config.polymarket.mode !== "live") {
+      return;
+    }
+    const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
+    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const remainingSec =
+      Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0
+        ? Math.floor(Number(line.tauSec))
+        : Number.isFinite(Number(persistedSnapshot.remainingSec))
+          ? Math.floor(Number(persistedSnapshot.remainingSec))
+          : null;
+    const selectedSlug =
+      line.selectedSlug || line.currentMarketId || persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || null;
+    const fromCachedSelection =
+      Boolean(selectedSlug) &&
+      Number(line.fetchedCount ?? 0) <= 0 &&
+      Number(line.afterWindowCount ?? 0) <= 0 &&
+      Number(line.finalCandidatesCount ?? 0) <= 0;
+    const fetchOk =
+      this.polyState.lastFetchOkTs > 0 &&
+      this.polyState.lastHttpStatus === 200 &&
+      nowTs - this.polyState.lastFetchOkTs <= Math.max(5_000, this.config.polymarket.live.discoveryStaleMs);
+    const candidateSlugs = this.getDeterministicBtc5mSlugCandidates(currentBucket).slice(0, 4);
+    const row: Record<string, unknown> = {
+      nowIso: new Date(nowTs).toISOString(),
+      pollMode: persistedSnapshot.pollMode || "-",
+      currentBucketSlug: persistedSnapshot.currentBucketSlug || currentBucket.currentSlug,
+      nextBucketSlug: persistedSnapshot.nextBucketSlug || currentBucket.nextSlug,
+      selectedSlug: selectedSlug || "-",
+      selectedTokenId: line.selectedTokenId || persistedSnapshot.selectedTokenId || "-",
+      remainingSec,
+      fetchedCount: Number(line.fetchedCount ?? this.polyState.fetchedCount ?? 0),
+      afterWindowCount: Number(line.afterWindowCount ?? this.polyState.afterWindowCount ?? 0),
+      finalCandidatesCount: Number(line.finalCandidatesCount ?? this.polyState.finalCandidatesCount ?? 0),
+      candidateSlugs,
+      discoveredCurrent: Boolean(persistedSnapshot.discoveredCurrent),
+      discoveredNext: Boolean(persistedSnapshot.discoveredNext),
+      selectionSource: persistedSnapshot.selectionSource || "-",
+      selectedFrom: persistedSnapshot.selectedFrom || persistedSnapshot.selectionSource || "-",
+      selectionCommitTs: persistedSnapshot.selectionCommitTs || 0,
+      liveValidationReason: persistedSnapshot.liveValidationReason || "-",
+      selectedBookable: persistedSnapshot.selectedBookable,
+      selectedTradable: persistedSnapshot.selectedTradable,
+      fromCachedSelection,
+      fetchOk,
+      lastFetchOkTs: this.polyState.lastFetchOkTs || 0,
+      warningState: persistedSnapshot.warningState || "-",
+      holdReason: line.holdReason || persistedSnapshot.holdReason || "-"
+    };
+    this.pushTraceRow(this.polyPollTrace, row);
+    this.logger.info(
+      `POLY_POLL nowIso=${String(row.nowIso)} pollMode=${String(row.pollMode)} currentBucketSlug=${String(
+        row.currentBucketSlug
+      )} nextBucketSlug=${String(row.nextBucketSlug)} selectedSlug=${String(
+        row.selectedSlug
+      )} selectedTokenId=${String(row.selectedTokenId)} remainingSec=${String(
+        row.remainingSec ?? "-"
+      )} fetchedCount=${String(row.fetchedCount)} afterWindowCount=${String(
+        row.afterWindowCount
+      )} finalCandidatesCount=${String(row.finalCandidatesCount)} candidateSlugs=${candidateSlugs.join(",")} selectionSource=${String(
+        row.selectionSource
+      )} selectedFrom=${String(row.selectedFrom)} discoveredCurrent=${String(
+        row.discoveredCurrent
+      )} discoveredNext=${String(row.discoveredNext)} selectionCommitTs=${String(
+        row.selectionCommitTs
+      )} liveValidationReason=${String(row.liveValidationReason)} selectedBookable=${String(
+        row.selectedBookable
+      )} selectedTradable=${String(row.selectedTradable)} fromCachedSelection=${String(
+        row.fromCachedSelection
+      )} fetchOk=${String(row.fetchOk)} lastFetchOkTs=${String(row.lastFetchOkTs)} warningState=${String(
+        row.warningState
+      )} holdReason=${String(row.holdReason)}`
+    );
+  }
+
+  private emitRolloverTraceLine(line: TickLogLine, nowTs: number): void {
+    if (this.config.polymarket.mode !== "live" || !this.isDeterministicBtc5mMode()) {
+      return;
+    }
+    const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
+    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const remainingSec =
+      Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0
+        ? Math.floor(Number(line.tauSec))
+        : Number.isFinite(Number(persistedSnapshot.remainingSec))
+          ? Math.floor(Number(persistedSnapshot.remainingSec))
+          : null;
+    const selectedSlug =
+      line.selectedSlug || line.currentMarketId || persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || null;
+    const nextDiscovered =
+      selectedSlug === currentBucket.nextSlug ||
+      persistedSnapshot.nextBucketSlug === currentBucket.nextSlug ||
+      this.getDeterministicBtc5mSlugCandidates(currentBucket).includes(currentBucket.nextSlug);
+    const nextTradable =
+      nextDiscovered &&
+      (persistedSnapshot.selectionSource === "next_slug" && persistedSnapshot.selectedTradable === true);
+    const changedBucketSignature = `${currentBucket.currentSlug}|${currentBucket.nextSlug}`;
+    const withinRolloverWindow = remainingSec !== null && remainingSec <= 90;
+    if (!withinRolloverWindow && changedBucketSignature === this.lastRolloverPlanBucketSignature) {
+      return;
+    }
+    this.lastRolloverPlanBucketSignature = changedBucketSignature;
+    const row: Record<string, unknown> = {
+      nowIso: new Date(nowTs).toISOString(),
+      pollMode: persistedSnapshot.pollMode || "-",
+      currentBucketSlug: currentBucket.currentSlug,
+      nextBucketSlug: currentBucket.nextSlug,
+      selectedSlug: selectedSlug || "-",
+      remainingSec,
+      nextDiscovered,
+      nextTradable,
+      discoveredCurrent: persistedSnapshot.discoveredCurrent,
+      discoveredNext: persistedSnapshot.discoveredNext,
+      selectedFrom: persistedSnapshot.selectedFrom || persistedSnapshot.selectionSource || "-",
+      liveValidationReason: persistedSnapshot.liveValidationReason || "-",
+      selectionSource: persistedSnapshot.selectionSource || "-"
+    };
+    this.pushTraceRow(this.polyRolloverTrace, row);
+    this.logger.info(
+      `POLY_ROLLOVER_TRACE nowIso=${String(row.nowIso)} pollMode=${String(row.pollMode)} currentBucketSlug=${String(
+        row.currentBucketSlug
+      )} nextBucketSlug=${String(row.nextBucketSlug)} selectedSlug=${String(
+        row.selectedSlug
+      )} remainingSec=${String(row.remainingSec ?? "-")} nextDiscovered=${String(
+        row.nextDiscovered
+      )} nextTradable=${String(row.nextTradable)} selectionSource=${String(
+        row.selectionSource
+      )} selectedFrom=${String(row.selectedFrom)} discoveredCurrent=${String(
+        row.discoveredCurrent
+      )} discoveredNext=${String(row.discoveredNext)} liveValidationReason=${String(row.liveValidationReason)}`
+    );
+  }
+
   private emitRolloverLine(line: TickLogLine, nowTs: number): void {
     if (this.config.polymarket.mode !== "live" || !this.isDeterministicBtc5mMode()) {
       return;
@@ -9181,6 +11777,9 @@ export class PolymarketEngine {
       currentBucketStartSec: currentBucket.currentBucketStartSec,
       selectedSlug,
       remainingBucket: this.getLogRemainingSecBucket(remainingSec),
+      selectedTokenId: persistedSnapshot.selectedTokenId ?? null,
+      candidateRefreshed: persistedSnapshot.candidateRefreshed ?? null,
+      lastPreorderValidationReason: persistedSnapshot.lastPreorderValidationReason ?? null,
       holdReason: line.holdReason ?? persistedSnapshot.holdReason ?? null,
       warningState: persistedSnapshot.warningState ?? null,
       pollMode: persistedSnapshot.pollMode ?? null
@@ -9190,45 +11789,106 @@ export class PolymarketEngine {
     }
     this.lastPolyRolloverSignature = signature;
     this.logger.info(
-      `DISCOVERY_ROLLOVER nowSec=${currentBucket.nowSec} currentBucketStartSec=${currentBucket.currentBucketStartSec} currentSlug=${currentBucket.currentSlug} prevSlug=${currentBucket.prevSlug} nextSlug=${currentBucket.nextSlug} candidateSlugs=${candidateSlugs.join(",")} selectedSlug=${selectedSlug || "-"} selectedBucketStartSec=${selectedBucketStartSec ?? "-"} remainingSec=${remainingSec ?? "-"} pollMode=${persistedSnapshot.pollMode || "-"} holdReason=${String(line.holdReason || persistedSnapshot.holdReason || "-")} warningState=${String(persistedSnapshot.warningState || "-")} reasonSelected=${String(line.selectedReason || line.dominantReject || "-")}`
+      `DISCOVERY_ROLLOVER nowSec=${currentBucket.nowSec} currentBucketStartSec=${currentBucket.currentBucketStartSec} currentSlug=${currentBucket.currentSlug} prevSlug=${currentBucket.prevSlug} nextSlug=${currentBucket.nextSlug} candidateSlugs=${candidateSlugs.join(",")} selectedSlug=${selectedSlug || "-"} selectedBucketStartSec=${selectedBucketStartSec ?? "-"} remainingSec=${remainingSec ?? "-"} pollMode=${persistedSnapshot.pollMode || "-"} selectedTokenId=${String(
+        persistedSnapshot.selectedTokenId || "-"
+      )} selectedBookable=${String(persistedSnapshot.selectedBookable)} selectedTradable=${String(
+        persistedSnapshot.selectedTradable
+      )} selectionSource=${String(persistedSnapshot.selectionSource || "-")} liveValidationReason=${String(
+        persistedSnapshot.liveValidationReason || "-"
+      )} candidateRefreshed=${String(
+        persistedSnapshot.candidateRefreshed
+      )} lastPreorderValidationReason=${String(
+        persistedSnapshot.lastPreorderValidationReason || "-"
+      )} holdReason=${String(line.holdReason || persistedSnapshot.holdReason || "-")} warningState=${String(
+        persistedSnapshot.warningState || "-"
+      )} reasonSelected=${String(line.selectedReason || line.dominantReject || "-")}`
     );
   }
 
   private emitUiStatusLine(line: TickLogLine, nowTs: number): void {
     const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
-    const selectedSlug = persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || "-";
+    const currentMarketSlug = persistedSnapshot.selectedSlug || "-";
+    const selectedMarketId = persistedSnapshot.selectedMarketId || "-";
+    const selectedSlug = currentMarketSlug !== "-" ? currentMarketSlug : selectedMarketId;
+    const blockedBy =
+      normalizeHoldReason(
+        persistedSnapshot.executionBlockedReason ||
+          line.blockedBy ||
+          line.dataHealthBlock ||
+          line.strategyBlock ||
+          persistedSnapshot.holdReason
+      ) || "-";
     const remainingSec =
       Number.isFinite(Number(persistedSnapshot.remainingSec))
         ? Math.floor(Number(persistedSnapshot.remainingSec))
         : "-";
     const signature = JSON.stringify({
       selectedSlug,
+      selectedMarketId,
+      selectedTokenId: persistedSnapshot.selectedTokenId ?? null,
+      selectedBookable: persistedSnapshot.selectedBookable,
+      selectedTradable: persistedSnapshot.selectedTradable,
+      discoveredCurrent: persistedSnapshot.discoveredCurrent,
+      discoveredNext: persistedSnapshot.discoveredNext,
+      selectionSource: persistedSnapshot.selectionSource,
+      selectedFrom: persistedSnapshot.selectedFrom,
+      selectionCommitTs: persistedSnapshot.selectionCommitTs,
+      liveValidationReason: persistedSnapshot.liveValidationReason,
+      lastBookTs: persistedSnapshot.lastBookTs,
+      lastQuoteTs: persistedSnapshot.lastQuoteTs,
+      currentBucketSlug: persistedSnapshot.currentBucketSlug,
+      nextBucketSlug: persistedSnapshot.nextBucketSlug,
+      currentBucketStartSec: persistedSnapshot.currentBucketStartSec,
+      selectedWindowStartSec: persistedSnapshot.selectedWindowStartSec,
+      selectedWindowEndSec: persistedSnapshot.selectedWindowEndSec,
       remainingBucket: this.getLogRemainingSecBucket(persistedSnapshot.remainingSec),
       chosenSide: persistedSnapshot.chosenSide,
       chosenDirection: persistedSnapshot.chosenDirection,
       holdReason: persistedSnapshot.holdReason,
+      blockedBy,
+      holdCategory: persistedSnapshot.holdCategory ?? null,
       warningState: persistedSnapshot.warningState,
+      staleState: persistedSnapshot.staleState,
       pollMode: persistedSnapshot.pollMode,
-      status: persistedSnapshot.status
+      status: persistedSnapshot.status,
+      candidateRefreshed: persistedSnapshot.candidateRefreshed ?? null,
+      lastPreorderValidationReason: persistedSnapshot.lastPreorderValidationReason ?? null,
+      threshold: persistedSnapshot.threshold ?? null
     });
     if (signature === this.lastUiStatusSignature) {
       return;
     }
     this.lastUiStatusSignature = signature;
     this.logger.info(
-      `UI_STATE_PUSH selectedSlug=${selectedSlug} remainingSec=${remainingSec} side=${String(
+      `UI_STATE_PUSH currentMarketSlug=${currentMarketSlug} selectedSlug=${selectedSlug} selectedMarketId=${selectedMarketId} remainingSec=${remainingSec} side=${String(
         persistedSnapshot.chosenSide || "-"
       )} direction=${String(persistedSnapshot.chosenDirection || "-")} action=${String(
         persistedSnapshot.action || this.getTickActionRoot(line.action)
-      )} holdReason=${String(persistedSnapshot.holdReason || "-")} holdCategory=${String(
+      )} holdReason=${String(persistedSnapshot.holdReason || "-")} blockedBy=${blockedBy} holdCategory=${String(
         persistedSnapshot.holdCategory || "-"
       )} pollMode=${String(persistedSnapshot.pollMode || "-")} staleState=${String(
         persistedSnapshot.staleState || "-"
-      )} selectedTokenId=${String(persistedSnapshot.selectedTokenId || "-")} candidateRefreshed=${String(
+      )} selectedTokenId=${String(persistedSnapshot.selectedTokenId || "-")} selectedBookable=${String(
+        persistedSnapshot.selectedBookable
+      )} selectedTradable=${String(persistedSnapshot.selectedTradable)} selectionSource=${String(
+        persistedSnapshot.selectionSource || "-"
+      )} selectedFrom=${String(persistedSnapshot.selectedFrom || persistedSnapshot.selectionSource || "-")} selectionCommitTs=${String(
+        persistedSnapshot.selectionCommitTs || "-"
+      )} discoveredCurrent=${String(persistedSnapshot.discoveredCurrent)} discoveredNext=${String(
+        persistedSnapshot.discoveredNext
+      )} liveValidationReason=${String(persistedSnapshot.liveValidationReason || "-")} lastBookTs=${String(
+        persistedSnapshot.lastBookTs ?? "-"
+      )} lastQuoteTs=${String(persistedSnapshot.lastQuoteTs ?? "-")} currentBucketSlug=${String(
+        persistedSnapshot.currentBucketSlug || "-"
+      )} nextBucketSlug=${String(persistedSnapshot.nextBucketSlug || "-")} candidateRefreshed=${String(
         persistedSnapshot.candidateRefreshed
+      )} lastPreorderValidationReason=${String(
+        persistedSnapshot.lastPreorderValidationReason || "-"
       )} status=${String(persistedSnapshot.status || "-")} warningState=${String(
         persistedSnapshot.warningState || "-"
-      )} btcMid=${
+      )} threshold=${
+        Number.isFinite(Number(persistedSnapshot.threshold)) ? Number(persistedSnapshot.threshold).toFixed(4) : "-"
+      } btcMid=${
         Number.isFinite(Number(persistedSnapshot.currentBtcMid)) && Number(persistedSnapshot.currentBtcMid) > 0
           ? Number(persistedSnapshot.currentBtcMid).toFixed(2)
           : "-"
@@ -9255,6 +11915,17 @@ export class PolymarketEngine {
           : null;
     const threshold =
       Number.isFinite(Number(line.threshold)) ? Number(line.threshold) : persistedSnapshot.threshold;
+    const remainingSec =
+      Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0
+        ? Math.floor(Number(line.tauSec))
+        : Number.isFinite(Number(persistedSnapshot.remainingSec))
+          ? Math.floor(Number(persistedSnapshot.remainingSec))
+          : null;
+    const selectedTokenId = line.selectedTokenId || persistedSnapshot.selectedTokenId || null;
+    const currentBtcMid =
+      Number.isFinite(Number(persistedSnapshot.currentBtcMid)) && Number(persistedSnapshot.currentBtcMid) > 0
+        ? Number(persistedSnapshot.currentBtcMid)
+        : null;
     const blockedBy =
       normalizeHoldReason(line.blockedBy || line.dataHealthBlock || line.strategyBlock || line.holdReason || "") ||
       null;
@@ -9266,12 +11937,25 @@ export class PolymarketEngine {
     this.logger.info(
       `POLY_PARITY paperWouldTrade=${paperWouldTrade} liveWouldTrade=${liveWouldTrade} selectedSlug=${selectedSlug} chosenSide=${String(
         line.chosenSide || persistedSnapshot.chosenSide || "-"
-      )} chosenDirection=${String(line.chosenDirection || persistedSnapshot.chosenDirection || "-")} score=${
+      )} chosenDirection=${String(line.chosenDirection || persistedSnapshot.chosenDirection || "-")} selectedTokenId=${String(
+        selectedTokenId || "-"
+      )} remainingSec=${remainingSec ?? "-"} currentBtcMid=${
+        currentBtcMid !== null ? currentBtcMid.toFixed(2) : "-"
+      } score=${
         score !== null ? score.toFixed(4) : "-"
       } threshold=${Number.isFinite(Number(threshold)) ? Number(threshold).toFixed(4) : "-"} blockedBy=${blockedBy || "-"} dataHealthBlock=${
         dataHealthBlock || "-"
       } strategyBlock=${strategyBlock || "-"}`
     );
+    if (paperWouldTrade && !liveWouldTrade) {
+      this.logger.warn(
+        `POLY_PARITY_MISMATCH selectedSlug=${selectedSlug} selectedTokenId=${String(
+          selectedTokenId || "-"
+        )} remainingSec=${remainingSec ?? "-"} currentBtcMid=${
+          currentBtcMid !== null ? currentBtcMid.toFixed(2) : "-"
+        } blockedBy=${blockedBy || "-"}`
+      );
+    }
   }
 
   private emitIntentionalHoldDecisionLine(line: TickLogLine, nowTs: number): void {
@@ -9334,11 +12018,84 @@ export class PolymarketEngine {
     );
   }
 
+  private emitPolyDebugLine(line: TickLogLine, nowTs: number): void {
+    const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
+    const selectedSlug = line.selectedSlug || persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || "-";
+    const selectedMarketId = line.currentMarketId || persistedSnapshot.selectedMarketId || "-";
+    const selectedTokenId = line.selectedTokenId || persistedSnapshot.selectedTokenId || "-";
+    const chosenSide = line.chosenSide || persistedSnapshot.chosenSide || "-";
+    const chosenDirection = line.chosenDirection || persistedSnapshot.chosenDirection || "-";
+    const remainingSec =
+      Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0
+        ? Math.floor(Number(line.tauSec))
+        : Number.isFinite(Number(persistedSnapshot.remainingSec))
+          ? Math.floor(Number(persistedSnapshot.remainingSec))
+          : null;
+    const holdReason = normalizeHoldReason(line.holdReason || persistedSnapshot.holdReason || "") || "-";
+    const blockedBy =
+      normalizeHoldReason(
+        line.blockedBy ||
+          line.dataHealthBlock ||
+          line.strategyBlock ||
+          persistedSnapshot.executionBlockedReason ||
+          persistedSnapshot.holdReason ||
+          ""
+      ) || "-";
+    const pollMode = persistedSnapshot.pollMode || "-";
+    const candidateRefreshed = persistedSnapshot.candidateRefreshed;
+    const lastPreorderValidationReason = persistedSnapshot.lastPreorderValidationReason || "-";
+    const signature = JSON.stringify({
+      selectedSlug,
+      selectedTokenId,
+      chosenSide,
+      holdReason,
+      blockedBy,
+      pollMode,
+      selectedBookable: persistedSnapshot.selectedBookable,
+      selectedTradable: persistedSnapshot.selectedTradable,
+      selectionSource: persistedSnapshot.selectionSource,
+      liveValidationReason: persistedSnapshot.liveValidationReason,
+      remainingBucket: this.getLogRemainingSecBucket(remainingSec),
+      candidateRefreshed: candidateRefreshed ?? null,
+      lastPreorderValidationReason
+    });
+    if (signature === this.lastPolyDebugSignature) {
+      return;
+    }
+    this.lastPolyDebugSignature = signature;
+    this.logger.info(
+      `POLY_DEBUG selectedSlug=${selectedSlug} selectedMarketId=${selectedMarketId} selectedTokenId=${selectedTokenId} chosenSide=${chosenSide} chosenDirection=${String(
+        chosenDirection
+      )} remainingSec=${remainingSec ?? "-"} currentBtcMid=${
+        Number.isFinite(Number(persistedSnapshot.currentBtcMid)) && Number(persistedSnapshot.currentBtcMid) > 0
+          ? Number(persistedSnapshot.currentBtcMid).toFixed(2)
+          : "-"
+      } threshold=${
+        Number.isFinite(Number(persistedSnapshot.threshold)) ? Number(persistedSnapshot.threshold).toFixed(4) : "-"
+      } holdReason=${holdReason} blockedBy=${blockedBy} holdCategory=${String(
+        persistedSnapshot.holdCategory || "-"
+      )} dataHealthBlock=${String(
+        normalizeHoldReason(line.dataHealthBlock || "") || "-"
+      )} strategyBlock=${String(
+        normalizeHoldReason(line.strategyBlock || "") || "-"
+      )} pollMode=${pollMode} selectedBookable=${String(
+        persistedSnapshot.selectedBookable
+      )} selectedTradable=${String(persistedSnapshot.selectedTradable)} selectionSource=${String(
+        persistedSnapshot.selectionSource || "-"
+      )} liveValidationReason=${String(persistedSnapshot.liveValidationReason || "-")} candidateRefreshed=${String(
+        candidateRefreshed
+      )} lastPreorderValidationReason=${lastPreorderValidationReason} action=${String(
+        this.getTickActionRoot(line.action)
+      )}`
+    );
+  }
+
   private emitPolyStatusLine(line: TickLogLine, nowTs: number): void {
     const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
     this.emitRolloverLine(line, nowTs);
     this.emitDecisionParityLine(line, nowTs);
     this.emitIntentionalHoldDecisionLine(line, nowTs);
+    this.emitPolyDebugLine(line, nowTs);
     this.emitUiStatusLine(line, nowTs);
     const actionRoot = this.getTickActionRoot(line.action);
     const candidatesCount = Math.max(
@@ -9354,12 +12111,14 @@ export class PolymarketEngine {
       )
     );
     const selected = line.selectedSlug || line.currentMarketId || persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || "-";
-    const remaining =
+    const selectedTokenId = line.selectedTokenId || persistedSnapshot.selectedTokenId || "-";
+    const remainingSecValue =
       Number.isFinite(Number(line.tauSec))
-        ? String(Math.floor(Number(line.tauSec)))
+        ? Math.floor(Number(line.tauSec))
         : Number.isFinite(Number(persistedSnapshot.remainingSec))
-          ? String(Math.floor(Number(persistedSnapshot.remainingSec)))
-          : "-";
+          ? Math.floor(Number(persistedSnapshot.remainingSec))
+          : null;
+    const remaining = remainingSecValue !== null ? String(remainingSecValue) : "-";
     const minRemainingSec =
       Number.isFinite(Number(line.minWindowSec)) && Number(line.minWindowSec) > 0
         ? Math.floor(Number(line.minWindowSec))
@@ -9415,7 +12174,18 @@ export class PolymarketEngine {
     const signature = JSON.stringify({
       status: statusText,
       selected,
-      remainingBucket: this.getLogRemainingSecBucket(line.tauSec),
+      selectedTokenId,
+      selectedBookable: persistedSnapshot.selectedBookable,
+      selectedTradable: persistedSnapshot.selectedTradable,
+      discoveredCurrent: persistedSnapshot.discoveredCurrent,
+      discoveredNext: persistedSnapshot.discoveredNext,
+      selectionSource: persistedSnapshot.selectionSource,
+      selectedFrom: persistedSnapshot.selectedFrom,
+      selectionCommitTs: persistedSnapshot.selectionCommitTs,
+      liveValidationReason: persistedSnapshot.liveValidationReason,
+      currentBucketSlug: persistedSnapshot.currentBucketSlug,
+      nextBucketSlug: persistedSnapshot.nextBucketSlug,
+      remainingBucket: this.getLogRemainingSecBucket(remainingSecValue),
       chosenSide: chosenSideText,
       chosenDirection: chosenDirectionText,
       action: actionRoot,
@@ -9433,11 +12203,21 @@ export class PolymarketEngine {
     }
     this.lastPolyStatusSignature = signature;
     this.logger.info(
-      `POLY_STATUS status=${statusText} selectedSlug=${selected} remainingSec=${remaining} chosenSide=${chosenSideText} chosenDirection=${chosenDirectionText} action=${actionRoot} holdReason=${holdReasonText} blockedBy=${blockedByText} holdCategory=${holdCategoryText} dataHealthBlock=${dataHealthBlockText} strategyBlock=${strategyBlockText} warningState=${warningStateText} staleState=${staleStateText} pollMode=${pollModeText} openTradesCount=${openTradesText} candidatesCount=${Math.max(candidatesCount, Number(persistedSnapshot.discoveredCandidatesCount || 0))} windowsCount=${Math.max(Number(line.afterWindowCount ?? 0), Number(persistedSnapshot.windowsCount || 0))} threshold=${thresholdText} btcMid=${
+      `POLY_STATUS status=${statusText} selectedSlug=${selected} selectedTokenId=${selectedTokenId} selectedBookable=${String(
+        persistedSnapshot.selectedBookable
+      )} selectedTradable=${String(persistedSnapshot.selectedTradable)} discoveredCurrent=${String(
+        persistedSnapshot.discoveredCurrent
+      )} discoveredNext=${String(persistedSnapshot.discoveredNext)} selectionSource=${String(
+        persistedSnapshot.selectionSource || "-"
+      )} selectedFrom=${String(persistedSnapshot.selectedFrom || persistedSnapshot.selectionSource || "-")} selectionCommitTs=${String(
+        persistedSnapshot.selectionCommitTs || "-"
+      )} liveValidationReason=${String(persistedSnapshot.liveValidationReason || "-")} remainingSec=${remaining} chosenSide=${chosenSideText} chosenDirection=${chosenDirectionText} action=${actionRoot} holdReason=${holdReasonText} blockedBy=${blockedByText} holdCategory=${holdCategoryText} dataHealthBlock=${dataHealthBlockText} strategyBlock=${strategyBlockText} warningState=${warningStateText} staleState=${staleStateText} pollMode=${pollModeText} openTradesCount=${openTradesText} candidatesCount=${Math.max(candidatesCount, Number(persistedSnapshot.discoveredCandidatesCount || 0))} windowsCount=${Math.max(Number(line.afterWindowCount ?? 0), Number(persistedSnapshot.windowsCount || 0))} threshold=${thresholdText} btcMid=${
         Number.isFinite(Number(persistedSnapshot.currentBtcMid)) && Number(persistedSnapshot.currentBtcMid) > 0
           ? Number(persistedSnapshot.currentBtcMid).toFixed(2)
           : "-"
-      } minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec}`
+      } currentBucketSlug=${String(persistedSnapshot.currentBucketSlug || "-")} nextBucketSlug=${String(
+        persistedSnapshot.nextBucketSlug || "-"
+      )} minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec}`
     );
   }
 
@@ -9454,10 +12234,14 @@ export class PolymarketEngine {
       ? Math.max(0, Math.floor(Number(line.finalCandidatesCount)))
       : this.polyState.finalCandidatesCount;
     if (line.selectedSlug !== undefined) {
-      this.polyState.selectedSlug = line.selectedSlug;
+      if (line.selectedSlug !== null || !this.persistedPolymarketSnapshot.selectedSlug) {
+        this.polyState.selectedSlug = line.selectedSlug;
+      }
     }
     if (line.currentMarketId !== undefined) {
-      this.polyState.selectedMarketId = line.currentMarketId;
+      if (line.currentMarketId !== null || !this.persistedPolymarketSnapshot.selectedMarketId) {
+        this.polyState.selectedMarketId = line.currentMarketId;
+      }
     }
     this.polyState.holdDetailReason =
       line.holdDetailReason !== undefined
@@ -9651,10 +12435,31 @@ export class PolymarketEngine {
       lastSlug: this.truthLastSlug,
       lastTradeTs: this.truthLastTradeTs,
       holdReason: persistedSnapshot.holdReason ?? this.truthHoldReason,
+      blockedBy:
+        normalizeHoldReason(
+          persistedSnapshot.executionBlockedReason ||
+            persistedSnapshot.holdReason ||
+            this.truthHoldReason
+        ) ?? null,
       currentWindowHoldReason: hasActiveSelection ? (persistedSnapshot.holdReason ?? this.truthHoldReason) : null,
       holdCategory: persistedSnapshot.holdCategory,
       strategyAction: persistedSnapshot.strategyAction,
       selectedTokenId: persistedSnapshot.selectedTokenId,
+      selectedBookable: persistedSnapshot.selectedBookable,
+      selectedTradable: persistedSnapshot.selectedTradable,
+      discoveredCurrent: persistedSnapshot.discoveredCurrent,
+      discoveredNext: persistedSnapshot.discoveredNext,
+      selectionSource: persistedSnapshot.selectionSource,
+      selectedFrom: persistedSnapshot.selectedFrom ?? persistedSnapshot.selectionSource,
+      selectionCommitTs: persistedSnapshot.selectionCommitTs,
+      liveValidationReason: persistedSnapshot.liveValidationReason,
+      lastBookTs: persistedSnapshot.lastBookTs,
+      lastQuoteTs: persistedSnapshot.lastQuoteTs,
+      currentBucketSlug: persistedSnapshot.currentBucketSlug,
+      nextBucketSlug: persistedSnapshot.nextBucketSlug,
+      currentBucketStartSec: persistedSnapshot.currentBucketStartSec,
+      selectedWindowStartSec: persistedSnapshot.selectedWindowStartSec,
+      selectedWindowEndSec: persistedSnapshot.selectedWindowEndSec,
       candidateRefreshed: persistedSnapshot.candidateRefreshed,
       lastPreorderValidationReason: persistedSnapshot.lastPreorderValidationReason,
       chosenSide: hasActiveSelection
@@ -10841,7 +13646,21 @@ type TickLogLine = {
   blockedCategory?: HoldCategory | null;
   strategyBlock?: string | null;
   dataHealthBlock?: string | null;
+  staleState?: "ACTIVE_MARKET_REFRESH_FAILED" | "ACTIVE_MARKET_PRICE_STALE" | "DISCOVERY_STALE" | null;
   selectedTokenId?: string | null;
+  selectedBookable?: boolean | null;
+  selectedTradable?: boolean | null;
+  discoveredCurrent?: boolean | null;
+  discoveredNext?: boolean | null;
+  selectionSource?: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+  selectedFrom?: "current_slug" | "next_slug" | "fallback_discovery" | "committed" | null;
+  selectionCommitTs?: number | null;
+  liveValidationReason?: string | null;
+  lastBookTs?: number | null;
+  lastQuoteTs?: number | null;
+  currentBucketSlug?: string | null;
+  nextBucketSlug?: string | null;
+  currentBucketStartSec?: number | null;
   candidateRefreshed?: boolean | null;
   size?: number | null;
   openTrades?: number;
@@ -11176,6 +13995,7 @@ function parseRawMarketToBtcWindow(
   if (!marketId) return null;
   const slug =
     pickRawString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || marketId;
+  const slugStartSec = parseBtc5mWindowStartSec(slug);
   const question =
     pickRawString(row, ["question", "title", "description", "subtitle"]) || slug;
   const active = pickRawBoolean(row, ["active", "is_active"], true);
@@ -11210,7 +14030,12 @@ function parseRawMarketToBtcWindow(
       "expires_at"
     ]
   );
-  const normalizedEndTs = endTs > 0 ? endTs : fallbackWindowEndMs;
+  const normalizedEndTs =
+    endTs > 0
+      ? endTs
+      : slugStartSec !== null
+        ? (slugStartSec + FIVE_MIN_SEC) * 1000
+        : fallbackWindowEndMs;
   if (!(normalizedEndTs > nowTs)) return null;
   const startTs = pickRawTimestamp(
     row,
@@ -11225,6 +14050,7 @@ function parseRawMarketToBtcWindow(
       "startTime"
     ]
   );
+  const normalizedStartTs = startTs > 0 ? startTs : slugStartSec !== null ? slugStartSec * 1000 : undefined;
   let priceToBeat = sanitizePaperPriceToBeatCandidate(
     pickRawNumber(row, [
     "price_to_beat",
@@ -11263,7 +14089,7 @@ function parseRawMarketToBtcWindow(
     question,
     priceToBeat,
     endTs: normalizedEndTs,
-    startTs: startTs > 0 ? startTs : undefined,
+    startTs: normalizedStartTs,
     yesTokenId,
     noTokenId,
     yesDisplayLabel: directionalLabels.yesDisplayLabel,
@@ -11648,9 +14474,26 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
   if (upper.startsWith("HOLD:")) {
     return normalizeHoldReason(raw.slice(5));
   }
-  if (upper === "HOLD") return "HOLD_GENERIC";
+  if (upper === "HOLD") return "HOLD_UNSPECIFIED";
+  if (upper.includes("HOLD_UNSPECIFIED")) return "HOLD_UNSPECIFIED";
+  if (upper.includes("HOLD_GENERIC")) return "HOLD_UNSPECIFIED";
+  if (upper.includes("MODEL_NOT_EXTREME") || upper.includes("NON_EXTREME_PRICE")) return "NON_EXTREME_PRICE";
+  if (upper.includes("AWAITING_NEXT_MARKET_DISCOVERY")) return "AWAITING_NEXT_MARKET_DISCOVERY";
+  if (upper.includes("PRICE_UNAVAILABLE")) return "PRICE_UNAVAILABLE";
+  if (upper.includes("PRICE_FETCH_FAILED") || upper.includes("QUOTE_FAILURE") || upper.includes("EMPTY_LIVE_QUOTE")) {
+    return "PRICE_UNAVAILABLE";
+  }
+  if (upper.includes("SIDE_NOT_BOOKABLE") || upper.includes("MISSING_ORDERBOOK")) return "SIDE_NOT_BOOKABLE";
+  if (upper.includes("ORDER_POST_REJECTED")) return "ORDER_POST_REJECTED";
+  if (upper.includes("ORDER_FAILED") || upper.includes("LIVE_REJECTED")) return "ORDER_POST_REJECTED";
+  if (upper.includes("SIZE (") && upper.includes("LOWER THAN THE MINIMUM: 5")) return "ORDER_SIZE_BELOW_MIN_SHARES";
+  if (upper.includes("ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED")) return "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED";
+  if (upper.includes("ORDER_SIZE_BELOW_MIN_SHARES")) return "ORDER_SIZE_BELOW_MIN_SHARES";
   if (upper.includes("STARTUP_INCOMPLETE_NO_USABLE_WINDOW")) return "STARTUP_INCOMPLETE_NO_USABLE_WINDOW";
   if (upper.includes("NO_ACTIVE_BTC5M_MARKET") || upper.includes("BTC5M_NOT_FOUND")) return "NO_ACTIVE_BTC5M_MARKET";
+  if (upper.includes("NO_ACTIVE_WINDOWS")) return "NO_ACTIVE_WINDOWS";
+  if (upper.includes("SELECTION_NOT_COMMITTED")) return "SELECTION_NOT_COMMITTED";
+  if (upper.includes("NON_CURRENT_OR_NEXT_WINDOW")) return "NON_CURRENT_OR_NEXT_WINDOW";
   if (upper.includes("EXPIRED_WINDOW")) return "EXPIRED_WINDOW";
   if (upper.includes("AWAITING_RESOLUTION") || upper.includes("MARKET_CLOSED_AWAITING_OUTCOME")) {
     return "AWAITING_RESOLUTION";
@@ -11659,6 +14502,10 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
   if (upper.includes("OPEN_POSITION_IN_WINDOW")) return "OPEN_POSITION_IN_WINDOW";
   if (upper.includes("REENTRY_COOLDOWN")) return "REENTRY_COOLDOWN";
   if (upper.includes("TOO_LATE_FOR_ENTRY")) return "TOO_LATE_FOR_ENTRY";
+  if (upper.includes("REFRESH_FAILED_ACTIVE_MARKET")) return "REFRESH_FAILED_ACTIVE_MARKET";
+  if (upper.includes("ACTIVE_MARKET_REFRESH_FAILED")) return "ACTIVE_MARKET_REFRESH_FAILED";
+  if (upper.includes("PRICE_REFRESH_FAILED_ACTIVE_MARKET")) return "PRICE_REFRESH_FAILED_ACTIVE_MARKET";
+  if (upper.includes("ACTIVE_MARKET_PRICE_STALE")) return "ACTIVE_MARKET_PRICE_STALE";
   if (upper.includes("SIZE_BELOW_MIN_NOTIONAL")) return "SIZE_BELOW_MIN_NOTIONAL";
   if (upper.includes("WINDOW_ALREADY_OPEN") || upper.includes("WINDOW_ALREADY_TRADED")) return "DUPLICATE_WINDOW";
   if (upper.includes("ORACLE_STALE_BOOK_STALE")) return "ORACLE_STALE_BOOK_STALE";
@@ -11682,7 +14529,13 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
 
 function isDataHealthBlockReason(reason: string | null | undefined): boolean {
   const raw = String(reason || "").trim().toUpperCase();
-  if (raw.includes("NETWORK") || raw.includes("PRICE_FETCH")) {
+  if (
+    raw.includes("NETWORK") ||
+    raw.includes("PRICE_FETCH") ||
+    raw.includes("REFRESH_FAILED_ACTIVE_MARKET") ||
+    raw.includes("ACTIVE_MARKET_REFRESH_FAILED") ||
+    raw.includes("ACTIVE_MARKET_PRICE_STALE")
+  ) {
     return true;
   }
   if (raw.includes("ORDERBOOK") || raw.includes("BOOKABLE") || raw.includes("ORACLE")) {
@@ -11694,8 +14547,13 @@ function isDataHealthBlockReason(reason: string | null | undefined): boolean {
     "NETWORK_ERROR",
     "DISCOVERY_STALE",
     "FETCH_STALE",
+    "REFRESH_FAILED_ACTIVE_MARKET",
+    "ACTIVE_MARKET_REFRESH_FAILED",
+    "ACTIVE_MARKET_PRICE_STALE",
+    "PRICE_REFRESH_FAILED_ACTIVE_MARKET",
     "NO_DATA",
     "PRICE_FETCH_FAILED",
+    "PRICE_UNAVAILABLE",
     "MISSING_ORDERBOOK",
     "SIDE_NOT_BOOKABLE",
     "ORACLE_STALE",
@@ -11717,7 +14575,8 @@ function classifyHoldCategory(reason: string | null | undefined): HoldCategory {
     raw.includes("RISK_") ||
     raw.includes("MAX_EXPOSURE") ||
     raw.includes("DAILY_LOSS") ||
-    raw.includes("SIZE_BELOW_MIN_NOTIONAL")
+    raw.includes("SIZE_BELOW_MIN_NOTIONAL") ||
+    raw.includes("ORDER_SIZE_BELOW_MIN_SHARES")
   ) {
     return "RISK";
   }
@@ -11732,12 +14591,15 @@ function classifyHoldCategory(reason: string | null | undefined): HoldCategory {
   }
   if (
     raw.includes("PREORDER_") ||
+    raw.includes("SELECTION_NOT_COMMITTED") ||
+    raw.includes("NON_CURRENT_OR_NEXT_WINDOW") ||
     raw.includes("ORDER_ABORT") ||
     raw.includes("LIVE_REJECTED") ||
     raw.includes("OPEN_ORDER_ALREADY_EXISTS") ||
     raw.includes("REMOTE_OPEN_ORDER_ALREADY_EXISTS") ||
     raw.includes("NON_POSITIVE_SIZE") ||
-    raw.includes("ORDER_FAILED")
+    raw.includes("ORDER_FAILED") ||
+    raw.includes("ORDER_POST_REJECTED")
   ) {
     return "EXECUTION";
   }
@@ -11749,11 +14611,26 @@ function classifyHoldCategory(reason: string | null | undefined): HoldCategory {
 
 function parseBtc5mWindowStartSec(slug: string | null | undefined): number | null {
   const text = String(slug || "").trim();
-  const match = text.match(/^btc-updown-5m-(\d{9,12})$/i);
+  const match = text.match(/btc-updown-5m-(\d{9,12})/i);
   if (!match) return null;
   const startSec = Number(match[1]);
   if (!Number.isFinite(startSec) || startSec <= 0) return null;
   return Math.floor(startSec);
+}
+
+function pickDeterministicBtc5mSlugFromMarketLike(market: {
+  slug?: string | null;
+  eventSlug?: string | null;
+  marketId?: string | null;
+}): string | null {
+  const slug = String(market.slug || "").trim();
+  const eventSlug = String(market.eventSlug || "").trim();
+  if (parseBtc5mWindowStartSec(slug) !== null) return slug;
+  if (parseBtc5mWindowStartSec(eventSlug) !== null) return eventSlug;
+  if (slug) return slug;
+  if (eventSlug) return eventSlug;
+  const marketId = String(market.marketId || "").trim();
+  return marketId || null;
 }
 
 function rowMatchesBtc5mSlug(row: Record<string, unknown>, slug: string): boolean {
@@ -11800,7 +14677,7 @@ function isDeterministicBtc5mMarketUsableNow(
   nowTs: number
 ): boolean {
   const startSec =
-    parseBtc5mWindowStartSec(market.eventSlug || market.slug) ??
+    parseBtc5mWindowStartSec(pickDeterministicBtc5mSlugFromMarketLike(market)) ??
     (Number.isFinite(Number(market.startTs)) && Number(market.startTs) > 0
       ? Math.floor(Number(market.startTs) / 1000)
       : null);
@@ -11816,7 +14693,7 @@ function rankDeterministicBtc5mMarket(
   nowTs: number
 ): number {
   const startSec =
-    parseBtc5mWindowStartSec(market.eventSlug || market.slug) ??
+    parseBtc5mWindowStartSec(pickDeterministicBtc5mSlugFromMarketLike(market)) ??
     (Number.isFinite(Number(market.startTs)) && Number(market.startTs) > 0
       ? Math.floor(Number(market.startTs) / 1000)
       : null);

@@ -70,6 +70,7 @@ export type TokenPriceQuote = {
   source: "clob_price" | "book_mid";
   fetchFailed: boolean;
   failedSides: Array<"BUY" | "SELL">;
+  quoteHealth?: "OK" | "PARTIAL_PRICE" | "BOOK_FALLBACK";
 };
 
 type OpenOrderRow = {
@@ -475,14 +476,15 @@ export class PolymarketClient {
         }
       } catch (error) {
         lastError = error;
-        this.logger.warn(
-          {
-            attempt: attempt.tag,
-            limit: boundedLimit,
-            error: serializeError(error)
-          },
-          "Polymarket recent events attempt failed"
-        );
+        const payload: Record<string, unknown> = {
+          attempt: attempt.tag,
+          limit: boundedLimit,
+          errorSummary: shortErrorMessage(error)
+        };
+        if (this.isPolyVerboseDebug()) {
+          payload.error = serializeError(error);
+        }
+        this.logger.warn(payload, "Polymarket recent events attempt failed");
       }
     }
 
@@ -574,13 +576,14 @@ export class PolymarketClient {
       const exact = findExact(direct.rows);
       if (exact) return exact;
     } catch (error) {
-      this.logger.warn(
-        {
-          slug: needle,
-          error: serializeError(error)
-        },
-        "Polymarket direct slug lookup failed; falling back to active markets scan"
-      );
+      const payload: Record<string, unknown> = {
+        slug: needle,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.warn(payload, "Polymarket direct slug lookup failed; falling back to active markets scan");
     }
 
     const page = await this.listMarketsPage({
@@ -776,13 +779,14 @@ export class PolymarketClient {
         return parsed;
       }
     } catch (error) {
-      this.logger.debug(
-        {
-          tokenId,
-          error: serializeError(error)
-        },
-        "Polymarket CLOB /book fetch failed; falling back to SDK"
-      );
+      const payload: Record<string, unknown> = {
+        tokenId,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.debug(payload, "Polymarket CLOB /book fetch failed; falling back to SDK");
     }
 
     const client = await this.getPublicClient();
@@ -852,7 +856,8 @@ export class PolymarketClient {
         ts: Math.max(Number(sellPoint?.ts || 0), Number(buyPoint?.ts || 0), Date.now()),
         source: "clob_price",
         fetchFailed: failedSides.length > 0,
-        failedSides
+        failedSides,
+        quoteHealth: failedSides.length > 0 ? "PARTIAL_PRICE" : "OK"
       };
     }
 
@@ -878,7 +883,8 @@ export class PolymarketClient {
       ts: book.ts,
       source: "book_mid",
       fetchFailed: true,
-      failedSides
+      failedSides,
+      quoteHealth: "BOOK_FALLBACK"
     };
   }
 
@@ -1286,7 +1292,7 @@ export class PolymarketClient {
   }
 
   private isPolyVerboseDebug(): boolean {
-    return this.config.debugHttp || process.env.DEBUG_POLY === "1" || process.env.DEBUG_POLY_VERBOSE === "true";
+    return this.config.debugHttp || process.env.DEBUG_POLY === "1";
   }
 
   private async getPublicClient(): Promise<any> {
@@ -1718,16 +1724,17 @@ export class PolymarketClient {
           isRetryable: (error) => isRetryableError(error),
           onRetry: (attempt, error, delayMs) => {
             if (this.config.debugHttp || process.env.DEBUG_POLY === "1") {
-              this.logger.warn(
-                {
-                  method,
-                  url,
-                  attempt,
-                  delayMs,
-                  error: serializeError(error)
-                },
-                "Polymarket HTTP retrying"
-              );
+              const payload: Record<string, unknown> = {
+                method,
+                url,
+                attempt,
+                delayMs,
+                errorSummary: shortErrorMessage(error)
+              };
+              if (this.isPolyVerboseDebug()) {
+                payload.error = serializeError(error);
+              }
+              this.logger.warn(payload, "Polymarket HTTP retrying");
             }
           }
         }
@@ -1738,11 +1745,18 @@ export class PolymarketClient {
       this.markNetworkFailure(`${method} ${path}`, error);
       this.markIngestionFailure(error);
       this.logger.error(
-        {
-          method,
-          url,
-          error: serializeError(error)
-        },
+        this.isPolyVerboseDebug()
+          ? {
+              method,
+              url,
+              errorSummary: shortErrorMessage(error),
+              error: serializeError(error)
+            }
+          : {
+              method,
+              url,
+              errorSummary: shortErrorMessage(error)
+            },
         "Polymarket HTTP failed after retries"
       );
       throw error;
@@ -1778,13 +1792,22 @@ export class PolymarketClient {
     }
     this.circuitOpenUntilTs = until;
     this.logger.warn(
-      {
-        label,
-        transientFailureCount: this.transientFailureCount,
-        circuitOpenMs: openMs,
-        circuitOpenUntilTs: until,
-        error: serializeError(error)
-      },
+      this.isPolyVerboseDebug()
+        ? {
+            label,
+            transientFailureCount: this.transientFailureCount,
+            circuitOpenMs: openMs,
+            circuitOpenUntilTs: until,
+            errorSummary: shortErrorMessage(error),
+            error: serializeError(error)
+          }
+        : {
+            label,
+            transientFailureCount: this.transientFailureCount,
+            circuitOpenMs: openMs,
+            circuitOpenUntilTs: until,
+            errorSummary: shortErrorMessage(error)
+          },
       "Polymarket network circuit breaker open"
     );
   }

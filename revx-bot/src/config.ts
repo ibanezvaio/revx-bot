@@ -104,6 +104,7 @@ export type PolymarketConfig = {
     enableMakerQuoting: boolean;
     cancelAllOnStart: boolean;
   };
+  debugDisableRevolutBaselineWhileLive: boolean;
   live: {
     minEntryRemainingSec: number;
     fastPollRemainingSec: number;
@@ -1228,6 +1229,13 @@ export function loadConfig(): BotConfig {
   const polymarketEnableMakerQuoting = boolWithDefault("POLYMARKET_ENABLE_MAKER_QUOTING", false);
   const polymarketCancelAllOnStart = boolWithDefault("POLYMARKET_CANCEL_ALL_ON_START", false);
   const polymarketCancelAllOnStartRaw = optional("POLYMARKET_CANCEL_ALL_ON_START");
+  const polymarketDebugDisableRevolutBaselineWhileLive = boolWithFallback(
+    [
+      "POLYMARKET_DEBUG_DISABLE_REVOLUT_BASELINE_WHILE_LIVE",
+      "POLYMARKET_DISABLE_REVOLUT_BASELINE_WHILE_LIVE"
+    ],
+    false
+  );
   const polymarketLiveMinEntryRemainingSec = clampInt(
     numberWithDefault("POLYMARKET_LIVE_MIN_REMAINING_SEC_TO_ENTER", 90),
     1,
@@ -1912,6 +1920,7 @@ export function loadConfig(): BotConfig {
         enableMakerQuoting: polymarketEnableMakerQuoting,
         cancelAllOnStart: polymarketEffectiveCancelAllOnStart
       },
+      debugDisableRevolutBaselineWhileLive: polymarketDebugDisableRevolutBaselineWhileLive,
       live: {
         minEntryRemainingSec: polymarketLiveMinEntryRemainingSec,
         fastPollRemainingSec: polymarketLiveFastPollRemainingSec,
