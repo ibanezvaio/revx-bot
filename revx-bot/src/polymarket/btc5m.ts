@@ -17,3 +17,7 @@ export function previousSlug(nowMs = Date.now()): string {
 export function currentSlug(nowMs = Date.now()): string {
   return slugForTs(windowTs(nowMs));
 }
+
+export function nextSlug(nowMs = Date.now()): string {
+  return slugForTs(windowTs(nowMs) + FIVE_MIN_SEC);
+}

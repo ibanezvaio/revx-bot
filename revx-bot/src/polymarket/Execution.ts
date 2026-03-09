@@ -24,6 +24,7 @@ export class PolymarketExecution {
   private remoteOpenOrdersCount = 0;
   private remoteOpenOrderMarkets = new Set<string>();
   private remoteOpenBuyTokenIds = new Set<string>();
+  private remoteOpenSellTokenIds = new Set<string>();
   private liveReadWarningState: string | null = null;
   private lastLiveReadWarningSignature = "";
   private lastLiveReadWarningLogTs = 0;
@@ -40,6 +41,44 @@ export class PolymarketExecution {
     private readonly logger: Logger,
     private readonly client: PolymarketClient
   ) {}
+
+  async executeBuyYes(params: {
+    marketId: string;
+    tokenId: string;
+    yesAsk: number;
+    notionalUsd: number;
+    tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
+    negRisk?: boolean;
+  }): Promise<ExecutionResult> {
+    return this.executeEntry({
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      side: "YES",
+      askPrice: params.yesAsk,
+      notionalUsd: params.notionalUsd,
+      tickSize: params.tickSize,
+      negRisk: params.negRisk
+    });
+  }
+
+  async executeBuyNo(params: {
+    marketId: string;
+    tokenId: string;
+    noAsk: number;
+    notionalUsd: number;
+    tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
+    negRisk?: boolean;
+  }): Promise<ExecutionResult> {
+    return this.executeEntry({
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      side: "NO",
+      askPrice: params.noAsk,
+      notionalUsd: params.notionalUsd,
+      tickSize: params.tickSize,
+      negRisk: params.negRisk
+    });
+  }
 
   async executeEntry(params: {
     marketId: string;
@@ -140,16 +179,26 @@ export class PolymarketExecution {
     this.openOrders.set(localOrderId, openOrder);
 
     try {
-      const placed = await this.client.placeMarketableBuyYes({
-        marketId: params.marketId,
-        tokenId: params.tokenId,
-        side: "BUY",
-        limitPrice,
-        size: shares,
-        ttlMs,
-        tickSize: params.tickSize,
-        negRisk: params.negRisk
-      });
+      const placed =
+        params.side === "YES"
+          ? await this.client.placeMarketableBuyYes({
+              marketId: params.marketId,
+              tokenId: params.tokenId,
+              limitPrice,
+              size: shares,
+              ttlMs,
+              tickSize: params.tickSize,
+              negRisk: params.negRisk
+            })
+          : await this.client.placeMarketableBuyNo({
+              marketId: params.marketId,
+              tokenId: params.tokenId,
+              limitPrice,
+              size: shares,
+              ttlMs,
+              tickSize: params.tickSize,
+              negRisk: params.negRisk
+            });
 
       openOrder.venueOrderId = placed.orderId;
       this.submittedByVenueOrderId.set(placed.orderId, {
@@ -206,7 +255,208 @@ export class PolymarketExecution {
       const fillPrice = fill && fill.shares > 0 ? fill.notional / fill.shares : undefined;
 
       return {
-        action: "BUY_YES",
+        action: entryAction,
+        accepted: true,
+        filledShares,
+        fillPrice,
+        orderId: placed.orderId,
+        reason: filledShares > 0 ? "LIVE_FILLED_OR_PARTIAL" : "LIVE_PLACED_NO_FILL"
+      };
+    } catch (error) {
+      openOrder.status = "REJECTED";
+      this.logger.error(
+        { error, marketId: params.marketId, tokenId: params.tokenId, side: params.side },
+        "POLY_LIVE_REJECT"
+      );
+      const payload: Record<string, unknown> = {
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        errorSummary: shortErrorSummary(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeErrorDetails(error);
+      }
+      this.logger.error(payload, "Polymarket order rejected");
+      const normalizedReason = this.normalizeOrderRejectReason(error);
+      return {
+        action: entryAction,
+        accepted: false,
+        filledShares: 0,
+        reason: normalizedReason
+      };
+    } finally {
+      this.openOrders.delete(localOrderId);
+    }
+  }
+
+  async executeExit(params: {
+    marketId: string;
+    tokenId: string;
+    side: "YES" | "NO";
+    shares: number;
+    bidPrice: number;
+    tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
+    negRisk?: boolean;
+  }): Promise<ExecutionResult> {
+    const price = clamp(params.bidPrice, 0.0001, 0.9999);
+    const exitAction = params.side === "YES" ? "SELL_YES" : "SELL_NO";
+    const positionKey = this.makePositionKey(params.marketId, params.tokenId);
+    const position = this.positions.get(positionKey);
+    const requestedShares = Number(params.shares);
+    const shares = position && position.side === params.side ? Math.min(requestedShares, position.shares) : 0;
+
+    if (!(requestedShares > 0) || !(shares > 0)) {
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "NO_POSITION_TO_EXIT"
+      };
+    }
+
+    const hasOpenDuplicate = Array.from(this.openOrders.values()).some(
+      (row) =>
+        row.marketId === params.marketId &&
+        row.tokenId === params.tokenId &&
+        row.side === "SELL" &&
+        row.status === "NEW"
+    );
+    if (hasOpenDuplicate) {
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "OPEN_ORDER_ALREADY_EXISTS"
+      };
+    }
+
+    if (this.config.polymarket.mode === "live" && this.remoteOpenSellTokenIds.has(params.tokenId)) {
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "REMOTE_OPEN_ORDER_ALREADY_EXISTS"
+      };
+    }
+
+    if (this.config.polymarket.mode === "paper") {
+      this.applyFill(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          orderSide: "SELL",
+          positionSide: params.side,
+          limitPrice: price
+        },
+        shares,
+        price
+      );
+      this.logger.info(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          mode: "paper",
+          shares,
+          price
+        },
+        "Polymarket paper fill"
+      );
+      return {
+        action: exitAction,
+        accepted: true,
+        filledShares: shares,
+        fillPrice: price,
+        reason: "PAPER_IMMEDIATE_FILL"
+      };
+    }
+
+    const localOrderId = randomUUID();
+    const limitPrice = clamp(price - this.config.polymarket.execution.takerPriceBuffer, 0.0001, 0.9999);
+    const ttlMs = this.config.polymarket.execution.orderTtlMs;
+    const startedTs = Date.now();
+    const openOrder: OpenOrderState = {
+      localOrderId,
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      side: "SELL",
+      limitPrice,
+      shares,
+      notionalUsd: shares * limitPrice,
+      matchedShares: 0,
+      createdTs: startedTs,
+      expiresTs: startedTs + ttlMs,
+      status: "NEW"
+    };
+    this.openOrders.set(localOrderId, openOrder);
+
+    try {
+      const placed = await this.client.placeMarketableOrder({
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        side: "SELL",
+        limitPrice,
+        size: shares,
+        ttlMs,
+        tickSize: params.tickSize,
+        negRisk: params.negRisk
+      });
+
+      openOrder.venueOrderId = placed.orderId;
+      this.submittedByVenueOrderId.set(placed.orderId, {
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        orderSide: "SELL",
+        positionSide: params.side,
+        limitPrice
+      });
+
+      const pollMs = Math.max(200, Math.min(1500, Math.floor(ttlMs / 3)));
+      while (Date.now() < openOrder.expiresTs) {
+        await this.refreshLiveState();
+
+        const currentMatched = this.fillsByVenueOrderId.get(placed.orderId)?.shares ?? 0;
+        openOrder.matchedShares = currentMatched;
+
+        const status = await this.client.getOrder(placed.orderId);
+        if (!status) {
+          await sleep(pollMs);
+          continue;
+        }
+
+        if (status.sizeMatched > currentMatched) {
+          this.recordFill(placed.orderId, status.sizeMatched - currentMatched, status.price);
+        }
+
+        const terminal = isTerminalStatus(status.status);
+        if (terminal) {
+          openOrder.status = status.sizeMatched > 0 ? "FILLED" : "CANCELLED";
+          break;
+        }
+
+        await sleep(pollMs);
+      }
+
+      if (openOrder.status === "NEW" && openOrder.venueOrderId) {
+        await this.client.cancelOrder(openOrder.venueOrderId);
+        openOrder.status = "CANCELLED";
+        this.logger.info(
+          {
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            orderId: openOrder.venueOrderId,
+            reason: "ORDER_TTL_EXPIRED"
+          },
+          "POLY_LIVE_CANCEL"
+        );
+      }
+
+      await this.refreshLiveState();
+      const fill = this.fillsByVenueOrderId.get(placed.orderId);
+      const filledShares = fill ? fill.shares : 0;
+      const fillPrice = fill && fill.shares > 0 ? fill.notional / fill.shares : undefined;
+
+      return {
+        action: exitAction,
         accepted: true,
         filledShares,
         fillPrice,
@@ -290,6 +540,12 @@ export class PolymarketExecution {
       this.remoteOpenBuyTokenIds = new Set(
         openOrders
           .filter((row) => row.side === "BUY")
+          .map((row) => row.assetId)
+          .filter((value) => value.length > 0)
+      );
+      this.remoteOpenSellTokenIds = new Set(
+        openOrders
+          .filter((row) => row.side === "SELL")
           .map((row) => row.assetId)
           .filter((value) => value.length > 0)
       );

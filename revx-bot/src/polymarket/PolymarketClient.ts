@@ -888,7 +888,7 @@ export class PolymarketClient {
     };
   }
 
-  async placeMarketableBuyYes(params: {
+  async placeMarketableOrder(params: {
     marketId?: string;
     tokenId: string;
     side: "BUY" | "SELL";
@@ -914,7 +914,7 @@ export class PolymarketClient {
         const expirationPlan = computeLiveOrderExpirationSec(params.ttlMs, Date.now());
         const { userOrder, options } = buildCreateOrderInput({
           tokenId: params.tokenId,
-          side: "BUY",
+          side: params.side,
           price: params.limitPrice,
           size: params.size,
           expirationSec: expirationPlan.expirationSec,
@@ -1039,6 +1039,7 @@ export class PolymarketClient {
   }
 
   async placeMarketableBuyYes(params: {
+    marketId?: string;
     tokenId: string;
     limitPrice: number;
     size: number;
@@ -1047,7 +1048,34 @@ export class PolymarketClient {
     negRisk?: boolean;
   }): Promise<{ orderId: string }> {
     return this.placeMarketableOrder({
-      ...params,
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      limitPrice: params.limitPrice,
+      size: params.size,
+      ttlMs: params.ttlMs,
+      tickSize: params.tickSize,
+      negRisk: params.negRisk,
+      side: "BUY"
+    });
+  }
+
+  async placeMarketableBuyNo(params: {
+    marketId?: string;
+    tokenId: string;
+    limitPrice: number;
+    size: number;
+    ttlMs: number;
+    tickSize?: TickSize;
+    negRisk?: boolean;
+  }): Promise<{ orderId: string }> {
+    return this.placeMarketableOrder({
+      marketId: params.marketId,
+      tokenId: params.tokenId,
+      limitPrice: params.limitPrice,
+      size: params.size,
+      ttlMs: params.ttlMs,
+      tickSize: params.tickSize,
+      negRisk: params.negRisk,
       side: "BUY"
     });
   }
