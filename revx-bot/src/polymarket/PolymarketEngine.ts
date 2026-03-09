@@ -63,6 +63,11 @@ type LivePollMode =
   | "EXPIRING"
   | "FAST_DISCOVERY_NEXT"
   | "LOCKED_ON_WINDOW";
+type SelectionBucketReconcileAction =
+  | "KEEP_CURRENT_SELECTION"
+  | "PROMOTE_CURRENT_BUCKET"
+  | "KEEP_NEXT_PREFETCH"
+  | "CLEAR_STALE_SELECTION";
 type RejectCountsByStage = Record<RejectStage, Record<string, number>>;
 type RejectSample = {
   stage: RejectStage;
@@ -1623,7 +1628,7 @@ export class PolymarketEngine {
       return null;
     }
     const slug = this.getMarketDeterministicSlug(params.market);
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const currentBucket = this.getFreshBtc5mWallClockBucket(params.nowTs);
     const timing = this.getCanonicalBtc5mTimingFromSlugOrRow({
       slug,
       rowStartTs: params.market.startTs ?? null,
@@ -1738,7 +1743,7 @@ export class PolymarketEngine {
     }
     if (!this.lastUsableLiveSelectedMarket) return null;
     if (!looksLikeBtc5mMarket(this.lastUsableLiveSelectedMarket)) return null;
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
     const cachedStartSec =
       parseBtc5mWindowStartSec(this.getMarketDeterministicSlug(this.lastUsableLiveSelectedMarket)) ??
       (Number.isFinite(Number(this.lastUsableLiveSelectedMarket.startTs)) &&
@@ -1844,8 +1849,9 @@ export class PolymarketEngine {
     };
   }
 
-  private getFreshBtc5mWallClockBucket(): Btc5mWallClockBucket {
-    const nowSec = Math.floor(Date.now() / 1000);
+  private getFreshBtc5mWallClockBucket(nowTs = Date.now()): Btc5mWallClockBucket {
+    const nowSec = Math.floor(nowTs / 1000);
+    // Wall-clock active bucket: 23:14:31 -> 23:10:00, 23:18:10 -> 23:15:00.
     const bucketStartSec = Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
     const windowStartTs = bucketStartSec * 1000;
     const windowEndTs = windowStartTs + FIVE_MIN_SEC * 1000;
@@ -1864,7 +1870,7 @@ export class PolymarketEngine {
     };
   }
 
-  private getExpectedCurrentBtc5mBucket(): {
+  private getExpectedCurrentBtc5mBucket(nowTs = Date.now()): {
     nowSec: number;
     bucketStartSec: number;
     currentBucketStartSec: number;
@@ -1876,7 +1882,7 @@ export class PolymarketEngine {
     windowEndTs: number;
     remainingSec: number;
   } {
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
     return {
       nowSec: currentBucket.nowSec,
       bucketStartSec: currentBucket.bucketStartSec,
@@ -1946,11 +1952,10 @@ export class PolymarketEngine {
   }
 
   private async fetchDeterministicLiveCandidateRows(nowTs: number): Promise<Record<string, unknown>[]> {
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
-    const slugs = [currentBucket.currentSlug, currentBucket.nextSlug, currentBucket.prevSlug];
+    const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
+    const slugs = this.getDeterministicBtc5mSlugCandidates(currentBucket);
     const out: Record<string, unknown>[] = [];
     const seen = new Set<string>();
-    let hadNetworkError = false;
     const addRow = (row: Record<string, unknown> | null | undefined): void => {
       if (!row || typeof row !== "object") return;
       const marketId = pickRawString(row, ["id", "market_id", "conditionId", "condition_id"]);
@@ -1962,7 +1967,6 @@ export class PolymarketEngine {
     };
     const directLookup = await this.directSlugResolver.lookupBySlugs(slugs);
     if (directLookup.hadNetworkError) {
-      hadNetworkError = true;
       this.markReadPathWarning("NETWORK_ERROR");
     }
     for (const candidate of directLookup.rows) {
@@ -1970,7 +1974,7 @@ export class PolymarketEngine {
     }
 
     // Only fall back to broad scan when direct slug lookup had no usable data.
-    const shouldFallbackScan = !directLookup.hadData || hadNetworkError;
+    const shouldFallbackScan = !directLookup.hadData;
     if (!shouldFallbackScan) {
       return out;
     }
@@ -2071,7 +2075,7 @@ export class PolymarketEngine {
     selectionSource: Btc5mSelectionSource;
   }): Promise<LiveMarketTradabilityValidation> {
     const slug = this.getMarketDeterministicSlug(params.market);
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const currentBucket = this.getFreshBtc5mWallClockBucket(params.nowTs);
     const nowSec = Math.floor(params.nowTs / 1000);
     if (params.market.enableOrderBook === false || params.market.acceptingOrders === false) {
       return {
@@ -2743,6 +2747,168 @@ export class PolymarketEngine {
       return Math.floor(Number(snapshot.remainingSec));
     }
     return null;
+  }
+
+  private getAwaitingResolutionMarketIds(): Set<string> {
+    const out = new Set<string>();
+    for (const position of this.execution.getPositions()) {
+      const marketId = String(position.marketId || "").trim();
+      if (marketId.length > 0) out.add(marketId);
+    }
+    for (const order of this.execution.getOpenOrders()) {
+      const marketId = String(order.marketId || "").trim();
+      if (marketId.length > 0) out.add(marketId);
+    }
+    for (const trade of this.paperLedger.getOpenTrades()) {
+      const marketId = String(trade.marketId || "").trim();
+      if (marketId.length > 0) out.add(marketId);
+    }
+    for (const trade of this.paperLedger.getResolutionQueueTrades()) {
+      const marketId = String(trade.marketId || "").trim();
+      if (marketId.length > 0) out.add(marketId);
+    }
+    return out;
+  }
+
+  private clearStaleSelectionForRollover(nowTs: number, reason: string): void {
+    const previousSelection = this.liveCommittedSelection;
+    const previousMarketId =
+      String(previousSelection?.selectedMarketId || this.persistedPolymarketSnapshot.selectedMarketId || "").trim() || null;
+    const previousTokenIds = new Set(
+      [
+        previousSelection?.selectedTokenId,
+        previousSelection?.yesTokenId,
+        previousSelection?.noTokenId,
+        this.persistedPolymarketSnapshot.selectedTokenId
+      ]
+        .map((value) => String(value || "").trim())
+        .filter((value) => value.length > 0)
+    );
+    const normalizedReason = normalizeHoldReason(reason) || "ROLLOVER_STALE_SELECTION_CLEARED";
+
+    this.liveCommittedSelection = null;
+    this.lastUsableLiveSelectedMarket = null;
+    this.selectedTokenIds = [];
+    this.polyState.selectedSlug = null;
+    this.polyState.selectedMarketId = null;
+    this.polyState.lastBookTsMs = 0;
+    this.polyState.lastYesBid = null;
+    this.polyState.lastYesAsk = null;
+    this.polyState.lastYesMid = null;
+
+    if (previousMarketId) {
+      this.latestYesBookByMarketId.delete(previousMarketId);
+    }
+    for (const tokenId of previousTokenIds) {
+      this.latestTokenBookByTokenId.delete(tokenId);
+    }
+
+    this.clearPersistedPolymarketSelection();
+    this.persistedPolymarketSnapshot = {
+      ...this.persistedPolymarketSnapshot,
+      status: "ROLLOVER_PENDING",
+      holdReason: normalizedReason,
+      executionBlockedReason: normalizedReason,
+      liveValidationReason: normalizedReason,
+      warningState: this.runtimeWarningState ?? this.persistedPolymarketSnapshot.warningState,
+      lastDecisionTs: nowTs
+    };
+    this.truthSelection = {
+      ...this.truthSelection,
+      selectedSlug: null,
+      selectedMarketId: null,
+      windowStartTs: null,
+      windowEndTs: null,
+      remainingSec: null
+    };
+  }
+
+  private reconcileSelectionWithCurrentBucket(params: {
+    nowTs: number;
+    selectedSlug: string | null;
+    selectedMarketId: string | null;
+    currentBucketSlug: string;
+    nextBucketSlug: string;
+    remainingSec: number | null;
+    selectionCommitTs: number | null;
+    holdReason: string | null;
+    selectedTradable: boolean;
+    bucketChanged: boolean;
+    hasCurrentTradableCandidate: boolean;
+    hasCurrentBookableCandidate: boolean;
+    openTradeMarketIds: Set<string>;
+  }): {
+    action: SelectionBucketReconcileAction;
+    hasOpenTradesForSelectedMarket: boolean;
+  } {
+    const selectedSlug = String(params.selectedSlug || "").trim() || null;
+    const selectedMarketId = String(params.selectedMarketId || "").trim() || null;
+    const selectedIsCurrent = selectedSlug !== null && selectedSlug === params.currentBucketSlug;
+    const selectedIsNextPrefetch =
+      selectedSlug !== null &&
+      selectedSlug === params.nextBucketSlug &&
+      (params.remainingSec === null || params.remainingSec > 0);
+    const selectedExpired = params.remainingSec !== null && params.remainingSec <= 0;
+    const selectedNonCurrent = Boolean(selectedSlug && !selectedIsCurrent && !selectedIsNextPrefetch);
+    const selectedNoLongerTradable = Boolean(selectedSlug && !params.selectedTradable && !selectedIsNextPrefetch);
+    const hasOpenTradesForSelectedMarket =
+      selectedMarketId !== null && params.openTradeMarketIds.has(selectedMarketId);
+
+    if (
+      selectedSlug &&
+      selectedSlug !== params.currentBucketSlug &&
+      (selectedExpired || selectedNonCurrent || selectedNoLongerTradable)
+    ) {
+      this.logger.error(
+        {
+          selectedSlug,
+          currentBucketSlug: params.currentBucketSlug,
+          nextBucketSlug: params.nextBucketSlug,
+          remainingSec: params.remainingSec,
+          selectionCommitTs: params.selectionCommitTs,
+          holdReason: normalizeHoldReason(params.holdReason) || null,
+          hasOpenTradesForSelectedMarket
+        },
+        "POLY_SELECTION_INVARIANT_BROKEN"
+      );
+    }
+
+    if (
+      params.hasCurrentTradableCandidate &&
+      params.hasCurrentBookableCandidate &&
+      (params.bucketChanged || !selectedIsCurrent || !params.selectedTradable)
+    ) {
+      return {
+        action: "PROMOTE_CURRENT_BUCKET",
+        hasOpenTradesForSelectedMarket
+      };
+    }
+
+    if (selectedIsCurrent && !selectedExpired) {
+      return {
+        action: "KEEP_CURRENT_SELECTION",
+        hasOpenTradesForSelectedMarket
+      };
+    }
+
+    if (selectedIsNextPrefetch) {
+      return {
+        action: "KEEP_NEXT_PREFETCH",
+        hasOpenTradesForSelectedMarket
+      };
+    }
+
+    if (hasOpenTradesForSelectedMarket) {
+      return {
+        action: "KEEP_CURRENT_SELECTION",
+        hasOpenTradesForSelectedMarket
+      };
+    }
+
+    return {
+      action: "CLEAR_STALE_SELECTION",
+      hasOpenTradesForSelectedMarket
+    };
   }
 
   private getLivePollMode(
@@ -3764,6 +3930,10 @@ export class PolymarketEngine {
     );
     const hasActiveSelection = Boolean(selectionSnapshot.selectedSlug || selectionSnapshot.selectedMarketId);
     const hasTrackedSelection = Boolean(trackedSelection.selectedSlug || trackedSelection.selectedMarketId);
+    const awaitingResolutionMarketIds = this.getAwaitingResolutionMarketIds();
+    const trackedHasAwaitingResolution =
+      Boolean(trackedSelection.selectedMarketId) &&
+      awaitingResolutionMarketIds.has(String(trackedSelection.selectedMarketId || "").trim());
     const trackedRemainingSec =
       trackedSelection.marketExpiresAtTs !== null
         ? Math.max(0, Math.floor((trackedSelection.marketExpiresAtTs - nowTs) / 1000))
@@ -3774,7 +3944,8 @@ export class PolymarketEngine {
       this.config.polymarket.mode === "live" &&
       hasTrackedSelection &&
       !hasActiveSelection &&
-      trackedRemainingSec !== null;
+      trackedRemainingSec !== null &&
+      trackedHasAwaitingResolution;
     const hasRenderableSelection = hasActiveSelection || preserveExpiredSelection;
     const lastDiscoverySuccessTs = Math.max(
       0,
@@ -4561,7 +4732,7 @@ export class PolymarketEngine {
         parseBtc5mWindowStartSec(selectedSlug);
       const activeCadenceStartSec =
         this.config.polymarket.mode === "live"
-          ? this.getFreshBtc5mWallClockBucket().bucketStartSec
+          ? this.getFreshBtc5mWallClockBucket(nowTs).bucketStartSec
           : windowTs(nowTs);
       // Selection validation is candidate-based; in live mode allow current or next cadence.
       const allowedCadenceStarts =
@@ -5510,10 +5681,23 @@ export class PolymarketEngine {
     attemptedSlugs: string[];
     fallbackUsed: "none" | "window" | "patterns" | "topActive";
   }> {
-    const currentBucket = this.getFreshBtc5mWallClockBucket();
+    const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
     const rolloverDemotion = this.demotePreviousCadenceLiveSelection(nowTs, currentBucket);
     this.logExpectedCurrentBtc5mSlug(rolloverDemotion.previousSelectedSlug, currentBucket);
     const attemptedSlugs = this.getDeterministicBtc5mSlugCandidates(currentBucket);
+    if (this.debugPoly) {
+      this.logger.info(
+        {
+          nowSec: currentBucket.nowSec,
+          currentBucketStartSec: currentBucket.currentBucketStartSec,
+          currentBucketSlug: currentBucket.currentSlug,
+          nextBucketSlug: currentBucket.nextSlug,
+          prevBucketSlug: currentBucket.prevSlug,
+          attemptedSlugs
+        },
+        "POLY_BTC5M_DISCOVERY_TICK"
+      );
+    }
     const activeStartSec = currentBucket.currentBucketStartSec;
     const nextStartSec = currentBucket.currentBucketStartSec + FIVE_MIN_SEC;
     let activeRefreshedSelection:
@@ -6087,7 +6271,7 @@ export class PolymarketEngine {
     }
 
     const shouldFallbackToBroadDiscovery =
-      eligibleDirectCandidates.length === 0 && (directLookup.hadNetworkError || !directLookup.hadData);
+      eligibleDirectCandidates.length === 0 && !directLookup.hadData;
     if (shouldFallbackToBroadDiscovery) {
       const broadRows = await safeListMarketsPage(
         {
@@ -6850,6 +7034,11 @@ export class PolymarketEngine {
     const slugNext = nextSlug(nowTs);
     const slugPrev = previousSlug(nowTs);
     const attemptedSlugs = Array.from(new Set([slugNow, slugNext, slugPrev]));
+    const tickBucket = this.getFreshBtc5mWallClockBucket(nowTs);
+    const previousTickBucketSlug = String(this.persistedPolymarketSnapshot.currentBucketSlug || "").trim() || null;
+    const bucketChangedThisTick =
+      previousTickBucketSlug !== null && previousTickBucketSlug !== tickBucket.currentSlug;
+    const openTradeMarketIds = deterministicBtc5mMode ? this.getAwaitingResolutionMarketIds() : new Set<string>();
     const sniperMinRemainingSec = Math.max(1, this.config.polymarket.paper.entryMinRemainingSec);
     const sniperMaxRemainingSec = Math.max(
       sniperMinRemainingSec,
@@ -6927,6 +7116,96 @@ export class PolymarketEngine {
       selectedReason = deterministicSelection.selectedReason;
       dominantReject = deterministicSelection.dominantReject;
       stageCounts = deterministicSelection.stageCounts;
+      const activeCommittedBeforeReconcile = this.getActiveLiveCommittedSelection(nowTs);
+      const selectedSlugForReconcile =
+        activeCommittedBeforeReconcile?.selectedSlug ?? selectedSlug ?? this.persistedPolymarketSnapshot.selectedSlug ?? null;
+      const selectedMarketIdForReconcile =
+        activeCommittedBeforeReconcile?.selectedMarketId ??
+        selectedMarket?.marketId ??
+        this.persistedPolymarketSnapshot.selectedMarketId ??
+        null;
+      const remainingSecForReconcile =
+        activeCommittedBeforeReconcile?.remainingSec ??
+        getSelectedRemainingSec() ??
+        this.getSelectionRemainingSecFromSnapshot(this.persistedPolymarketSnapshot, nowTs);
+      const selectedTradableForReconcile =
+        activeCommittedBeforeReconcile?.selectedTradable ??
+        selectedTradable ??
+        this.persistedPolymarketSnapshot.selectedTradable;
+      const hasCurrentTradableCandidate = Boolean(
+        selectedMarket &&
+          this.getMarketDeterministicSlug(selectedMarket) === tickBucket.currentSlug &&
+          selectedBookable &&
+          selectedTradable
+      );
+      const hasCurrentBookableCandidate = Boolean(
+        selectedMarket &&
+          this.getMarketDeterministicSlug(selectedMarket) === tickBucket.currentSlug &&
+          selectedBookable
+      );
+      const reconcileDecision = this.reconcileSelectionWithCurrentBucket({
+        nowTs,
+        selectedSlug: selectedSlugForReconcile,
+        selectedMarketId: selectedMarketIdForReconcile,
+        currentBucketSlug: tickBucket.currentSlug,
+        nextBucketSlug: tickBucket.nextSlug,
+        remainingSec: remainingSecForReconcile,
+        selectionCommitTs:
+          activeCommittedBeforeReconcile?.selectionCommitTs ??
+          selectionCommitTs ??
+          this.persistedPolymarketSnapshot.selectionCommitTs,
+        holdReason: activeCommittedBeforeReconcile?.holdReason ?? this.persistedPolymarketSnapshot.holdReason,
+        selectedTradable: selectedTradableForReconcile,
+        bucketChanged: bucketChangedThisTick,
+        hasCurrentTradableCandidate,
+        hasCurrentBookableCandidate,
+        openTradeMarketIds
+      });
+      if (reconcileDecision.action === "CLEAR_STALE_SELECTION") {
+        this.clearStaleSelectionForRollover(nowTs, "ROLLOVER_STALE_SELECTION_CLEARED");
+        selectedMarket = hasCurrentTradableCandidate ? selectedMarket : null;
+        selectedSlug = hasCurrentTradableCandidate && selectedMarket ? this.getMarketDeterministicSlug(selectedMarket) : null;
+        selectedWindowStart =
+          hasCurrentTradableCandidate && selectedMarket
+            ? selectedMarket.startTs ?? selectedWindowStart
+            : null;
+        selectedWindowEnd =
+          hasCurrentTradableCandidate && selectedMarket
+            ? selectedMarket.endTs ?? selectedWindowEnd
+            : null;
+        selectedAcceptingOrders =
+          hasCurrentTradableCandidate && selectedMarket ? selectedMarket.acceptingOrders ?? null : null;
+        selectedEnableOrderBook =
+          hasCurrentTradableCandidate && selectedMarket ? selectedMarket.enableOrderBook ?? null : null;
+        selectedCommittedTokenId =
+          hasCurrentTradableCandidate && selectedMarket
+            ? selectedCommittedTokenId ??
+              (selectedChosenSide === "NO"
+                ? String(selectedMarket.noTokenId || "").trim() || null
+                : String(selectedMarket.yesTokenId || "").trim() || null)
+            : null;
+        selectedBookable = hasCurrentTradableCandidate ? selectedBookable : false;
+        selectedTradable = hasCurrentTradableCandidate ? selectedTradable : false;
+        selectionSource = hasCurrentTradableCandidate ? "DIRECT_SLUG" : null;
+        selectedFrom = hasCurrentTradableCandidate ? "DIRECT_SLUG" : null;
+        selectionCommitTs = hasCurrentTradableCandidate ? nowTs : null;
+        liveValidationReason = hasCurrentTradableCandidate
+          ? liveValidationReason
+          : "ROLLOVER_STALE_SELECTION_CLEARED";
+      } else if (
+        reconcileDecision.action === "PROMOTE_CURRENT_BUCKET" &&
+        hasCurrentTradableCandidate &&
+        selectedMarket
+      ) {
+        selectedSlug = this.getMarketDeterministicSlug(selectedMarket) ?? tickBucket.currentSlug;
+        selectedWindowStart = selectedMarket.startTs ?? selectedWindowStart;
+        selectedWindowEnd = selectedMarket.endTs ?? selectedWindowEnd;
+        selectedAcceptingOrders = selectedMarket.acceptingOrders ?? selectedAcceptingOrders;
+        selectedEnableOrderBook = selectedMarket.enableOrderBook ?? selectedEnableOrderBook;
+        selectionSource = "DIRECT_SLUG";
+        selectedFrom = "DIRECT_SLUG";
+        selectionCommitTs = nowTs;
+      }
       const validationReasonUpper = String(liveValidationReason || "").trim().toUpperCase();
       if (selectedTradable && validationReasonUpper.startsWith("TRADABLE_")) {
         this.persistedPolymarketSnapshot = {
@@ -6954,7 +7233,7 @@ export class PolymarketEngine {
         ? [selectedMarket.yesTokenId, selectedMarket.noTokenId].filter(Boolean) as string[]
         : [];
       if (selectedMarket) {
-        const currentBucket = this.getFreshBtc5mWallClockBucket();
+        const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
         const selectedBucketStartSec =
           parseBtc5mWindowStartSec(selectedSlug) ??
           (Number.isFinite(Number(selectedMarket.startTs)) && Number(selectedMarket.startTs) > 0
@@ -7026,7 +7305,7 @@ export class PolymarketEngine {
               : null
         };
       } else {
-        const currentBucket = this.getFreshBtc5mWallClockBucket();
+        const currentBucket = this.getFreshBtc5mWallClockBucket(nowTs);
         let activeCommittedSelection = this.getActiveLiveCommittedSelection(nowTs);
         const activeSelectionBucketStartSec = this.getLiveSelectionCadenceStartSec(activeCommittedSelection);
         const liveValidationReasonText = String(liveValidationReason || "").trim().toUpperCase();
