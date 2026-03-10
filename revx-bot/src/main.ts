@@ -16,6 +16,7 @@ import { createStore } from "./store/factory";
 import { MakerStrategy } from "./strategy/MakerStrategy";
 import { DashboardServer } from "./web/DashboardServer";
 import { PolymarketEngine } from "./polymarket/PolymarketEngine";
+import { Btc5mLiveRunner } from "./polymarket/live/Btc5mLiveRunner";
 import { getTradingTruthReporter } from "./logging/truth";
 
 async function main(): Promise<void> {
@@ -79,9 +80,18 @@ async function main(): Promise<void> {
   const performanceEngine = config.performanceEnabled
     ? new PerformanceEngine(config, revxLogger, store, marketData)
     : undefined;
+  const polyLiveRunnerMode = String(process.env.POLY_LIVE_RUNNER || "").trim().toLowerCase();
+  const usePolymarketV2Runner =
+    config.polymarket.enabled &&
+    config.polymarket.mode === "live" &&
+    polyLiveRunnerMode === "v2";
   const polymarketEngine =
     config.polymarket.enabled
       ? new PolymarketEngine(config, pmLogger ?? logger, { store })
+      : undefined;
+  const polymarketV2Runner =
+    usePolymarketV2Runner
+      ? new Btc5mLiveRunner(config, pmLogger ?? logger, { store })
       : undefined;
   const execution = new Execution(config, revxLogger, client, store, config.dryRun);
   const reconciler = new Reconciler(config, reconLogger, client, store, marketData, performanceEngine);
@@ -110,6 +120,7 @@ async function main(): Promise<void> {
     logger.warn({ signal }, "Shutdown requested");
 
     strategy.stop();
+    await polymarketV2Runner?.stop("SHUTDOWN");
     await polymarketEngine?.stop("SHUTDOWN");
     reconciler.stop();
     externalQuoteService.stop();
@@ -162,9 +173,19 @@ async function main(): Promise<void> {
     }
     if (config.polymarket.enabled) {
       // Start Polymarket on its own async loop; never block RevX strategy cycle startup.
-      void polymarketEngine?.start().catch((error) => {
-        pmLogger?.error({ error }, "Polymarket engine failed to start in combined runtime");
-      });
+      if (usePolymarketV2Runner) {
+        pmLogger?.warn(
+          { liveRunner: "v2", mode: config.polymarket.mode },
+          "POLY_LIVE_RUNNER=v2 enabled; legacy PolymarketEngine live entry loop disabled"
+        );
+        void polymarketV2Runner?.start().catch((error) => {
+          pmLogger?.error({ error }, "Polymarket v2 live runner failed to start");
+        });
+      } else {
+        void polymarketEngine?.start().catch((error) => {
+          pmLogger?.error({ error }, "Polymarket engine failed to start in combined runtime");
+        });
+      }
     }
     externalQuoteService.start();
     newsEngine.start();
@@ -177,6 +198,7 @@ async function main(): Promise<void> {
     if (!shuttingDown) {
       logger.error("Main loop exited without SIGINT/SIGTERM; stopping Polymarket with UNEXPECTED_EXIT");
     }
+    await polymarketV2Runner?.stop(shuttingDown ? "SHUTDOWN" : "UNEXPECTED_EXIT");
     await polymarketEngine?.stop(shuttingDown ? "SHUTDOWN" : "UNEXPECTED_EXIT");
     externalQuoteService.stop();
     newsEngine.stop();

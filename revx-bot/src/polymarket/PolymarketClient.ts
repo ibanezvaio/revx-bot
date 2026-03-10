@@ -620,6 +620,78 @@ export class PolymarketClient {
     return out;
   }
 
+  async getMarketsBySlugPathFirst(slug: string): Promise<RawPolymarketMarket[]> {
+    const needle = String(slug || "").trim().toLowerCase();
+    if (!needle) return [];
+
+    const out: RawPolymarketMarket[] = [];
+    const seen = new Set<string>();
+    const addRows = (payload: unknown): void => {
+      const parsed = parseMarketsPage(payload).rows;
+      const rowLike =
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as Record<string, unknown>)
+          : null;
+      const rows =
+        rowLike && pickString(rowLike, ["id", "market_id", "conditionId", "condition_id", "slug"])
+          ? [rowLike, ...parsed]
+          : parsed;
+      for (const row of rows) {
+        if (extractMarketSlug(row).toLowerCase() !== needle) continue;
+        const key = marketUniqueKey(row, out.length);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+      }
+    };
+
+    let pathLookupOk = false;
+    try {
+      const payload = await this.requestJson(
+        "GET",
+        this.gammaBaseUrl,
+        `/markets/slug/${encodeURIComponent(needle)}`
+      );
+      pathLookupOk = true;
+      addRows(payload);
+    } catch (error) {
+      const payload: Record<string, unknown> = {
+        slug: needle,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.warn(payload, "Polymarket market-by-slug path lookup failed");
+    }
+
+    // Query fallback is only used when the path lookup itself failed.
+    if (!pathLookupOk) {
+      try {
+        const params = new URLSearchParams({
+          slug: needle,
+          limit: "50",
+          active: "true",
+          closed: "false",
+          archived: "false"
+        });
+        const payload = await this.requestJson("GET", this.gammaBaseUrl, `/markets?${params.toString()}`);
+        addRows(payload);
+      } catch (error) {
+        const payload: Record<string, unknown> = {
+          slug: needle,
+          errorSummary: shortErrorMessage(error)
+        };
+        if (this.isPolyVerboseDebug()) {
+          payload.error = serializeError(error);
+        }
+        this.logger.warn(payload, "Polymarket market-by-slug query fallback failed");
+      }
+    }
+
+    return out;
+  }
+
   async getActiveMarketBySlug(slug: string): Promise<RawPolymarketMarket | null> {
     const needle = String(slug || "").trim().toLowerCase();
     if (!needle) return null;
