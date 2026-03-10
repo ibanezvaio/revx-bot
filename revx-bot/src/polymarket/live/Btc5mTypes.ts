@@ -48,13 +48,20 @@ export type Btc5mDecisionAction = "BUY_YES" | "BUY_NO" | "HOLD";
 export type Btc5mDecision = {
   action: Btc5mDecisionAction;
   blocker: string | null;
+  blockerSeverity: "hard" | "warning-only" | null;
+  warning: string | null;
   chosenSide: Btc5mSide | null;
   edge: number;
   threshold: number;
   spread: number;
+  maxSpread: number;
+  remainingSec: number;
+  minEntryRemainingSec: number;
+  oracleAgeMs: number | null;
+  oracleWarnMs: number;
+  oracleHardBlockMs: number;
   sideEnabled: boolean;
   orderbookOk: boolean;
   sideAsk: number | null;
   pUpModel: number | null;
 };
-

@@ -112,6 +112,8 @@ export type PolymarketConfig = {
     maxSpread: number;
     yesMidMin: number;
     yesMidMax: number;
+    oracleWarnMs: number;
+    oracleHardBlockMs: number;
     fastPollRemainingSec: number;
     veryFastPollRemainingSec: number;
     fastPollMs: number;
@@ -1257,6 +1259,19 @@ export function loadConfig(): BotConfig {
     0,
     1
   );
+  const polymarketLiveOracleWarnMs = clampInt(
+    numberWithDefault("POLYMARKET_LIVE_ORACLE_WARN_MS", polymarketStaleMs),
+    0,
+    10 * 60_000
+  );
+  const polymarketLiveOracleHardBlockMs = clampInt(
+    numberWithDefault(
+      "POLYMARKET_LIVE_ORACLE_HARD_BLOCK_MS",
+      Math.max(polymarketLiveOracleWarnMs + 1, 120_000)
+    ),
+    polymarketLiveOracleWarnMs + 1,
+    30 * 60_000
+  );
   const polymarketLiveYesMidMin = clampNumber(numberWithDefault("POLYMARKET_LIVE_YES_MID_MIN", 0.0005), 0, 0.5);
   const polymarketLiveYesMidMax = clampNumber(
     numberWithDefault("POLYMARKET_LIVE_YES_MID_MAX", 0.9995),
@@ -1953,6 +1968,8 @@ export function loadConfig(): BotConfig {
         maxSpread: polymarketLiveMaxSpread,
         yesMidMin: polymarketLiveYesMidMin,
         yesMidMax: polymarketLiveYesMidMax,
+        oracleWarnMs: polymarketLiveOracleWarnMs,
+        oracleHardBlockMs: polymarketLiveOracleHardBlockMs,
         fastPollRemainingSec: polymarketLiveFastPollRemainingSec,
         veryFastPollRemainingSec: polymarketLiveVeryFastPollRemainingSec,
         fastPollMs: polymarketLiveFastPollMs,

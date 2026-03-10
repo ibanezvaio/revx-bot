@@ -10,6 +10,7 @@
     "start": "node dist/main.js",
     "cli": "node dist/cli.js",
     "polymarket": "npm run build && node dist/cli.js polymarket --btc5m --paper",
+    "poly:v2-smoke": "npm run build && node dist/scripts/polyV2Smoke.js",
     "polymarket:paper-reset": "npm run build && node dist/scripts/resetPolymarketPaperHistory.js",
     "polymarket:btc5m:clean": "npm run polymarket:paper-reset && node dist/cli.js polymarket --btc5m --paper",
     "polymarket:ping": "npm run build && node dist/cli.js polymarket ping --paper",

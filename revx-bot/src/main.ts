@@ -93,11 +93,12 @@ async function main(): Promise<void> {
     usePolymarketV2Runner
       ? new Btc5mLiveRunner(config, pmLogger ?? logger, { store })
       : undefined;
+  const polymarketRuntimeProvider = usePolymarketV2Runner ? polymarketV2Runner : polymarketEngine;
   const execution = new Execution(config, revxLogger, client, store, config.dryRun);
   const reconciler = new Reconciler(config, reconLogger, client, store, marketData, performanceEngine);
   const dashboard = new DashboardServer(config, webLogger, store, execution.getRunId(), {
     cancelAllBotOrders: async () => execution.cancelAllBotOrders(config.symbol)
-  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine, polymarketEngine);
+  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine, polymarketRuntimeProvider);
   const strategy = new MakerStrategy(
     config,
     revxLogger,
@@ -114,7 +115,7 @@ async function main(): Promise<void> {
     intelEngine
   );
   let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
+  const shutdown = async (signal: string, exitCode = 0): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.warn({ signal }, "Shutdown requested");
@@ -137,7 +138,7 @@ async function main(): Promise<void> {
     }
 
     store.close();
-    process.exit(0);
+    process.exit(exitCode);
   };
 
   process.on("SIGINT", () => {
@@ -180,6 +181,7 @@ async function main(): Promise<void> {
         );
         void polymarketV2Runner?.start().catch((error) => {
           pmLogger?.error({ error }, "Polymarket v2 live runner failed to start");
+          void shutdown("POLY_V2_STARTUP_FAILED", 1);
         });
       } else {
         void polymarketEngine?.start().catch((error) => {
