@@ -80,6 +80,7 @@ export class Btc5mLiveRunner {
   private executionCooldownUntilTs = 0;
   private invalidatedAttemptIds = new Set<string>();
   private previousCurrentSlug: string | null = null;
+  private lastRolloverTs = 0;
   private state: RuntimeState = {
     running: false,
     fetchOk: false,
@@ -380,6 +381,7 @@ export class Btc5mLiveRunner {
         },
         "POLY_V2_MARKET_ROLLOVER"
       );
+      this.lastRolloverTs = tick.tickNowMs;
       this.invalidateExecutionAttempt("ROLLOVER", {
         currentSlug: tick.currentSlug,
         selectedSlug: this.activeExecutionAttempt?.selectedSlug ?? null
@@ -657,8 +659,39 @@ export class Btc5mLiveRunner {
     if (!input.decision.chosenSide || !tokenId) {
       return { action: "HOLD", blocker: "TOKEN_NOT_BOOKABLE" };
     }
-    if (!this.isExecutionSlugEligible(input.selected.slug, input.tick)) {
-      return { action: "HOLD", blocker: "STALE_EXECUTION_SLUG" };
+    if (input.selected.slug !== input.tick.currentSlug) {
+      this.logger.warn(
+        {
+          executionSlug: input.selected.slug,
+          currentSlug: input.tick.currentSlug,
+          selectedSlug: input.selected.slug,
+          side: input.decision.chosenSide,
+          tokenId,
+          retryCount: 0,
+          reason: "INVARIANT_EXECUTION_SLUG_NOT_CURRENT"
+        },
+        "POLY_V2_SKIP_NEXT_MARKET_EXECUTION"
+      );
+      return { action: "HOLD", blocker: "NEXT_MARKET_PRELOAD_ONLY" };
+    }
+
+    const postRolloverGraceMs = this.getPostRolloverGraceMs();
+    const elapsedSinceRolloverMs = this.lastRolloverTs > 0 ? input.tick.tickNowMs - this.lastRolloverTs : Number.POSITIVE_INFINITY;
+    if (elapsedSinceRolloverMs < postRolloverGraceMs) {
+      this.logger.warn(
+        {
+          executionSlug: input.selected.slug,
+          currentSlug: input.tick.currentSlug,
+          selectedSlug: input.selected.slug,
+          side: input.decision.chosenSide,
+          tokenId,
+          retryCount: 0,
+          elapsedMs: elapsedSinceRolloverMs,
+          graceMs: postRolloverGraceMs
+        },
+        "POLY_V2_POST_ROLLOVER_GRACE"
+      );
+      return { action: "HOLD", blocker: "POST_ROLLOVER_GRACE" };
     }
 
     const active = this.activeExecutionAttempt;
@@ -732,7 +765,7 @@ export class Btc5mLiveRunner {
         if (timeoutHandle) clearTimeout(timeoutHandle);
 
         if (raceResult === "TIMEOUT") {
-          this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+          this.applyExecutionCooldown("EXECUTION_DEADLINE_EXCEEDED", this.getExecutionCooldownMs(), attempt);
           this.logger.warn(
             {
               attemptId: attempt.attemptId,
@@ -746,10 +779,7 @@ export class Btc5mLiveRunner {
             },
             "POLY_V2_EXECUTION_TIMEOUT"
           );
-          this.invalidateExecutionAttempt("TIMEOUT", {
-            currentSlug: this.state.currentBucketSlug ?? null,
-            selectedSlug: attempt.selectedSlug
-          });
+          this.resetExecutionAttemptState("EXECUTION_DEADLINE_EXCEEDED", attempt);
           return;
         }
 
@@ -759,8 +789,17 @@ export class Btc5mLiveRunner {
         }
 
         if (raceResult.action === "HOLD" && raceResult.blocker) {
+          if (raceResult.blocker === "STALE_AFTER_POST") {
+            this.applyExecutionCooldown("STALE_AFTER_POST", this.getStaleAfterPostCooldownMs(), attempt);
+            this.resetExecutionAttemptState("STALE_AFTER_POST", attempt);
+            return;
+          }
+          if (raceResult.blocker === "STALE_ATTEMPT_ABORTED") {
+            this.resetExecutionAttemptState("STALE_ATTEMPT_ABORTED", attempt);
+            return;
+          }
           if (isTransientExecutionError(raceResult.blocker)) {
-            this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+            this.applyExecutionCooldown(raceResult.blocker, this.getExecutionCooldownMs(), attempt);
           }
           this.logger.warn(
             {
@@ -777,7 +816,7 @@ export class Btc5mLiveRunner {
           );
         }
       } catch (error) {
-        this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+        this.applyExecutionCooldown("EXECUTION_EXCEPTION", this.getExecutionCooldownMs(), attempt);
         this.logger.warn(
           {
             attemptId: attempt.attemptId,
@@ -791,6 +830,7 @@ export class Btc5mLiveRunner {
           },
           "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
         );
+        this.resetExecutionAttemptState("EXECUTION_EXCEPTION", attempt);
       } finally {
         if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
           this.activeExecutionAttempt = null;
@@ -824,6 +864,48 @@ export class Btc5mLiveRunner {
       "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
     );
     this.activeExecutionAttempt = null;
+  }
+
+  private resetExecutionAttemptState(reason: string, attempt: ExecutionAttempt): void {
+    this.invalidatedAttemptIds.add(attempt.attemptId);
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_EXECUTION_ATTEMPT_RESET"
+    );
+    if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
+      this.activeExecutionAttempt = null;
+    }
+  }
+
+  private applyExecutionCooldown(reason: string, cooldownMs: number, attempt: ExecutionAttempt): void {
+    const untilTs = Date.now() + cooldownMs;
+    if (untilTs > this.executionCooldownUntilTs) {
+      this.executionCooldownUntilTs = untilTs;
+    }
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason,
+        cooldownMs,
+        cooldownUntilTs: this.executionCooldownUntilTs
+      },
+      "POLY_V2_RETRY_COOLDOWN"
+    );
   }
 
   private isExecutionAttemptActive(attempt: ExecutionAttempt): boolean {
@@ -865,16 +947,19 @@ export class Btc5mLiveRunner {
       "POLY_V2_ABORT_STALE_ATTEMPT"
     );
     this.logExecutionAttemptStale(attempt, reason);
+    if (reason === "STALE_AFTER_POST") {
+      return { action: "HOLD", blocker: "STALE_AFTER_POST" };
+    }
     return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
   }
 
   private isExecutionSlugEligible(slug: string, tick: Btc5mTick): boolean {
-    return slug === tick.currentSlug || slug === tick.nextSlug;
+    return slug === tick.currentSlug;
   }
 
   private getExecutionDeadlineMs(): number {
-    const envValue = Number(process.env.POLY_V2_EXECUTION_DEADLINE_MS || 4_000);
-    if (!Number.isFinite(envValue)) return 4_000;
+    const envValue = Number(process.env.POLY_V2_EXECUTION_DEADLINE_MS || 25_000);
+    if (!Number.isFinite(envValue)) return 25_000;
     return Math.max(1_000, Math.min(30_000, Math.floor(envValue)));
   }
 
@@ -882,6 +967,18 @@ export class Btc5mLiveRunner {
     const envValue = Number(process.env.POLY_V2_EXECUTION_COOLDOWN_MS || 5_000);
     if (!Number.isFinite(envValue)) return 5_000;
     return Math.max(1_000, Math.min(120_000, Math.floor(envValue)));
+  }
+
+  private getStaleAfterPostCooldownMs(): number {
+    const envValue = Number(process.env.POLY_V2_STALE_AFTER_POST_COOLDOWN_MS || 4_000);
+    if (!Number.isFinite(envValue)) return 4_000;
+    return Math.max(1_000, Math.min(30_000, Math.floor(envValue)));
+  }
+
+  private getPostRolloverGraceMs(): number {
+    const envValue = Number(process.env.POLY_V2_POST_ROLLOVER_GRACE_MS || 6_000);
+    if (!Number.isFinite(envValue)) return 6_000;
+    return Math.max(0, Math.min(30_000, Math.floor(envValue)));
   }
 
   private async maybeExecuteDecision(input: {

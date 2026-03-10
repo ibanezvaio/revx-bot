@@ -25,7 +25,7 @@ type RollingPoint = {
   ema: number;
 };
 
-const VENUES: VenueId[] = ["coinbase", "binance", "kraken"];
+const DEFAULT_VENUES: VenueId[] = ["coinbase", "binance", "kraken"];
 const MAX_ROLLING_POINTS = 2_000;
 
 export class CrossVenueSignalEngine {
@@ -49,7 +49,8 @@ export class CrossVenueSignalEngine {
   }
 
   async compute(symbol: string, revxMid: number, nowTs = Date.now()): Promise<CrossVenueComputation> {
-    const rawSnapshots = await Promise.all(VENUES.map((venue) => this.refreshVenue(venue, symbol, nowTs)));
+    const venues = this.resolveConfiguredVenues();
+    const rawSnapshots = await Promise.all(venues.map((venue) => this.refreshVenue(venue, symbol, nowTs)));
     const fair = this.fairPriceModel.compute(symbol, revxMid, rawSnapshots, nowTs);
     const venueHealth = this.fairPriceModel.toVenueHealth(fair.venues);
     const healthyVenues = venueHealth.filter((row) => row.ok && !row.stale && row.mid && row.mid > 0);
@@ -96,10 +97,42 @@ export class CrossVenueSignalEngine {
     };
     this.lastSignal = signal;
 
+    const providerStatus = rawSnapshots.map((row) => {
+      const ageMs = Math.max(0, nowTs - Number(row.ts || nowTs));
+      const fresh = ageMs <= this.config.fairStaleMs;
+      const accepted = Boolean(row.ok) && Number(row.mid || 0) > 0 && fresh;
+      return {
+        provider: row.venue,
+        requestedSymbol: symbol,
+        responseOk: Boolean(row.ok),
+        mid: row.mid,
+        ageMs,
+        fresh,
+        accepted,
+        error: row.error ?? null
+      };
+    });
+    this.logger.debug(
+      {
+        symbol,
+        configuredProviders: venues,
+        providerStatus,
+        finalAcceptedVenueCount: providerStatus.filter((row) => row.accepted).length
+      },
+      "Cross-venue provider pipeline"
+    );
+
     if (confidence === 0 && healthyVenues.length === 0 && nowTs - this.lastNoHealthyWarnMs >= 30_000) {
       this.lastNoHealthyWarnMs = nowTs;
       this.logger.warn(
-        { symbol, reason: fair.reason ?? "no healthy cross-venue snapshots", revxMid },
+        {
+          symbol,
+          reason: fair.reason ?? "no healthy cross-venue snapshots",
+          revxMid,
+          configuredProviders: venues,
+          providerStatus,
+          finalAcceptedVenueCount: providerStatus.filter((row) => row.accepted).length
+        },
         "Cross-venue signal low confidence"
       );
     }
@@ -121,11 +154,32 @@ export class CrossVenueSignalEngine {
       return runtime.inFlight;
     }
     if (runtime.lastSnapshot && nowTs < runtime.nextAllowedTs) {
-      return runtime.lastSnapshot;
+      const ageMs = Math.max(0, nowTs - Number(runtime.lastSnapshot.ts || nowTs));
+      const reusable =
+        Boolean(runtime.lastSnapshot.ok) &&
+        Number(runtime.lastSnapshot.mid || 0) > 0 &&
+        ageMs <= this.config.fairStaleMs;
+      if (reusable) {
+        this.logger.debug(
+          {
+            provider: venue,
+            requestedSymbol: symbol,
+            responseOk: runtime.lastSnapshot.ok,
+            mid: runtime.lastSnapshot.mid,
+            status: "CACHED_REUSE",
+            ageMs,
+            fresh: true
+          },
+          "Cross-venue provider response"
+        );
+        return runtime.lastSnapshot;
+      }
     }
 
     const fetchPromise = this.fetchVenueSnapshot(venue, symbol)
       .then((snapshot) => {
+        const ageMs = Math.max(0, nowTs - Number(snapshot.ts || nowTs));
+        const fresh = ageMs <= this.config.fairStaleMs;
         if (snapshot.ok && snapshot.mid !== null && snapshot.mid > 0) {
           runtime.failureCount = 0;
           runtime.nextAllowedTs = nowTs + this.config.venueRefreshMs;
@@ -137,6 +191,19 @@ export class CrossVenueSignalEngine {
           );
           runtime.nextAllowedTs = nowTs + backoffMs;
         }
+        this.logger.debug(
+          {
+            provider: venue,
+            requestedSymbol: symbol,
+            responseOk: snapshot.ok,
+            mid: snapshot.mid,
+            status: snapshot.ok ? "OK" : "BAD_RESPONSE",
+            ageMs,
+            fresh,
+            error: snapshot.error ?? null
+          },
+          "Cross-venue provider response"
+        );
         runtime.lastSnapshot = snapshot;
         runtime.inFlight = null;
         return snapshot;
@@ -161,12 +228,34 @@ export class CrossVenueSignalEngine {
           ok: false,
           error: (error as Error).message
         };
+        this.logger.debug(
+          {
+            provider: venue,
+            requestedSymbol: symbol,
+            responseOk: false,
+            mid: null,
+            status: "FETCH_ERROR",
+            ageMs: 0,
+            fresh: false,
+            error: failed.error ?? null
+          },
+          "Cross-venue provider response"
+        );
         runtime.lastSnapshot = failed;
         runtime.inFlight = null;
         return failed;
       });
     runtime.inFlight = fetchPromise;
     return fetchPromise;
+  }
+
+  private resolveConfiguredVenues(): VenueId[] {
+    const raw = Array.isArray(this.config.signalVenues) ? this.config.signalVenues : [];
+    const parsed = raw
+      .map((row) => String(row || "").trim().toLowerCase())
+      .filter((row): row is VenueId => row === "coinbase" || row === "binance" || row === "kraken");
+    if (parsed.length === 0) return DEFAULT_VENUES;
+    return Array.from(new Set(parsed));
   }
 
   private async fetchVenueSnapshot(
