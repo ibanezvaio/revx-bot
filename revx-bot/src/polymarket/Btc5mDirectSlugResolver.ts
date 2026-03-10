@@ -4,7 +4,7 @@ import { PolymarketClient, RawPolymarketMarket } from "./PolymarketClient";
 export type Btc5mDirectLookupRow = {
   row: Record<string, unknown>;
   slug: string;
-  source: "slug_query" | "search_query";
+  source: "slug_api";
 };
 
 export type Btc5mDirectLookupResult = {
@@ -51,14 +51,7 @@ export class Btc5mDirectSlugResolver {
     for (const slug of attemptedSlugs) {
       let bySlug: RawPolymarketMarket[] = [];
       try {
-        const page = await this.client.listMarketsPage({
-          limit: 100,
-          slug,
-          active: true,
-          closed: false,
-          archived: false
-        });
-        bySlug = Array.isArray(page.rows) ? page.rows : [];
+        bySlug = await this.client.getMarketsBySlug(slug);
       } catch (error) {
         hadNetworkError = true;
         this.logger.warn(
@@ -70,30 +63,7 @@ export class Btc5mDirectSlugResolver {
         );
       }
 
-      appendRows(slug, "slug_query", bySlug);
-      if (bySlug.length > 0) {
-        continue;
-      }
-
-      try {
-        const page = await this.client.listMarketsPage({
-          limit: 100,
-          search: slug,
-          active: true,
-          closed: false,
-          archived: false
-        });
-        appendRows(slug, "search_query", Array.isArray(page.rows) ? page.rows : []);
-      } catch (error) {
-        hadNetworkError = true;
-        this.logger.warn(
-          {
-            slug,
-            error: shortErrorMessage(error)
-          },
-          "Direct BTC5m search lookup failed"
-        );
-      }
+      appendRows(slug, "slug_api", bySlug);
     }
 
     return {

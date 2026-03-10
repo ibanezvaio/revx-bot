@@ -553,6 +553,73 @@ export class PolymarketClient {
     return parseMarketsPage(payload);
   }
 
+  async getMarketsBySlug(slug: string): Promise<RawPolymarketMarket[]> {
+    const needle = String(slug || "").trim().toLowerCase();
+    if (!needle) return [];
+
+    const out: RawPolymarketMarket[] = [];
+    const seen = new Set<string>();
+    const addRows = (payload: unknown): void => {
+      const parsed = parseMarketsPage(payload).rows;
+      const rowLike =
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as Record<string, unknown>)
+          : null;
+      const rows =
+        rowLike && pickString(rowLike, ["id", "market_id", "conditionId", "condition_id", "slug"])
+          ? [rowLike, ...parsed]
+          : parsed;
+      for (const row of rows) {
+        if (extractMarketSlug(row).toLowerCase() !== needle) continue;
+        const key = marketUniqueKey(row, out.length);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+      }
+    };
+
+    try {
+      const payload = await this.requestJson(
+        "GET",
+        this.gammaBaseUrl,
+        `/markets/slug/${encodeURIComponent(needle)}`
+      );
+      addRows(payload);
+    } catch (error) {
+      const payload: Record<string, unknown> = {
+        slug: needle,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.warn(payload, "Polymarket market-by-slug path lookup failed");
+    }
+
+    try {
+      const params = new URLSearchParams({
+        slug: needle,
+        limit: "50",
+        active: "true",
+        closed: "false",
+        archived: "false"
+      });
+      const payload = await this.requestJson("GET", this.gammaBaseUrl, `/markets?${params.toString()}`);
+      addRows(payload);
+    } catch (error) {
+      const payload: Record<string, unknown> = {
+        slug: needle,
+        errorSummary: shortErrorMessage(error)
+      };
+      if (this.isPolyVerboseDebug()) {
+        payload.error = serializeError(error);
+      }
+      this.logger.warn(payload, "Polymarket market-by-slug query lookup failed");
+    }
+
+    return out;
+  }
+
   async getActiveMarketBySlug(slug: string): Promise<RawPolymarketMarket | null> {
     const needle = String(slug || "").trim().toLowerCase();
     if (!needle) return null;
@@ -566,14 +633,8 @@ export class PolymarketClient {
     };
 
     try {
-      const direct = await this.listMarketsPage({
-        limit: 25,
-        slug: needle,
-        active: true,
-        closed: false,
-        archived: false
-      });
-      const exact = findExact(direct.rows);
+      const direct = await this.getMarketsBySlug(needle);
+      const exact = findExact(direct);
       if (exact) return exact;
     } catch (error) {
       const payload: Record<string, unknown> = {

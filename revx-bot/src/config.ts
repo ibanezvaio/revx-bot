@@ -107,6 +107,11 @@ export type PolymarketConfig = {
   debugDisableRevolutBaselineWhileLive: boolean;
   live: {
     minEntryRemainingSec: number;
+    minEdgeThreshold: number;
+    enableNoSide: boolean;
+    maxSpread: number;
+    yesMidMin: number;
+    yesMidMax: number;
     fastPollRemainingSec: number;
     veryFastPollRemainingSec: number;
     fastPollMs: number;
@@ -1241,6 +1246,23 @@ export function loadConfig(): BotConfig {
     1,
     300
   );
+  const polymarketLiveMinEdgeThreshold = clampNumber(
+    numberWithFallback(["POLYMARKET_LIVE_MIN_EDGE", "POLYMARKET_LIVE_MIN_EDGE_THRESHOLD"], 0.0005),
+    0,
+    0.5
+  );
+  const polymarketLiveEnableNoSide = boolWithDefault("POLYMARKET_LIVE_ENABLE_NO_SIDE", true);
+  const polymarketLiveMaxSpread = clampNumber(
+    numberWithDefault("POLYMARKET_LIVE_MAX_SPREAD", Math.min(1, polymarketMaxSpread + 0.02)),
+    0,
+    1
+  );
+  const polymarketLiveYesMidMin = clampNumber(numberWithDefault("POLYMARKET_LIVE_YES_MID_MIN", 0.0005), 0, 0.5);
+  const polymarketLiveYesMidMax = clampNumber(
+    numberWithDefault("POLYMARKET_LIVE_YES_MID_MAX", 0.9995),
+    0.5,
+    0.9999
+  );
   const polymarketLiveFastPollRemainingSec = clampInt(
     numberWithDefault("POLYMARKET_LIVE_FAST_POLL_REMAINING_SEC", 120),
     10,
@@ -1465,6 +1487,9 @@ export function loadConfig(): BotConfig {
     throw new Error(
       "POLYMARKET_LIVE_FAST_POLL_REMAINING_SEC must be >= POLYMARKET_LIVE_VERY_FAST_POLL_REMAINING_SEC"
     );
+  }
+  if (polymarketLiveYesMidMin >= polymarketLiveYesMidMax) {
+    throw new Error("POLYMARKET_LIVE_YES_MID_MAX must be > POLYMARKET_LIVE_YES_MID_MIN");
   }
   if (polymarketExtremeHighPrice <= polymarketExtremeLowPrice) {
     throw new Error("POLYMARKET_EXTREME_HIGH_PRICE must be > POLYMARKET_EXTREME_LOW_PRICE");
@@ -1923,6 +1948,11 @@ export function loadConfig(): BotConfig {
       debugDisableRevolutBaselineWhileLive: polymarketDebugDisableRevolutBaselineWhileLive,
       live: {
         minEntryRemainingSec: polymarketLiveMinEntryRemainingSec,
+        minEdgeThreshold: polymarketLiveMinEdgeThreshold,
+        enableNoSide: polymarketLiveEnableNoSide,
+        maxSpread: polymarketLiveMaxSpread,
+        yesMidMin: polymarketLiveYesMidMin,
+        yesMidMax: polymarketLiveYesMidMax,
         fastPollRemainingSec: polymarketLiveFastPollRemainingSec,
         veryFastPollRemainingSec: polymarketLiveVeryFastPollRemainingSec,
         fastPollMs: polymarketLiveFastPollMs,
