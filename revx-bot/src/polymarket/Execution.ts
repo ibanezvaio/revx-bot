@@ -49,6 +49,7 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<ExecutionResult> {
     return this.executeEntry({
       marketId: params.marketId,
@@ -57,7 +58,8 @@ export class PolymarketExecution {
       askPrice: params.yesAsk,
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
-      negRisk: params.negRisk
+      negRisk: params.negRisk,
+      executionGuard: params.executionGuard
     });
   }
 
@@ -68,6 +70,7 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<ExecutionResult> {
     return this.executeEntry({
       marketId: params.marketId,
@@ -76,7 +79,8 @@ export class PolymarketExecution {
       askPrice: params.noAsk,
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
-      negRisk: params.negRisk
+      negRisk: params.negRisk,
+      executionGuard: params.executionGuard
     });
   }
 
@@ -88,10 +92,21 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<ExecutionResult> {
     const price = clamp(params.askPrice, 0.0001, 0.9999);
     const shares = params.notionalUsd / price;
     const entryAction = params.side === "YES" ? "BUY_YES" : "BUY_NO";
+    const staleAbort = (): ExecutionResult => ({
+      action: "HOLD",
+      accepted: false,
+      filledShares: 0,
+      reason: "STALE_ATTEMPT_ABORTED"
+    });
+    const shouldContinue = (): boolean => (params.executionGuard ? params.executionGuard() : true);
+    if (!shouldContinue()) {
+      return staleAbort();
+    }
 
     if (!(params.notionalUsd > 0) || !(shares > 0)) {
       return {
@@ -179,6 +194,9 @@ export class PolymarketExecution {
     this.openOrders.set(localOrderId, openOrder);
 
     try {
+      if (!shouldContinue()) {
+        return staleAbort();
+      }
       const placed =
         params.side === "YES"
           ? await this.client.placeMarketableBuyYes({
@@ -188,7 +206,8 @@ export class PolymarketExecution {
               size: shares,
               ttlMs,
               tickSize: params.tickSize,
-              negRisk: params.negRisk
+              negRisk: params.negRisk,
+              executionGuard: params.executionGuard
             })
           : await this.client.placeMarketableBuyNo({
               marketId: params.marketId,
@@ -197,7 +216,8 @@ export class PolymarketExecution {
               size: shares,
               ttlMs,
               tickSize: params.tickSize,
-              negRisk: params.negRisk
+              negRisk: params.negRisk,
+              executionGuard: params.executionGuard
             });
 
       openOrder.venueOrderId = placed.orderId;
@@ -211,12 +231,20 @@ export class PolymarketExecution {
 
       const pollMs = Math.max(200, Math.min(1500, Math.floor(ttlMs / 3)));
       while (Date.now() < openOrder.expiresTs) {
-        await this.refreshLiveState();
+        if (!shouldContinue()) {
+          return staleAbort();
+        }
+        await this.refreshLiveState({ shouldContinue: params.executionGuard });
+        if (!shouldContinue()) {
+          return staleAbort();
+        }
 
         const currentMatched = this.fillsByVenueOrderId.get(placed.orderId)?.shares ?? 0;
         openOrder.matchedShares = currentMatched;
 
-        const status = await this.client.getOrder(placed.orderId);
+        const status = await this.client.getOrder(placed.orderId, {
+          executionGuard: params.executionGuard
+        });
         if (!status) {
           await sleep(pollMs);
           continue;
@@ -236,7 +264,12 @@ export class PolymarketExecution {
       }
 
       if (openOrder.status === "NEW" && openOrder.venueOrderId) {
-        await this.client.cancelOrder(openOrder.venueOrderId);
+        if (!shouldContinue()) {
+          return staleAbort();
+        }
+        await this.client.cancelOrder(openOrder.venueOrderId, {
+          executionGuard: params.executionGuard
+        });
         openOrder.status = "CANCELLED";
         this.logger.info(
           {
@@ -249,7 +282,10 @@ export class PolymarketExecution {
         );
       }
 
-      await this.refreshLiveState();
+      if (!shouldContinue()) {
+        return staleAbort();
+      }
+      await this.refreshLiveState({ shouldContinue: params.executionGuard });
       const fill = this.fillsByVenueOrderId.get(placed.orderId);
       const filledShares = fill ? fill.shares : 0;
       const fillPrice = fill && fill.shares > 0 ? fill.notional / fill.shares : undefined;
@@ -490,8 +526,10 @@ export class PolymarketExecution {
     }
   }
 
-  async refreshLiveState(): Promise<void> {
+  async refreshLiveState(options: { shouldContinue?: () => boolean } = {}): Promise<void> {
     if (this.config.polymarket.mode !== "live") return;
+    const shouldContinue = (): boolean => (options.shouldContinue ? options.shouldContinue() : true);
+    if (!shouldContinue()) return;
     const nowTs = Date.now();
     const hasVenueStateToReconcile =
       this.openOrders.size > 0 ||
@@ -504,8 +542,8 @@ export class PolymarketExecution {
     this.lastPassiveLiveSyncTs = nowTs;
 
     const [openOrdersResult, recentTradesResult] = await Promise.allSettled([
-      this.client.getOpenOrders(),
-      this.client.getRecentTrades(250)
+      this.client.getOpenOrders({ executionGuard: options.shouldContinue }),
+      this.client.getRecentTrades(250, { executionGuard: options.shouldContinue })
     ]);
     const degradedLabels: string[] = [];
     const openOrders =
@@ -554,10 +592,13 @@ export class PolymarketExecution {
     const remoteOpenIds = openOrders ? new Set(openOrders.map((row) => row.id)) : null;
 
     for (const local of this.openOrders.values()) {
+      if (!shouldContinue()) return;
       if (!local.venueOrderId || !remoteOpenIds) continue;
       if (!remoteOpenIds.has(local.venueOrderId) && local.status === "NEW") {
         try {
-          const status = await this.client.getOrder(local.venueOrderId);
+          const status = await this.client.getOrder(local.venueOrderId, {
+            executionGuard: options.shouldContinue
+          });
           if (status && isTerminalStatus(status.status)) {
             local.status = status.sizeMatched > 0 ? "FILLED" : "CANCELLED";
             if (status.sizeMatched > 0) {
@@ -580,6 +621,7 @@ export class PolymarketExecution {
     }
 
     for (const trade of recentTrades || []) {
+      if (!shouldContinue()) return;
       if (this.seenTradeIds.has(trade.id)) continue;
       this.seenTradeIds.add(trade.id);
 

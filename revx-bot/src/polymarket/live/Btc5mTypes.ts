@@ -26,8 +26,8 @@ export type Btc5mSelectedMarket = {
   remainingSec: number;
   tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
   negRisk?: boolean;
-  chosenSide: Btc5mSide;
-  selectedTokenId: string;
+  chosenSide: Btc5mSide | null;
+  selectedTokenId: string | null;
   yesTokenId: string | null;
   noTokenId: string | null;
   yesBook: Btc5mSideBook;
@@ -45,6 +45,14 @@ export type Btc5mSelectionResult = {
 
 export type Btc5mDecisionAction = "BUY_YES" | "BUY_NO" | "HOLD";
 
+export type Btc5mIntelligence = {
+  source: string;
+  posture: string | null;
+  score: number | null;
+  pUpModel: number;
+  fallbackUsed: boolean;
+};
+
 export type Btc5mDecision = {
   action: Btc5mDecisionAction;
   blocker: string | null;
@@ -52,16 +60,24 @@ export type Btc5mDecision = {
   warning: string | null;
   chosenSide: Btc5mSide | null;
   edge: number;
+  yesEdge: number;
+  noEdge: number;
   threshold: number;
   spread: number;
+  yesSpread: number;
+  noSpread: number;
   maxSpread: number;
   remainingSec: number;
   minEntryRemainingSec: number;
   oracleAgeMs: number | null;
   oracleWarnMs: number;
   oracleHardBlockMs: number;
+  intelligenceSource: string;
+  intelligencePosture: string | null;
+  intelligenceScore: number | null;
   sideEnabled: boolean;
   orderbookOk: boolean;
   sideAsk: number | null;
   pUpModel: number | null;
+  pDownModel: number | null;
 };

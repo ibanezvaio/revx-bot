@@ -11,8 +11,6 @@ import {
 
 type SelectInput = {
   tick: Btc5mTick;
-  referencePrice: number | null;
-  preferredSide?: Btc5mSide | null;
 };
 
 export class Btc5mSelector {
@@ -46,46 +44,63 @@ export class Btc5mSelector {
           continue;
         }
 
-        const sideOrder = this.getSideOrder(candidate, input.referencePrice, input.preferredSide ?? null);
+        const sideOrder = this.getSideOrder();
+        const sideBooks: Partial<Record<Btc5mSide, Btc5mSideBook>> = {};
+        let candidateRejected = false;
+
         for (const side of sideOrder) {
           const tokenId = side === "YES" ? candidate.yesTokenId : candidate.noTokenId;
           if (!tokenId) {
+            candidateRejected = true;
+            lastReason = "TOKEN_ID_MISSING";
             continue;
           }
           if (cycleUnbookableTokenIds.has(tokenId)) {
+            candidateRejected = true;
             lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
             continue;
           }
+
           const sideBook = await this.fetchSideBook(slug, side, tokenId);
           if (
             sideBook.reason &&
             sideBook.reason.toLowerCase().includes("no orderbook exists for the requested token id")
           ) {
             cycleUnbookableTokenIds.add(tokenId);
+            candidateRejected = true;
             lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
             continue;
           }
           if (!sideBook.bookable || !sideBook.tokenId) {
+            candidateRejected = true;
             lastReason = sideBook.reason || "SIDE_NOT_BOOKABLE";
             continue;
           }
 
-          const selected: Btc5mSelectedMarket = {
-            ...candidate,
-            chosenSide: side,
-            selectedTokenId: tokenId,
-            yesBook: side === "YES" ? sideBook : candidate.yesBook,
-            noBook: side === "NO" ? sideBook : candidate.noBook,
-            orderbookOk: true
-          };
-
-          return {
-            tick,
-            attemptedSlugs,
-            selected,
-            reason: "OK"
-          };
+          sideBooks[side] = sideBook;
         }
+
+        const yesBook = sideBooks.YES ?? candidate.yesBook;
+        const noBook = sideBooks.NO ?? candidate.noBook;
+        if (candidateRejected || !yesBook.bookable || !noBook.bookable || !yesBook.tokenId || !noBook.tokenId) {
+          continue;
+        }
+
+        const selected: Btc5mSelectedMarket = {
+          ...candidate,
+          chosenSide: null,
+          selectedTokenId: null,
+          yesBook,
+          noBook,
+          orderbookOk: true
+        };
+
+        return {
+          tick,
+          attemptedSlugs,
+          selected,
+          reason: "OK"
+        };
       }
     }
 
@@ -156,19 +171,9 @@ export class Btc5mSelector {
     };
   }
 
-  private getSideOrder(
-    candidate: Omit<Btc5mSelectedMarket, "chosenSide" | "selectedTokenId" | "orderbookOk">,
-    referencePrice: number | null,
-    preferredSide: Btc5mSide | null
-  ): Btc5mSide[] {
-    const sideFromReference =
-      referencePrice !== null && candidate.priceToBeat !== null
-        ? referencePrice >= candidate.priceToBeat
-          ? "YES"
-          : "NO"
-        : null;
-    const head = preferredSide ?? sideFromReference ?? "YES";
-    return head === "YES" ? ["YES", "NO"] : ["NO", "YES"];
+  private getSideOrder(): Btc5mSide[] {
+    const configuredOrder = String(process.env.POLY_V2_BOOK_CHECK_ORDER || "YES_NO").trim().toUpperCase();
+    return configuredOrder === "NO_YES" ? ["NO", "YES"] : ["YES", "NO"];
   }
 
   private async fetchSideBook(slug: string, side: Btc5mSide, tokenId: string): Promise<Btc5mSideBook> {
@@ -318,19 +323,12 @@ function pickBoolean(obj: Record<string, unknown>, keys: string[], fallback: boo
 }
 
 function sanitizePrice(value: unknown): number | null {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.min(0.9999, Math.max(0.0001, n));
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return numeric;
 }
 
 function normalizeErrorReason(error: unknown): string {
-  const message = String((error as Error)?.message || error || "unknown_error");
-  const normalized = message.toLowerCase();
-  if (normalized.includes("no orderbook exists for the requested token id")) {
-    return "No orderbook exists for the requested token id";
-  }
-  if (normalized.includes("timeout")) return "NETWORK_TIMEOUT";
-  if (normalized.includes("fetch")) return "NETWORK_ERROR";
-  return message;
+  if (error instanceof Error) return error.message || "UNKNOWN_ERROR";
+  return String(error || "UNKNOWN_ERROR");
 }
-

@@ -91,7 +91,7 @@ async function main(): Promise<void> {
       : undefined;
   const polymarketV2Runner =
     usePolymarketV2Runner
-      ? new Btc5mLiveRunner(config, pmLogger ?? logger, { store })
+      ? new Btc5mLiveRunner(config, pmLogger ?? logger, { store, intelEngine, signalsEngine })
       : undefined;
   const polymarketRuntimeProvider = usePolymarketV2Runner ? polymarketV2Runner : polymarketEngine;
   const execution = new Execution(config, revxLogger, client, store, config.dryRun);

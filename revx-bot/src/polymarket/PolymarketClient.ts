@@ -1030,6 +1030,7 @@ export class PolymarketClient {
     ttlMs: number;
     tickSize?: TickSize;
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<{ orderId: string }> {
     validateTokenId(params.tokenId);
     validatePrice(params.limitPrice);
@@ -1147,6 +1148,7 @@ export class PolymarketClient {
       },
       {
         isRetryable: (error) => isRetryableError(error) || isOrderRebuildRequiredError(error),
+        shouldContinue: params.executionGuard,
         onRetry: (attempt, error, delayMs) => {
           if (this.config.debugHttp || process.env.DEBUG_POLY === "1") {
             this.logger.warn(
@@ -1179,6 +1181,7 @@ export class PolymarketClient {
     ttlMs: number;
     tickSize?: TickSize;
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<{ orderId: string }> {
     return this.placeMarketableOrder({
       marketId: params.marketId,
@@ -1188,6 +1191,7 @@ export class PolymarketClient {
       ttlMs: params.ttlMs,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
+      executionGuard: params.executionGuard,
       side: "BUY"
     });
   }
@@ -1200,6 +1204,7 @@ export class PolymarketClient {
     ttlMs: number;
     tickSize?: TickSize;
     negRisk?: boolean;
+    executionGuard?: () => boolean;
   }): Promise<{ orderId: string }> {
     return this.placeMarketableOrder({
       marketId: params.marketId,
@@ -1209,14 +1214,17 @@ export class PolymarketClient {
       ttlMs: params.ttlMs,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
+      executionGuard: params.executionGuard,
       side: "BUY"
     });
   }
 
-  async cancelOrder(orderId: string): Promise<void> {
+  async cancelOrder(orderId: string, options: { executionGuard?: () => boolean } = {}): Promise<void> {
     if (!orderId) return;
     const authClient = await this.getAuthClient();
-    await this.runClobCall("cancelOrder", async () => authClient.cancelOrder({ orderID: orderId }));
+    await this.runClobCall("cancelOrder", async () => authClient.cancelOrder({ orderID: orderId }), {
+      shouldContinue: options.executionGuard
+    });
   }
 
   async cancelAll(): Promise<void> {
@@ -1241,10 +1249,12 @@ export class PolymarketClient {
     await this.runClobCall("cancelMarketOrders", async () => authClient.cancelMarketOrders(payload));
   }
 
-  async getOrder(orderId: string): Promise<OpenOrderRow | null> {
+  async getOrder(orderId: string, options: { executionGuard?: () => boolean } = {}): Promise<OpenOrderRow | null> {
     if (!orderId) return null;
     const authClient = await this.getAuthClient();
-    const row = await this.runClobCall("getOrder", async () => authClient.getOrder(orderId));
+    const row = await this.runClobCall("getOrder", async () => authClient.getOrder(orderId), {
+      shouldContinue: options.executionGuard
+    });
     if (!row || typeof row !== "object") return null;
     const obj = row as Record<string, unknown>;
     return {
@@ -1259,18 +1269,22 @@ export class PolymarketClient {
     };
   }
 
-  async getOpenOrders(): Promise<OpenOrderRow[]> {
+  async getOpenOrders(options: { executionGuard?: () => boolean } = {}): Promise<OpenOrderRow[]> {
     const authClient = await this.getAuthClient();
-    const rows = await this.runClobCall("getOpenOrders", async () => authClient.getOpenOrders(undefined, true));
+    const rows = await this.runClobCall("getOpenOrders", async () => authClient.getOpenOrders(undefined, true), {
+      shouldContinue: options.executionGuard
+    });
     if (!Array.isArray(rows)) return [];
     return rows
       .map((row) => normalizeOpenOrder(row))
       .filter((row): row is OpenOrderRow => row !== null);
   }
 
-  async getRecentTrades(limit = 200): Promise<TradeRow[]> {
+  async getRecentTrades(limit = 200, options: { executionGuard?: () => boolean } = {}): Promise<TradeRow[]> {
     const authClient = await this.getAuthClient();
-    const rows = await this.runClobCall("getTrades", async () => authClient.getTrades(undefined, true));
+    const rows = await this.runClobCall("getTrades", async () => authClient.getTrades(undefined, true), {
+      shouldContinue: options.executionGuard
+    });
     if (!Array.isArray(rows)) return [];
     return rows
       .slice(0, Math.max(1, Math.floor(limit)))
@@ -1348,6 +1362,7 @@ export class PolymarketClient {
     options?: {
       isRetryable?: (error: unknown) => boolean;
       onRetry?: (attempt: number, error: unknown, delayMs: number) => void;
+      shouldContinue?: () => boolean;
     }
   ): Promise<T> {
     this.throwIfCircuitOpen(label);
@@ -1363,22 +1378,34 @@ export class PolymarketClient {
     });
     try {
       let attempt = 0;
+      const ensureShouldContinue = (): void => {
+        if (options?.shouldContinue && !options.shouldContinue()) {
+          throw new Error("STALE_ATTEMPT_ABORTED");
+        }
+      };
       const result = await withRetry(
         () =>
           this.requestScheduler.schedule(() =>
-            withTimeout(
-              fn(++attempt),
-              this.getHttpTimeoutMs(),
-              `Polymarket CLOB call timeout (${label})`
-            )
+            {
+              ensureShouldContinue();
+              return withTimeout(
+                fn(++attempt),
+                this.getHttpTimeoutMs(),
+                `Polymarket CLOB call timeout (${label})`
+              );
+            }
           ),
         {
           maxRetries: this.config.polymarket.http.maxRetries,
           baseDelayMs: this.config.polymarket.http.baseBackoffMs,
           maxDelayMs: this.config.polymarket.http.maxBackoffMs,
           jitterMs: this.config.polymarket.http.jitterMs,
-          isRetryable: (error) => options?.isRetryable ? options.isRetryable(error) : isRetryableError(error),
+          isRetryable: (error) => {
+            if (isStaleAttemptAbort(error)) return false;
+            return options?.isRetryable ? options.isRetryable(error) : isRetryableError(error);
+          },
           onRetry: (attempt, error, delayMs) => {
+            ensureShouldContinue();
             const nowTs = Date.now();
             const errorSummary = shortErrorMessage(error);
             const signature = JSON.stringify({
@@ -2136,6 +2163,11 @@ function isRetryableError(error: unknown): boolean {
     message.includes("temporarily") ||
     message.includes("socket")
   );
+}
+
+function isStaleAttemptAbort(error: unknown): boolean {
+  const message = String((error as Error)?.message || "").toUpperCase();
+  return message.includes("STALE_ATTEMPT_ABORTED");
 }
 
 function isOrderRebuildRequiredError(error: unknown): boolean {

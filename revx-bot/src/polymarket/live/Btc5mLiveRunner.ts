@@ -1,5 +1,7 @@
 import { BotConfig } from "../../config";
+import { IntelEngine } from "../../intel/IntelEngine";
 import { Logger } from "../../logger";
+import { SignalsEngine } from "../../signals/SignalsEngine";
 import { Store } from "../../store/Store";
 import { sleep } from "../../util/time";
 import { deriveBtc5mTickContext, slugForTs } from "../btc5m";
@@ -9,10 +11,12 @@ import { PolymarketRisk } from "../Risk";
 import { Sizing } from "../Sizing";
 import { Btc5mExecutionGate } from "./Btc5mExecutionGate";
 import { Btc5mSelector } from "./Btc5mSelector";
-import { Btc5mDecision, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
+import { Btc5mDecision, Btc5mIntelligence, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
 
 type RunnerDeps = {
   store?: Store;
+  intelEngine?: IntelEngine;
+  signalsEngine?: SignalsEngine;
 };
 
 type RuntimeState = {
@@ -38,6 +42,21 @@ type RuntimeState = {
   lastUpdateTs: number;
 };
 
+type ExecutionAttempt = {
+  attemptId: string;
+  executionSlug: string;
+  selectedSlug: string;
+  currentSlugAtCreate: string;
+  side: "YES" | "NO";
+  tokenId: string;
+  retryCount: number;
+  createdTs: number;
+  deadlineTs: number;
+  tick: Btc5mTick;
+  selected: Btc5mSelectedMarket;
+  decision: Btc5mDecision;
+};
+
 export class Btc5mLiveRunner {
   private readonly client: PolymarketClient;
   private readonly execution: PolymarketExecution;
@@ -46,6 +65,8 @@ export class Btc5mLiveRunner {
   private readonly selector: Btc5mSelector;
   private readonly gate: Btc5mExecutionGate;
   private readonly store?: Store;
+  private readonly intelEngine?: IntelEngine;
+  private readonly signalsEngine?: SignalsEngine;
 
   private running = false;
   private stopRequested = false;
@@ -53,6 +74,12 @@ export class Btc5mLiveRunner {
   private firstTickResolve: (() => void) | null = null;
   private firstTickPromise: Promise<void> | null = null;
   private readonly recentTicks: Array<Record<string, unknown>> = [];
+  private activeExecutionAttempt: ExecutionAttempt | null = null;
+  private activeExecutionTask: Promise<void> | null = null;
+  private executionAttemptSeq = 0;
+  private executionCooldownUntilTs = 0;
+  private invalidatedAttemptIds = new Set<string>();
+  private previousCurrentSlug: string | null = null;
   private state: RuntimeState = {
     running: false,
     fetchOk: false,
@@ -82,6 +109,8 @@ export class Btc5mLiveRunner {
     deps: RunnerDeps = {}
   ) {
     this.store = deps.store;
+    this.intelEngine = deps.intelEngine;
+    this.signalsEngine = deps.signalsEngine;
     this.client = new PolymarketClient(config, logger);
     this.execution = new PolymarketExecution(config, logger, this.client);
     this.risk = new PolymarketRisk(config, logger);
@@ -156,6 +185,7 @@ export class Btc5mLiveRunner {
 
   async stop(reason = "STOPPED"): Promise<void> {
     this.stopRequested = true;
+    this.invalidateExecutionAttempt("STOP_REQUESTED", { currentSlug: this.state.currentBucketSlug ?? null });
     if (this.loopTask) {
       await this.loopTask.catch(() => undefined);
     }
@@ -341,6 +371,21 @@ export class Btc5mLiveRunner {
     this.state.tickNowSec = tick.tickNowSec;
     this.state.lastFetchAttemptTs = tick.tickNowMs;
     this.state.lastUpdateTs = tick.tickNowMs;
+    if (this.previousCurrentSlug && this.previousCurrentSlug !== tick.currentSlug) {
+      this.logger.warn(
+        {
+          previousCurrentSlug: this.previousCurrentSlug,
+          currentSlug: tick.currentSlug,
+          nextSlug: tick.nextSlug
+        },
+        "POLY_V2_MARKET_ROLLOVER"
+      );
+      this.invalidateExecutionAttempt("ROLLOVER", {
+        currentSlug: tick.currentSlug,
+        selectedSlug: this.activeExecutionAttempt?.selectedSlug ?? null
+      });
+    }
+    this.previousCurrentSlug = tick.currentSlug;
 
     this.logger.warn(
       {
@@ -368,8 +413,16 @@ export class Btc5mLiveRunner {
       this.logInvariantBroken(tick, tickInvariant.reason, {});
       this.logDecision({
         edge: Number.NaN,
+        yesEdge: Number.NaN,
+        noEdge: Number.NaN,
+        pUpModel: null,
+        intelligenceSource: "NONE",
+        intelligencePosture: null,
+        intelligenceScore: null,
         threshold: this.config.polymarket.live.minEdgeThreshold,
         spread: Number.NaN,
+        yesSpread: Number.NaN,
+        noSpread: Number.NaN,
         maxSpread: this.config.polymarket.live.maxSpread,
         remainingSec: tick.remainingSec,
         minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
@@ -377,6 +430,7 @@ export class Btc5mLiveRunner {
         blocker: tickInvariant.reason,
         blockerSeverity: "hard",
         warning: null,
+        chosenSide: null,
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: tickInvariant.reason });
@@ -385,8 +439,7 @@ export class Btc5mLiveRunner {
 
     const reference = this.getReferencePrice(tick.tickNowMs);
     const selectionResult = await this.selector.select({
-      tick,
-      referencePrice: reference.price
+      tick
     });
     const selected = selectionResult.selected;
     const selectionReason = String(selectionResult.reason || "");
@@ -403,8 +456,9 @@ export class Btc5mLiveRunner {
     this.logger.warn(
       {
         selectedSlug: selected?.slug ?? null,
+        yesTokenId: selected?.yesTokenId ?? null,
+        noTokenId: selected?.noTokenId ?? null,
         selectedTokenId: selected?.selectedTokenId ?? null,
-        side: selected?.chosenSide ?? null,
         orderbookOk: selected?.orderbookOk ?? false,
         reason: selectionResult.reason
       },
@@ -432,8 +486,16 @@ export class Btc5mLiveRunner {
       );
       this.logDecision({
         edge: Number.NaN,
+        yesEdge: Number.NaN,
+        noEdge: Number.NaN,
+        pUpModel: null,
+        intelligenceSource: "NONE",
+        intelligencePosture: null,
+        intelligenceScore: null,
         threshold: this.config.polymarket.live.minEdgeThreshold,
         spread: Number.NaN,
+        yesSpread: Number.NaN,
+        noSpread: Number.NaN,
         maxSpread: this.config.polymarket.live.maxSpread,
         remainingSec: tick.remainingSec,
         minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
@@ -441,6 +503,7 @@ export class Btc5mLiveRunner {
         blocker,
         blockerSeverity: "hard",
         warning: null,
+        chosenSide: null,
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker });
@@ -450,9 +513,9 @@ export class Btc5mLiveRunner {
     const selectedInvariant = this.validateSelectionInvariant(tick, selected);
     if (!selectedInvariant.ok) {
       this.state.selectedSlug = selected.slug;
-      this.state.selectedTokenId = selected.selectedTokenId;
-      this.state.chosenSide = selected.chosenSide;
-      this.state.chosenDirection = chosenDirectionForSide(selected.chosenSide);
+      this.state.selectedTokenId = null;
+      this.state.chosenSide = null;
+      this.state.chosenDirection = null;
       this.state.action = "HOLD";
       this.state.holdReason = selectedInvariant.reason;
       this.state.blockedBy = selectedInvariant.reason;
@@ -464,8 +527,16 @@ export class Btc5mLiveRunner {
       });
       this.logDecision({
         edge: Number.NaN,
+        yesEdge: Number.NaN,
+        noEdge: Number.NaN,
+        pUpModel: null,
+        intelligenceSource: "NONE",
+        intelligencePosture: null,
+        intelligenceScore: null,
         threshold: this.config.polymarket.live.minEdgeThreshold,
-        spread: selected.chosenSide === "YES" ? Number(selected.yesBook.spread) : Number(selected.noBook.spread),
+        spread: Number.NaN,
+        yesSpread: Number(selected.yesBook.spread),
+        noSpread: Number(selected.noBook.spread),
         maxSpread: this.config.polymarket.live.maxSpread,
         remainingSec: tick.remainingSec,
         minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
@@ -473,31 +544,53 @@ export class Btc5mLiveRunner {
         blocker: selectedInvariant.reason,
         blockerSeverity: "hard",
         warning: null,
+        chosenSide: null,
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: selectedInvariant.reason });
       return;
     }
 
+    const intelligence = this.resolveDirectionalIntelligence({
+      nowMs: tick.tickNowMs,
+      referencePrice: reference.price,
+      priceToBeat: selected.priceToBeat,
+      fallbackMid: selected.yesBook.mid
+    });
+    if (intelligence.fallbackUsed) {
+      this.logger.warn(
+        {
+          source: intelligence.source,
+          pUpModel: intelligence.pUpModel,
+          referencePrice: reference.price,
+          priceToBeat: selected.priceToBeat
+        },
+        "POLY_V2_INTEL_FALLBACK"
+      );
+    }
+
     const decision = this.gate.evaluate({
       tick,
       selected,
-      referencePrice: reference.price,
+      intelligence,
       oracleAgeMs: reference.ageMs
     });
-    const executionResult = await this.maybeExecuteDecision({
+    const executionDispatch = this.dispatchExecutionAttempt({
       tick,
       selected,
       decision,
       allowExecution
     });
 
-    const finalAction = executionResult.action;
-    const finalBlocker = executionResult.blocker;
+    const finalAction = executionDispatch.action;
+    const finalBlocker = executionDispatch.blocker;
+    const chosenSide = decision.chosenSide;
+    const selectedTokenId =
+      chosenSide === "YES" ? selected.yesTokenId : chosenSide === "NO" ? selected.noTokenId : null;
     this.state.selectedSlug = selected.slug;
-    this.state.selectedTokenId = selected.selectedTokenId;
-    this.state.chosenSide = selected.chosenSide;
-    this.state.chosenDirection = chosenDirectionForSide(selected.chosenSide);
+    this.state.selectedTokenId = selectedTokenId;
+    this.state.chosenSide = chosenSide;
+    this.state.chosenDirection = chosenSide ? chosenDirectionForSide(chosenSide) : null;
     this.state.action = finalAction;
     this.state.holdReason = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
     this.state.blockedBy = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
@@ -506,8 +599,16 @@ export class Btc5mLiveRunner {
 
     this.logDecision({
       edge: decision.edge,
+      yesEdge: decision.yesEdge,
+      noEdge: decision.noEdge,
+      pUpModel: decision.pUpModel,
+      intelligenceSource: decision.intelligenceSource,
+      intelligencePosture: decision.intelligencePosture,
+      intelligenceScore: decision.intelligenceScore,
       threshold: decision.threshold,
       spread: decision.spread,
+      yesSpread: decision.yesSpread,
+      noSpread: decision.noSpread,
       maxSpread: decision.maxSpread,
       remainingSec: decision.remainingSec,
       minEntryRemainingSec: decision.minEntryRemainingSec,
@@ -515,16 +616,272 @@ export class Btc5mLiveRunner {
       blocker: finalBlocker,
       blockerSeverity: finalAction === "HOLD" ? "hard" : decision.blockerSeverity,
       warning: decision.warning,
+      chosenSide: decision.chosenSide,
       action: finalAction
     });
     this.pushRecentTick({
       tickNowSec: tick.tickNowSec,
       selectedSlug: selected.slug,
-      selectedTokenId: selected.selectedTokenId,
-      side: selected.chosenSide,
+      selectedTokenId,
+      side: chosenSide,
       action: finalAction,
       blocker: finalBlocker
     });
+  }
+
+  private dispatchExecutionAttempt(input: {
+    tick: Btc5mTick;
+    selected: Btc5mSelectedMarket;
+    decision: Btc5mDecision;
+    allowExecution: boolean;
+  }): { action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | null } {
+    if (input.decision.action === "HOLD") {
+      return { action: "HOLD", blocker: input.decision.blocker || "HOLD" };
+    }
+    if (!input.allowExecution) {
+      return { action: input.decision.action, blocker: null };
+    }
+    if (!this.canMutateVenueState()) {
+      return { action: "HOLD", blocker: "LIVE_EXECUTION_DISABLED" };
+    }
+    if (Date.now() < this.executionCooldownUntilTs) {
+      return { action: "HOLD", blocker: "EXECUTION_COOLDOWN" };
+    }
+
+    const tokenId =
+      input.decision.chosenSide === "YES"
+        ? input.selected.yesTokenId
+        : input.decision.chosenSide === "NO"
+          ? input.selected.noTokenId
+          : null;
+    if (!input.decision.chosenSide || !tokenId) {
+      return { action: "HOLD", blocker: "TOKEN_NOT_BOOKABLE" };
+    }
+    if (!this.isExecutionSlugEligible(input.selected.slug, input.tick)) {
+      return { action: "HOLD", blocker: "STALE_EXECUTION_SLUG" };
+    }
+
+    const active = this.activeExecutionAttempt;
+    if (active && this.isExecutionAttemptActive(active)) {
+      const sameAttemptTarget =
+        active.executionSlug === input.selected.slug && active.side === input.decision.chosenSide && active.tokenId === tokenId;
+      if (sameAttemptTarget) {
+        return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
+      }
+      this.invalidateExecutionAttempt("SUPERSEDED", {
+        currentSlug: input.tick.currentSlug,
+        selectedSlug: input.selected.slug
+      });
+    }
+
+    const attempt: ExecutionAttempt = {
+      attemptId: `att-${++this.executionAttemptSeq}`,
+      executionSlug: input.selected.slug,
+      selectedSlug: input.selected.slug,
+      currentSlugAtCreate: input.tick.currentSlug,
+      side: input.decision.chosenSide,
+      tokenId,
+      retryCount: 0,
+      createdTs: Date.now(),
+      deadlineTs: Date.now() + this.getExecutionDeadlineMs(),
+      tick: input.tick,
+      selected: input.selected,
+      decision: input.decision
+    };
+    this.activeExecutionAttempt = attempt;
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: input.tick.currentSlug,
+        selectedSlug: input.selected.slug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason: "CREATED"
+      },
+      "POLY_V2_EXECUTION_ATTEMPT_CREATED"
+    );
+    this.startExecutionAttempt(attempt);
+    return { action: input.decision.action, blocker: null };
+  }
+
+  private startExecutionAttempt(attempt: ExecutionAttempt): void {
+    let task: Promise<void> | null = null;
+    task = (async () => {
+      try {
+        if (!this.isExecutionAttemptActive(attempt)) {
+          this.logExecutionAttemptStale(attempt, "STALE_BEFORE_START");
+          return;
+        }
+
+        const timeoutMs = Math.max(1, attempt.deadlineTs - Date.now());
+        let timeoutHandle: NodeJS.Timeout | null = null;
+        const timeoutPromise = new Promise<"TIMEOUT">((resolve) => {
+          timeoutHandle = setTimeout(() => resolve("TIMEOUT"), timeoutMs);
+        });
+        const executionPromise = this.maybeExecuteDecision({
+          tick: attempt.tick,
+          selected: attempt.selected,
+          decision: attempt.decision,
+          allowExecution: true,
+          attempt
+        });
+
+        const raceResult = await Promise.race([executionPromise, timeoutPromise]);
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+
+        if (raceResult === "TIMEOUT") {
+          this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+          this.logger.warn(
+            {
+              attemptId: attempt.attemptId,
+              executionSlug: attempt.executionSlug,
+              currentSlug: this.state.currentBucketSlug,
+              selectedSlug: attempt.selectedSlug,
+              side: attempt.side,
+              tokenId: attempt.tokenId,
+              retryCount: attempt.retryCount,
+              reason: "EXECUTION_DEADLINE_EXCEEDED"
+            },
+            "POLY_V2_EXECUTION_TIMEOUT"
+          );
+          this.invalidateExecutionAttempt("TIMEOUT", {
+            currentSlug: this.state.currentBucketSlug ?? null,
+            selectedSlug: attempt.selectedSlug
+          });
+          return;
+        }
+
+        if (!this.isExecutionAttemptActive(attempt)) {
+          this.logExecutionAttemptStale(attempt, "STALE_AFTER_EXECUTION");
+          return;
+        }
+
+        if (raceResult.action === "HOLD" && raceResult.blocker) {
+          if (isTransientExecutionError(raceResult.blocker)) {
+            this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+          }
+          this.logger.warn(
+            {
+              attemptId: attempt.attemptId,
+              executionSlug: attempt.executionSlug,
+              currentSlug: this.state.currentBucketSlug,
+              selectedSlug: attempt.selectedSlug,
+              side: attempt.side,
+              tokenId: attempt.tokenId,
+              retryCount: attempt.retryCount,
+              reason: raceResult.blocker
+            },
+            "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
+          );
+        }
+      } catch (error) {
+        this.executionCooldownUntilTs = Date.now() + this.getExecutionCooldownMs();
+        this.logger.warn(
+          {
+            attemptId: attempt.attemptId,
+            executionSlug: attempt.executionSlug,
+            currentSlug: this.state.currentBucketSlug,
+            selectedSlug: attempt.selectedSlug,
+            side: attempt.side,
+            tokenId: attempt.tokenId,
+            retryCount: attempt.retryCount,
+            reason: shortError(error)
+          },
+          "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
+        );
+      } finally {
+        if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
+          this.activeExecutionAttempt = null;
+        }
+        if (this.activeExecutionTask === task) {
+          this.activeExecutionTask = null;
+        }
+      }
+    })();
+    this.activeExecutionTask = task;
+  }
+
+  private invalidateExecutionAttempt(
+    reason: string,
+    context: { currentSlug: string | null; selectedSlug?: string | null }
+  ): void {
+    const attempt = this.activeExecutionAttempt;
+    if (!attempt) return;
+    this.invalidatedAttemptIds.add(attempt.attemptId);
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: context.currentSlug,
+        selectedSlug: context.selectedSlug ?? attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
+    );
+    this.activeExecutionAttempt = null;
+  }
+
+  private isExecutionAttemptActive(attempt: ExecutionAttempt): boolean {
+    if (Date.now() > attempt.deadlineTs) return false;
+    if (this.invalidatedAttemptIds.has(attempt.attemptId)) return false;
+    if (this.activeExecutionAttempt?.attemptId !== attempt.attemptId) return false;
+    if (!this.isExecutionSlugEligible(attempt.executionSlug, deriveBtc5mTickContext(Date.now()))) return false;
+    return true;
+  }
+
+  private logExecutionAttemptStale(attempt: ExecutionAttempt, reason: string): void {
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_EXECUTION_ATTEMPT_STALE"
+    );
+  }
+
+  private abortStaleAttempt(attempt: ExecutionAttempt, reason: string): { action: "HOLD"; blocker: string } {
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_ABORT_STALE_ATTEMPT"
+    );
+    this.logExecutionAttemptStale(attempt, reason);
+    return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
+  }
+
+  private isExecutionSlugEligible(slug: string, tick: Btc5mTick): boolean {
+    return slug === tick.currentSlug || slug === tick.nextSlug;
+  }
+
+  private getExecutionDeadlineMs(): number {
+    const envValue = Number(process.env.POLY_V2_EXECUTION_DEADLINE_MS || 4_000);
+    if (!Number.isFinite(envValue)) return 4_000;
+    return Math.max(1_000, Math.min(30_000, Math.floor(envValue)));
+  }
+
+  private getExecutionCooldownMs(): number {
+    const envValue = Number(process.env.POLY_V2_EXECUTION_COOLDOWN_MS || 5_000);
+    if (!Number.isFinite(envValue)) return 5_000;
+    return Math.max(1_000, Math.min(120_000, Math.floor(envValue)));
   }
 
   private async maybeExecuteDecision(input: {
@@ -532,6 +889,7 @@ export class Btc5mLiveRunner {
     selected: Btc5mSelectedMarket;
     decision: Btc5mDecision;
     allowExecution: boolean;
+    attempt?: ExecutionAttempt;
   }): Promise<{ action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | null }> {
     if (!input.allowExecution) {
       return {
@@ -545,9 +903,22 @@ export class Btc5mLiveRunner {
     if (input.decision.action === "HOLD") {
       return { action: "HOLD", blocker: input.decision.blocker || "HOLD" };
     }
-    if (!input.decision.chosenSide || !input.decision.sideAsk || !input.selected.selectedTokenId) {
+    const executionTokenId =
+      input.decision.chosenSide === "YES"
+        ? input.selected.yesTokenId
+        : input.decision.chosenSide === "NO"
+          ? input.selected.noTokenId
+          : null;
+    if (!input.decision.chosenSide || !input.decision.sideAsk || !executionTokenId) {
       return { action: "HOLD", blocker: "TOKEN_NOT_BOOKABLE" };
     }
+    if (input.attempt && !this.isExecutionAttemptActive(input.attempt)) {
+      return this.abortStaleAttempt(input.attempt, "STALE_BEFORE_PRECHECK");
+    }
+    const executionGuard = (): boolean => {
+      if (!input.attempt) return true;
+      return this.isExecutionAttemptActive(input.attempt);
+    };
 
     const tauSec = Math.max(0, input.tick.remainingSec);
     const oracleAgeMs = input.decision.oracleAgeMs;
@@ -604,25 +975,39 @@ export class Btc5mLiveRunner {
     if (!riskCheck.ok) {
       return { action: "HOLD", blocker: riskCheck.reason || "RISK_BLOCKED" };
     }
+    if (!executionGuard()) {
+      if (input.attempt) {
+        return this.abortStaleAttempt(input.attempt, "STALE_BEFORE_POST");
+      }
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
+    }
 
     const result =
       input.decision.chosenSide === "YES"
         ? await this.execution.executeBuyYes({
             marketId: input.selected.marketId,
-            tokenId: input.selected.selectedTokenId,
+            tokenId: executionTokenId,
             yesAsk: input.decision.sideAsk,
             notionalUsd,
             tickSize: input.selected.tickSize,
-            negRisk: input.selected.negRisk
+            negRisk: input.selected.negRisk,
+            executionGuard
           })
         : await this.execution.executeBuyNo({
             marketId: input.selected.marketId,
-            tokenId: input.selected.selectedTokenId,
+            tokenId: executionTokenId,
             noAsk: input.decision.sideAsk,
             notionalUsd,
             tickSize: input.selected.tickSize,
-            negRisk: input.selected.negRisk
+            negRisk: input.selected.negRisk,
+            executionGuard
           });
+    if (!executionGuard()) {
+      if (input.attempt) {
+        return this.abortStaleAttempt(input.attempt, "STALE_AFTER_POST");
+      }
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
+    }
     if (!result.accepted) {
       return { action: "HOLD", blocker: result.reason || "LIVE_REJECTED" };
     }
@@ -647,7 +1032,13 @@ export class Btc5mLiveRunner {
     if (selected.slug !== tick.currentSlug && selected.slug !== tick.nextSlug) {
       return { ok: false, reason: "SELECTED_SLUG_NOT_CURRENT_OR_NEXT" };
     }
-    if (!selected.selectedTokenId || !selected.orderbookOk) {
+    if (
+      !selected.orderbookOk ||
+      !selected.yesTokenId ||
+      !selected.noTokenId ||
+      !selected.yesBook.bookable ||
+      !selected.noBook.bookable
+    ) {
       return { ok: false, reason: "SELECTED_TOKEN_NOT_EXECUTABLE" };
     }
     return { ok: true };
@@ -655,8 +1046,16 @@ export class Btc5mLiveRunner {
 
   private logDecision(input: {
     edge: number;
+    yesEdge: number;
+    noEdge: number;
+    pUpModel: number | null;
+    intelligenceSource: string;
+    intelligencePosture: string | null;
+    intelligenceScore: number | null;
     threshold: number;
     spread: number;
+    yesSpread: number;
+    noSpread: number;
     maxSpread: number;
     remainingSec: number | null;
     minEntryRemainingSec: number;
@@ -664,13 +1063,22 @@ export class Btc5mLiveRunner {
     blocker: string | null;
     blockerSeverity: "hard" | "warning-only" | null;
     warning: string | null;
+    chosenSide: "YES" | "NO" | null;
     action: "BUY_YES" | "BUY_NO" | "HOLD";
   }): void {
     this.logger.warn(
       {
         edge: Number.isFinite(input.edge) ? input.edge : null,
+        yesEdge: Number.isFinite(input.yesEdge) ? input.yesEdge : null,
+        noEdge: Number.isFinite(input.noEdge) ? input.noEdge : null,
+        pUpModel: Number.isFinite(Number(input.pUpModel)) ? Number(input.pUpModel) : null,
+        intelligenceSource: input.intelligenceSource,
+        intelligencePosture: input.intelligencePosture,
+        intelligenceScore: Number.isFinite(Number(input.intelligenceScore)) ? Number(input.intelligenceScore) : null,
         threshold: Number.isFinite(input.threshold) ? input.threshold : null,
         spread: Number.isFinite(input.spread) ? input.spread : null,
+        yesSpread: Number.isFinite(input.yesSpread) ? input.yesSpread : null,
+        noSpread: Number.isFinite(input.noSpread) ? input.noSpread : null,
         maxSpread: Number.isFinite(input.maxSpread) ? input.maxSpread : null,
         remainingSec: input.remainingSec,
         minEntryRemainingSec: Number.isFinite(input.minEntryRemainingSec) ? input.minEntryRemainingSec : null,
@@ -678,6 +1086,7 @@ export class Btc5mLiveRunner {
         blocker: input.blocker,
         blockerSeverity: input.blockerSeverity,
         warning: input.warning,
+        chosenSide: input.chosenSide,
         action: input.action
       },
       "POLY_V2_DECISION"
@@ -733,6 +1142,92 @@ export class Btc5mLiveRunner {
     };
   }
 
+  private resolveDirectionalIntelligence(input: {
+    nowMs: number;
+    referencePrice: number | null;
+    priceToBeat: number | null;
+    fallbackMid: number | null;
+  }): Btc5mIntelligence {
+    const components: Array<{ name: string; weight: number; score: number; posture: string }> = [];
+
+    if (this.signalsEngine && this.config.signalsEnabled) {
+      const aggregate = this.signalsEngine.getLatestAggregate();
+      const direction = directionToScore(aggregate.direction);
+      const confidence = clampRange(Number(aggregate.confidence || 0), 0, 1);
+      const impact = clampRange(Number(aggregate.impact || 0), 0, 1);
+      if (aggregate.ts > 0 || aggregate.latestTs > 0 || confidence > 0 || impact > 0) {
+        const strength = clampRange(Math.max(0.1, impact) * confidence, 0, 1);
+        components.push({
+          name: "SIGNALS_ENGINE",
+          weight: 0.45,
+          score: direction * strength,
+          posture: String(aggregate.state || "NORMAL")
+        });
+      }
+    }
+
+    if (this.intelEngine && this.config.enableIntel) {
+      const posture = this.intelEngine.getPosture(input.nowMs);
+      const direction = directionToScore(posture.direction);
+      const confidence = clampRange(Number(posture.confidence || 0), 0, 1);
+      const impact = clampRange(Number(posture.impact || 0), 0, 1);
+      if (posture.ts > 0 || confidence > 0 || impact > 0) {
+        const strength = clampRange(Math.max(0.1, impact) * confidence, 0, 1);
+        components.push({
+          name: "INTEL_ENGINE",
+          weight: 0.35,
+          score: direction * strength,
+          posture: String(posture.state || "NORMAL")
+        });
+      }
+    }
+
+    const status = this.store?.getBotStatus();
+    const signalBias = status?.quoting?.bias;
+    const signalBiasConfidence = status?.quoting?.biasConfidence;
+    if (signalBias === "LONG" || signalBias === "SHORT" || signalBias === "NEUTRAL") {
+      const direction = signalBias === "LONG" ? 1 : signalBias === "SHORT" ? -1 : 0;
+      const confidence = clampRange(Number(signalBiasConfidence || 0), 0, 1);
+      components.push({
+        name: "CROSS_VENUE_BIAS",
+        weight: 0.20,
+        score: direction * confidence,
+        posture: signalBias
+      });
+    }
+
+    if (components.length === 0) {
+      const pUpFallback = inferProbabilityFallback({
+        referencePrice: input.referencePrice,
+        priceToBeat: input.priceToBeat,
+        fallbackMid: input.fallbackMid
+      });
+      return {
+        source: "HEURISTIC_FALLBACK",
+        posture: null,
+        score: null,
+        pUpModel: pUpFallback,
+        fallbackUsed: true
+      };
+    }
+
+    let weighted = 0;
+    let weights = 0;
+    for (const component of components) {
+      weighted += component.score * component.weight;
+      weights += component.weight;
+    }
+    const intelligenceScore = weights > 0 ? clampRange(weighted / weights, -1, 1) : 0;
+    const pUpModel = clampRange(0.5 + intelligenceScore * 0.45, 0.0005, 0.9995);
+    return {
+      source: components.map((row) => row.name).join("+"),
+      posture: components.map((row) => row.posture).join("|"),
+      score: intelligenceScore,
+      pUpModel,
+      fallbackUsed: false
+    };
+  }
+
   private getMinVenueShares(): number {
     const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || 5);
     if (!Number.isFinite(envValue)) return 5;
@@ -756,4 +1251,68 @@ function chosenDirectionForSide(side: "YES" | "NO"): "UP" | "DOWN" {
 function shortError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error || "unknown_error");
+}
+
+function isTransientExecutionError(reason: string): boolean {
+  const normalized = String(reason || "").toUpperCase();
+  return (
+    normalized.includes("TIMEOUT") ||
+    normalized.includes("NETWORK") ||
+    normalized.includes("EPIPE") ||
+    normalized.includes("ECONNRESET") ||
+    normalized.includes("ECONNREFUSED") ||
+    normalized.includes("SOCKET") ||
+    normalized.includes("ABORT")
+  );
+}
+
+function inferProbabilityFallback(input: {
+  referencePrice: number | null;
+  priceToBeat: number | null;
+  fallbackMid: number | null;
+}): number {
+  if (
+    input.referencePrice !== null &&
+    input.referencePrice > 0 &&
+    input.priceToBeat !== null &&
+    input.priceToBeat > 0
+  ) {
+    const moveRatio = (input.referencePrice - input.priceToBeat) / input.priceToBeat;
+    const sigmaRatio = 0.0015;
+    const z = clampRange(moveRatio / sigmaRatio, -8, 8);
+    return clampRange(normalCdf(z), 0.0005, 0.9995);
+  }
+  if (input.fallbackMid !== null && input.fallbackMid > 0) {
+    return clampRange(input.fallbackMid, 0.0005, 0.9995);
+  }
+  return 0.5;
+}
+
+function directionToScore(direction: string | null | undefined): number {
+  const normalized = String(direction || "").trim().toUpperCase();
+  if (normalized === "UP") return 1;
+  if (normalized === "DOWN") return -1;
+  return 0;
+}
+
+function clampRange(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalCdf(z: number): number {
+  return 0.5 * (1 + erf(z / Math.sqrt(2)));
+}
+
+function erf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x);
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const p = 0.3275911;
+  const t = 1 / (1 + p * absX);
+  const y = 1 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX));
+  return sign * y;
 }

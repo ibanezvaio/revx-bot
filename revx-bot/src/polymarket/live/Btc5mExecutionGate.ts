@@ -1,10 +1,10 @@
 import { BotConfig } from "../../config";
-import { Btc5mDecision, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
+import { Btc5mDecision, Btc5mIntelligence, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
 
 type ExecutionGateInput = {
   tick: Btc5mTick;
   selected: Btc5mSelectedMarket;
-  referencePrice: number | null;
+  intelligence: Btc5mIntelligence;
   oracleAgeMs: number | null;
 };
 
@@ -13,10 +13,13 @@ export class Btc5mExecutionGate {
 
   evaluate(input: ExecutionGateInput): Btc5mDecision {
     const selected = input.selected;
-    const sideBook = selected.chosenSide === "YES" ? selected.yesBook : selected.noBook;
-    const sideEnabled = selected.chosenSide === "YES" ? true : this.config.polymarket.live.enableNoSide;
-    const sideAsk = sideBook.bestAsk;
-    const spread = Number.isFinite(Number(sideBook.spread)) ? Math.max(0, Number(sideBook.spread)) : Number.POSITIVE_INFINITY;
+    const yesBook = selected.yesBook;
+    const noBook = selected.noBook;
+    const yesAsk = yesBook.bestAsk;
+    const noAsk = noBook.bestAsk;
+    const yesSpread = sanitizeSpread(yesBook.spread);
+    const noSpread = sanitizeSpread(noBook.spread);
+    const sideEnabled = this.config.polymarket.live.enableNoSide;
     const threshold = Math.max(0, Number(this.config.polymarket.live.minEdgeThreshold || 0));
     const maxSpread = Math.max(0, Number(this.config.polymarket.live.maxSpread || 0));
     const minEntryRemainingSec = Math.max(1, Number(this.config.polymarket.live.minEntryRemainingSec || 1));
@@ -29,114 +32,158 @@ export class Btc5mExecutionGate {
       oracleHardBlockMs
     });
 
-    const pUpModel = inferProbability({
-      referencePrice: input.referencePrice,
-      priceToBeat: selected.priceToBeat,
-      fallbackMid: selected.yesBook.mid
-    });
-    const expectedProb = selected.chosenSide === "YES" ? pUpModel : 1 - pUpModel;
-    const edge = sideAsk !== null ? expectedProb - sideAsk : Number.NEGATIVE_INFINITY;
+    const pUpModel = clamp(input.intelligence.pUpModel, 0.0005, 0.9995);
+    const pDownModel = clamp(1 - pUpModel, 0.0005, 0.9995);
 
-    if (!sideBook.bookable || !selected.orderbookOk || !selected.selectedTokenId || sideAsk === null) {
+    const yesBookable = Boolean(selected.yesTokenId && yesBook.bookable && selected.orderbookOk && yesAsk !== null);
+    const noBookable = Boolean(selected.noTokenId && noBook.bookable && selected.orderbookOk && noAsk !== null && sideEnabled);
+
+    if (!yesBookable && !noBookable) {
       return holdDecision({
         blocker: "TOKEN_NOT_BOOKABLE",
         selected,
         threshold,
-        spread,
+        yesSpread,
+        noSpread,
         maxSpread,
         sideEnabled,
         orderbookOk: false,
-        sideAsk,
-        edge,
+        sideAsk: null,
         pUpModel,
+        pDownModel,
+        yesEdge: Number.NEGATIVE_INFINITY,
+        noEdge: Number.NEGATIVE_INFINITY,
+        edge: Number.NEGATIVE_INFINITY,
         remainingSec: input.tick.remainingSec,
         minEntryRemainingSec,
         oracleAgeMs: input.oracleAgeMs,
         oracleWarnMs,
         oracleHardBlockMs,
-        warning
+        warning,
+        chosenSide: null,
+        intelligence: input.intelligence
       });
     }
+
     if (input.tick.remainingSec <= minEntryRemainingSec) {
       return holdDecision({
         blocker: "TOO_LATE_FOR_ENTRY",
         selected,
         threshold,
-        spread,
+        yesSpread,
+        noSpread,
         maxSpread,
         sideEnabled,
         orderbookOk: true,
-        sideAsk,
-        edge,
+        sideAsk: null,
         pUpModel,
+        pDownModel,
+        yesEdge: Number.NEGATIVE_INFINITY,
+        noEdge: Number.NEGATIVE_INFINITY,
+        edge: Number.NEGATIVE_INFINITY,
         remainingSec: input.tick.remainingSec,
         minEntryRemainingSec,
         oracleAgeMs: input.oracleAgeMs,
         oracleWarnMs,
         oracleHardBlockMs,
-        warning
+        warning,
+        chosenSide: null,
+        intelligence: input.intelligence
       });
     }
-    if (!(spread <= maxSpread)) {
+
+    const yesSpreadOk = yesBookable && yesSpread <= maxSpread;
+    const noSpreadOk = noBookable && noSpread <= maxSpread;
+    if (!yesSpreadOk && !noSpreadOk) {
       return holdDecision({
         blocker: "SPREAD_TOO_WIDE",
         selected,
         threshold,
-        spread,
+        yesSpread,
+        noSpread,
         maxSpread,
         sideEnabled,
         orderbookOk: true,
-        sideAsk,
-        edge,
+        sideAsk: null,
         pUpModel,
+        pDownModel,
+        yesEdge: Number.NEGATIVE_INFINITY,
+        noEdge: Number.NEGATIVE_INFINITY,
+        edge: Number.NEGATIVE_INFINITY,
         remainingSec: input.tick.remainingSec,
         minEntryRemainingSec,
         oracleAgeMs: input.oracleAgeMs,
         oracleWarnMs,
         oracleHardBlockMs,
-        warning
+        warning,
+        chosenSide: null,
+        intelligence: input.intelligence
       });
     }
-    if (!(edge > threshold)) {
+
+    const yesEdge = yesSpreadOk && yesAsk !== null ? pUpModel - yesAsk : Number.NEGATIVE_INFINITY;
+    const noEdge = noSpreadOk && noAsk !== null ? pDownModel - noAsk : Number.NEGATIVE_INFINITY;
+
+    const yesWins = yesEdge >= noEdge;
+    const bestSide = yesWins ? "YES" : "NO";
+    const bestEdge = yesWins ? yesEdge : noEdge;
+    const bestSpread = yesWins ? yesSpread : noSpread;
+    const bestAsk = yesWins ? yesAsk : noAsk;
+
+    if (!(bestEdge > threshold)) {
       return holdDecision({
         blocker: "EDGE_BELOW_THRESHOLD",
         selected,
         threshold,
-        spread,
+        yesSpread,
+        noSpread,
         maxSpread,
         sideEnabled,
         orderbookOk: true,
-        sideAsk,
-        edge,
+        sideAsk: bestAsk,
         pUpModel,
+        pDownModel,
+        yesEdge,
+        noEdge,
+        edge: bestEdge,
         remainingSec: input.tick.remainingSec,
         minEntryRemainingSec,
         oracleAgeMs: input.oracleAgeMs,
         oracleWarnMs,
         oracleHardBlockMs,
-        warning
+        warning,
+        chosenSide: null,
+        intelligence: input.intelligence
       });
     }
 
     return {
-      action: selected.chosenSide === "YES" ? "BUY_YES" : "BUY_NO",
+      action: bestSide === "YES" ? "BUY_YES" : "BUY_NO",
       blocker: null,
       blockerSeverity: warning ? "warning-only" : null,
       warning,
-      chosenSide: selected.chosenSide,
-      edge,
+      chosenSide: bestSide,
+      edge: bestEdge,
+      yesEdge,
+      noEdge,
       threshold,
-      spread,
+      spread: bestSpread,
+      yesSpread,
+      noSpread,
       maxSpread,
       remainingSec: input.tick.remainingSec,
       minEntryRemainingSec,
       oracleAgeMs: input.oracleAgeMs,
       oracleWarnMs,
       oracleHardBlockMs,
+      intelligenceSource: input.intelligence.source,
+      intelligencePosture: input.intelligence.posture,
+      intelligenceScore: input.intelligence.score,
       sideEnabled,
       orderbookOk: true,
-      sideAsk,
-      pUpModel
+      sideAsk: bestAsk,
+      pUpModel,
+      pDownModel
     };
   }
 
@@ -146,8 +193,9 @@ export class Btc5mExecutionGate {
     oracleWarnMs: number;
     oracleHardBlockMs: number;
   }): string | null {
+    const warnings: string[] = [];
     if (!input.sideEnabled) {
-      return "LIVE_NO_SIDE_DISABLED";
+      warnings.push("LIVE_NO_SIDE_DISABLED");
     }
     if (
       input.oracleAgeMs !== null &&
@@ -155,9 +203,9 @@ export class Btc5mExecutionGate {
       input.oracleAgeMs > input.oracleWarnMs &&
       input.oracleAgeMs <= input.oracleHardBlockMs
     ) {
-      return "STALE_ORACLE_WARN";
+      warnings.push("STALE_ORACLE_WARN");
     }
-    return null;
+    return warnings.length > 0 ? warnings.join("|") : null;
   }
 }
 
@@ -166,19 +214,25 @@ function holdDecision(
     blocker: string;
     selected: Btc5mSelectedMarket;
     threshold: number;
-    spread: number;
+    yesSpread: number;
+    noSpread: number;
     maxSpread: number;
     sideEnabled: boolean;
     orderbookOk: boolean;
     sideAsk: number | null;
+    pUpModel: number;
+    pDownModel: number;
+    yesEdge: number;
+    noEdge: number;
     edge: number;
-    pUpModel: number | null;
     remainingSec: number;
     minEntryRemainingSec: number;
     oracleAgeMs: number | null;
     oracleWarnMs: number;
     oracleHardBlockMs: number;
     warning: string | null;
+    chosenSide: "YES" | "NO" | null;
+    intelligence: Btc5mIntelligence;
   }
 ): Btc5mDecision {
   return {
@@ -186,63 +240,36 @@ function holdDecision(
     blocker: input.blocker,
     blockerSeverity: "hard",
     warning: input.warning,
-    chosenSide: input.selected.chosenSide,
+    chosenSide: input.chosenSide,
     edge: input.edge,
+    yesEdge: input.yesEdge,
+    noEdge: input.noEdge,
     threshold: input.threshold,
-    spread: input.spread,
+    spread: Math.min(input.yesSpread, input.noSpread),
+    yesSpread: input.yesSpread,
+    noSpread: input.noSpread,
     maxSpread: input.maxSpread,
     remainingSec: input.remainingSec,
     minEntryRemainingSec: input.minEntryRemainingSec,
     oracleAgeMs: input.oracleAgeMs,
     oracleWarnMs: input.oracleWarnMs,
     oracleHardBlockMs: input.oracleHardBlockMs,
+    intelligenceSource: input.intelligence.source,
+    intelligencePosture: input.intelligence.posture,
+    intelligenceScore: input.intelligence.score,
     sideEnabled: input.sideEnabled,
     orderbookOk: input.orderbookOk,
     sideAsk: input.sideAsk,
-    pUpModel: input.pUpModel
+    pUpModel: input.pUpModel,
+    pDownModel: input.pDownModel
   };
-}
-
-function inferProbability(input: {
-  referencePrice: number | null;
-  priceToBeat: number | null;
-  fallbackMid: number | null;
-}): number {
-  if (
-    input.referencePrice !== null &&
-    input.referencePrice > 0 &&
-    input.priceToBeat !== null &&
-    input.priceToBeat > 0
-  ) {
-    const moveRatio = (input.referencePrice - input.priceToBeat) / input.priceToBeat;
-    const sigmaRatio = 0.0015;
-    const z = clamp(moveRatio / sigmaRatio, -8, 8);
-    return clamp(normalCdf(z), 0.0005, 0.9995);
-  }
-  if (input.fallbackMid !== null && input.fallbackMid > 0) {
-    return clamp(input.fallbackMid, 0.0005, 0.9995);
-  }
-  return 0.5;
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function normalCdf(z: number): number {
-  return 0.5 * (1 + erf(z / Math.sqrt(2)));
-}
-
-function erf(x: number): number {
-  const sign = x < 0 ? -1 : 1;
-  const absX = Math.abs(x);
-  const a1 = 0.254829592;
-  const a2 = -0.284496736;
-  const a3 = 1.421413741;
-  const a4 = -1.453152027;
-  const a5 = 1.061405429;
-  const p = 0.3275911;
-  const t = 1 / (1 + p * absX);
-  const y = 1 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX));
-  return sign * y;
+function sanitizeSpread(value: number | null): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, numeric) : Number.POSITIVE_INFINITY;
 }
