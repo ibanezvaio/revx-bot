@@ -614,7 +614,7 @@ export function loadConfig(): BotConfig {
   const enableCrossVenueSignals = boolWithDefault("ENABLE_CROSS_VENUE_SIGNALS", true);
   const venueRefreshMs = clampInt(numberWithFallback(["VENUE_REFRESH_MS", "SIGNAL_REFRESH_MS"], 1000), 250, 10_000);
   const venueStaleMs = clampInt(numberWithDefault("VENUE_STALE_MS", 5000), 500, 60_000);
-  const venueTimeoutMs = clampInt(numberWithDefault("VENUE_TIMEOUT_MS", 1200), 200, 10_000);
+  const venueTimeoutMs = clampInt(numberWithDefault("VENUE_TIMEOUT_MS", 8000), 200, 10_000);
   const venueMaxBackoffMs = clampInt(numberWithDefault("VENUE_MAX_BACKOFF_MS", 30_000), 1000, 300_000);
   const fairDriftMaxBps = clampNumber(numberWithDefault("FAIR_DRIFT_MAX_BPS", 8), 0, 100);
   const fairBasisMaxBps = clampNumber(numberWithDefault("FAIR_BASIS_MAX_BPS", 10), 0, 100);
@@ -1238,6 +1238,7 @@ export function loadConfig(): BotConfig {
   const polymarketCancelAllOnStartRaw = optional("POLYMARKET_CANCEL_ALL_ON_START");
   const polymarketDebugDisableRevolutBaselineWhileLive = boolWithFallback(
     [
+      "REVX_DISABLE_BASELINE_FOR_POLY_TEST",
       "POLYMARKET_DEBUG_DISABLE_REVOLUT_BASELINE_WHILE_LIVE",
       "POLYMARKET_DISABLE_REVOLUT_BASELINE_WHILE_LIVE"
     ],

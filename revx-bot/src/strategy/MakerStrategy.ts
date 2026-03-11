@@ -192,6 +192,7 @@ export class MakerStrategy {
   private lastCancelAllReason = "";
   private baselineInvariantMissingSinceTs = 0;
   private baselineAckMissingLoggedAtTs = 0;
+  private lastBaselineDisabledForPolyTestLogTs = 0;
   private seedStartTs = 0;
   private seedReposts = 0;
   private seedTakerFired = false;
@@ -4372,6 +4373,19 @@ export class MakerStrategy {
           ...quotePlan.blockedReasons,
           "FORCE_BASELINE_DISABLED_WHILE_POLYMARKET_LIVE"
         ]);
+        if (Date.now() - this.lastBaselineDisabledForPolyTestLogTs >= 15_000) {
+          this.lastBaselineDisabledForPolyTestLogTs = Date.now();
+          this.logger.warn(
+            {
+              revxDisableBaselineForPolyTest: process.env.REVX_DISABLE_BASELINE_FOR_POLY_TEST ?? null,
+              polymarketDisableBaselineWhileLive:
+                process.env.POLYMARKET_DEBUG_DISABLE_REVOLUT_BASELINE_WHILE_LIVE ??
+                process.env.POLYMARKET_DISABLE_REVOLUT_BASELINE_WHILE_LIVE ??
+                null
+            },
+            "REVX_BASELINE_DISABLED_FOR_POLY_TEST"
+          );
+        }
       }
 
       postReconcileActiveOrders = this.store.getActiveBotOrders(this.config.symbol);

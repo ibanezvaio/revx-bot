@@ -18,6 +18,9 @@ type FillTracker = {
   notional: number;
 };
 
+type ExecutionLifecycleEvent = "posting_started" | "post_returned" | "reconcile_result";
+type EntryOrderMode = "MARKETABLE" | "RESTING";
+
 export class PolymarketExecution {
   private readonly openOrders = new Map<string, OpenOrderState>();
   private readonly positions = new Map<string, PositionState>();
@@ -46,20 +49,26 @@ export class PolymarketExecution {
     marketId: string;
     tokenId: string;
     yesAsk: number;
+    yesBid?: number | null;
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
+    executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
   }): Promise<ExecutionResult> {
     return this.executeEntry({
       marketId: params.marketId,
       tokenId: params.tokenId,
       side: "YES",
       askPrice: params.yesAsk,
+      bidPrice: params.yesBid ?? null,
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
-      executionGuard: params.executionGuard
+      orderMode: params.orderMode,
+      executionGuard: params.executionGuard,
+      executionLifecycle: params.executionLifecycle
     });
   }
 
@@ -67,20 +76,26 @@ export class PolymarketExecution {
     marketId: string;
     tokenId: string;
     noAsk: number;
+    noBid?: number | null;
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
+    executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
   }): Promise<ExecutionResult> {
     return this.executeEntry({
       marketId: params.marketId,
       tokenId: params.tokenId,
       side: "NO",
       askPrice: params.noAsk,
+      bidPrice: params.noBid ?? null,
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
-      executionGuard: params.executionGuard
+      orderMode: params.orderMode,
+      executionGuard: params.executionGuard,
+      executionLifecycle: params.executionLifecycle
     });
   }
 
@@ -89,14 +104,25 @@ export class PolymarketExecution {
     tokenId: string;
     side: "YES" | "NO";
     askPrice: number;
+    bidPrice?: number | null;
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
+    executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
   }): Promise<ExecutionResult> {
-    const price = clamp(params.askPrice, 0.0001, 0.9999);
-    const shares = params.notionalUsd / price;
+    const quotedPrice = clamp(params.askPrice, 0.0001, 0.9999);
+    const requestedNotionalUsd = Math.max(0, params.notionalUsd);
     const entryAction = params.side === "YES" ? "BUY_YES" : "BUY_NO";
+    let postingStarted = false;
+    const emitLifecycle = (event: ExecutionLifecycleEvent, payload: Record<string, unknown> = {}): void => {
+      try {
+        params.executionLifecycle?.(event, payload);
+      } catch {
+        // do not block order flow on observability callback errors
+      }
+    };
     const staleAbort = (): ExecutionResult => ({
       action: "HOLD",
       accepted: false,
@@ -105,10 +131,11 @@ export class PolymarketExecution {
     });
     const shouldContinue = (): boolean => (params.executionGuard ? params.executionGuard() : true);
     if (!shouldContinue()) {
+      emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
       return staleAbort();
     }
 
-    if (!(params.notionalUsd > 0) || !(shares > 0)) {
+    if (!(requestedNotionalUsd > 0)) {
       return {
         action: "HOLD",
         accepted: false,
@@ -116,6 +143,232 @@ export class PolymarketExecution {
         reason: "NON_POSITIVE_SIZE"
       };
     }
+
+    let tickSize = params.tickSize;
+    if (!tickSize) {
+      if (this.config.polymarket.mode !== "live") {
+        tickSize = "0.01";
+      } else {
+        try {
+          tickSize = await this.client.getTickSize(params.tokenId);
+        } catch {
+          tickSize = "0.01";
+        }
+      }
+    }
+    const knownAffordableUsd = readKnownAffordableUsd();
+    const availableCashUsd = knownAffordableUsd;
+    const reservedCashUsd = this.getReservedOpenBuyNotionalUsd();
+    const unsettledCashUsd = this.getUnsettledOpenBuyNotionalUsd();
+    const maxEntryNotionalUsd = getMaxEntryNotionalUsd();
+    const minEntryNotionalUsd = getMinEntryNotionalUsd();
+    const targetEntryNotionalUsd = getTargetEntryNotionalUsd();
+    const maxSharesPerEntry = getMaxSharesPerEntry();
+    const intendedOrderMode = normalizeEntryOrderMode(params.orderMode);
+    const marketabilityBufferBps = getMarketableBufferBps();
+    const feeBufferBps = getSizingFeeBufferBps();
+    const feeMultiplier = 1 + feeBufferBps / 10_000;
+
+    const desiredCostUsd = Math.min(
+      Math.max(requestedNotionalUsd > 0 ? requestedNotionalUsd : targetEntryNotionalUsd, minEntryNotionalUsd),
+      maxEntryNotionalUsd,
+      Math.max(0, this.config.polymarket.sizing.maxNotionalPerWindow)
+    );
+    const effectiveAffordableCostUsd =
+      availableCashUsd !== null
+        ? Math.max(0, availableCashUsd - reservedCashUsd - unsettledCashUsd)
+        : Number.POSITIVE_INFINITY;
+
+    const tickValue = Number(tickSize);
+    const marketableBufferFromBps = quotedPrice * (marketabilityBufferBps / 10_000);
+    const marketableBuffer = Math.max(
+      this.config.polymarket.execution.takerPriceBuffer,
+      tickValue,
+      marketableBufferFromBps
+    );
+    const rawLimitPrice =
+      intendedOrderMode === "MARKETABLE"
+        ? clamp(quotedPrice + marketableBuffer, 0.0001, 0.9999)
+        : clamp(quotedPrice, 0.0001, 0.9999);
+    const limitPrice = normalizeBuyLimitPrice(rawLimitPrice, tickSize);
+    this.logger.info(
+      {
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        side: params.side,
+        bestBid: Number.isFinite(Number(params.bidPrice)) ? Number(params.bidPrice) : null,
+        bestAsk: Number.isFinite(Number(params.askPrice)) ? Number(params.askPrice) : null,
+        chosenPrice: limitPrice,
+        priceSource: "LIVE_SIDE_BOOK",
+        marketabilityBufferBps
+      },
+      "POLY_V2_ENTRY_PRICE_PLAN"
+    );
+
+    const minVenueShares = getMinVenueShares();
+    const minVenueNotionalUsd = getMinVenueNotionalUsd();
+    const minSharesForVenueNotional =
+      minVenueNotionalUsd > 0 ? ceilToPrecision(minVenueNotionalUsd / Math.max(limitPrice, 0.0001), 6) : 0;
+    const minValidSize = Math.max(minVenueShares, minSharesForVenueNotional);
+    const minValidCostUsd = minValidSize * limitPrice * feeMultiplier;
+    const affordableCostUsd = Math.min(desiredCostUsd, effectiveAffordableCostUsd);
+    let shares = floorToPrecision(affordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
+    let estimatedCost = shares * limitPrice;
+    let feeAdjustedCostUsd = estimatedCost * feeMultiplier;
+
+    this.logger.info(
+      {
+        availableCashUsd,
+        reservedCashUsd,
+        unsettledCashUsd,
+        requiredOrderCostUsd: desiredCostUsd,
+        minOrderCostUsd: minValidCostUsd,
+        chosenPrice: limitPrice,
+        chosenSize: shares,
+        side: params.side,
+        tokenId: params.tokenId
+      },
+      "POLY_V2_BUYING_POWER_CHECK"
+    );
+
+    if (shares < minValidSize) {
+      if (!(effectiveAffordableCostUsd >= minValidCostUsd - 1e-9)) {
+        return {
+          action: "HOLD",
+          accepted: false,
+          filledShares: 0,
+          reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+        };
+      }
+      shares = minValidSize;
+      estimatedCost = shares * limitPrice;
+      feeAdjustedCostUsd = estimatedCost * feeMultiplier;
+    }
+
+    shares = Math.min(shares, maxSharesPerEntry);
+    shares = floorToPrecision(shares, 6);
+    if (!(shares > 0)) {
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+      };
+    }
+
+    estimatedCost = shares * limitPrice;
+    feeAdjustedCostUsd = estimatedCost * feeMultiplier;
+    if (feeAdjustedCostUsd > effectiveAffordableCostUsd + 1e-9) {
+      shares = floorToPrecision(effectiveAffordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
+      estimatedCost = shares * limitPrice;
+      feeAdjustedCostUsd = estimatedCost * feeMultiplier;
+    }
+
+    if (shares < minValidSize || feeAdjustedCostUsd < minValidCostUsd - 1e-9) {
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+      };
+    }
+
+    const targetNotionalUsd = desiredCostUsd;
+    const maxAffordableSize = Math.min(
+      maxSharesPerEntry,
+      effectiveAffordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001)
+    );
+    this.logger.info(
+      {
+        targetCostUsd: targetNotionalUsd,
+        maxCostUsd: maxEntryNotionalUsd,
+        affordableCostUsd: Number.isFinite(effectiveAffordableCostUsd) ? effectiveAffordableCostUsd : null,
+        selectedPrice: limitPrice,
+        selectedSize: shares,
+        minValidSize,
+        minValidCostUsd,
+        feeAdjustedCostUsd,
+        side: params.side,
+        tokenId: params.tokenId
+      },
+      "POLY_V2_ENTRY_SIZING"
+    );
+
+    if (estimatedCost > maxEntryNotionalUsd + 1e-9) {
+      this.logger.warn(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          side: params.side,
+          targetNotional: targetNotionalUsd,
+          finalPrice: limitPrice,
+          finalSize: shares,
+          estimatedCost,
+          maxAffordableSize,
+          maxEntryNotionalUsd,
+          minEntryNotionalUsd,
+          maxSharesPerEntry,
+          intendedOrderMode: intendedOrderMode === "MARKETABLE" ? "MARKETABLE_ENTRY" : "RESTING_ENTRY",
+          maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow
+        },
+        "POLY_ORDER_SIZING_REJECT"
+      );
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "ORDER_COST_EXCEEDS_BUDGET"
+      };
+    }
+    if (feeAdjustedCostUsd > effectiveAffordableCostUsd + 1e-9) {
+      this.logger.warn(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          side: params.side,
+          targetNotional: targetNotionalUsd,
+          finalPrice: limitPrice,
+          finalSize: shares,
+          estimatedCost,
+          maxAffordableSize,
+          maxEntryNotionalUsd,
+          minEntryNotionalUsd,
+          maxSharesPerEntry,
+          intendedOrderMode: intendedOrderMode === "MARKETABLE" ? "MARKETABLE_ENTRY" : "RESTING_ENTRY",
+          maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow,
+          knownAffordableUsd,
+          reservedCashUsd,
+          unsettledCashUsd
+        },
+        "POLY_ORDER_SIZING_REJECT"
+      );
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+      };
+    }
+    this.logger.info(
+      {
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        side: params.side,
+        targetNotional: targetNotionalUsd,
+        finalPrice: limitPrice,
+        finalSize: shares,
+        estimatedCost,
+        feeAdjustedCostUsd,
+        maxAffordableSize,
+        maxEntryNotionalUsd,
+        minEntryNotionalUsd,
+        maxSharesPerEntry,
+        intendedOrderMode: intendedOrderMode === "MARKETABLE" ? "MARKETABLE_ENTRY" : "RESTING_ENTRY",
+        maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow,
+        knownAffordableUsd
+      },
+      "POLY_ORDER_SIZING_PRECHECK"
+    );
 
     const hasOpenDuplicate = Array.from(this.openOrders.values()).some(
       (row) =>
@@ -149,19 +402,19 @@ export class PolymarketExecution {
           tokenId: params.tokenId,
           orderSide: "BUY",
           positionSide: params.side,
-          limitPrice: price
+          limitPrice
         },
         shares,
-        price
+        limitPrice
       );
       this.logger.info(
         {
           marketId: params.marketId,
           tokenId: params.tokenId,
           mode: "paper",
-          notionalUsd: params.notionalUsd,
+          notionalUsd: estimatedCost,
           shares,
-          price
+          price: limitPrice
         },
         "Polymarket paper fill"
       );
@@ -169,13 +422,12 @@ export class PolymarketExecution {
         action: entryAction,
         accepted: true,
         filledShares: shares,
-        fillPrice: price,
+        fillPrice: limitPrice,
         reason: "PAPER_IMMEDIATE_FILL"
       };
     }
 
     const localOrderId = randomUUID();
-    const limitPrice = clamp(price + this.config.polymarket.execution.takerPriceBuffer, 0.0001, 0.9999);
     const ttlMs = this.config.polymarket.execution.orderTtlMs;
     const startedTs = Date.now();
     const openOrder: OpenOrderState = {
@@ -185,7 +437,7 @@ export class PolymarketExecution {
       side: "BUY",
       limitPrice,
       shares,
-      notionalUsd: params.notionalUsd,
+      notionalUsd: estimatedCost,
       matchedShares: 0,
       createdTs: startedTs,
       expiresTs: startedTs + ttlMs,
@@ -195,8 +447,15 @@ export class PolymarketExecution {
 
     try {
       if (!shouldContinue()) {
+        emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
         return staleAbort();
       }
+      postingStarted = true;
+      emitLifecycle("posting_started", {
+        marketId: params.marketId,
+        tokenId: params.tokenId,
+        side: params.side
+      });
       const placed =
         params.side === "YES"
           ? await this.client.placeMarketableBuyYes({
@@ -205,7 +464,7 @@ export class PolymarketExecution {
               limitPrice,
               size: shares,
               ttlMs,
-              tickSize: params.tickSize,
+              tickSize,
               negRisk: params.negRisk,
               executionGuard: params.executionGuard
             })
@@ -215,10 +474,13 @@ export class PolymarketExecution {
               limitPrice,
               size: shares,
               ttlMs,
-              tickSize: params.tickSize,
+              tickSize,
               negRisk: params.negRisk,
               executionGuard: params.executionGuard
             });
+      emitLifecycle("post_returned", {
+        orderId: placed.orderId
+      });
 
       openOrder.venueOrderId = placed.orderId;
       this.submittedByVenueOrderId.set(placed.orderId, {
@@ -231,11 +493,16 @@ export class PolymarketExecution {
 
       const pollMs = Math.max(200, Math.min(1500, Math.floor(ttlMs / 3)));
       while (Date.now() < openOrder.expiresTs) {
-        if (!shouldContinue()) {
+        if (openOrder.status !== "NEW") {
+          break;
+        }
+        if (!shouldContinue() && !postingStarted) {
+          emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
           return staleAbort();
         }
         await this.refreshLiveState({ shouldContinue: params.executionGuard });
-        if (!shouldContinue()) {
+        if (!shouldContinue() && !postingStarted) {
+          emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
           return staleAbort();
         }
 
@@ -264,7 +531,8 @@ export class PolymarketExecution {
       }
 
       if (openOrder.status === "NEW" && openOrder.venueOrderId) {
-        if (!shouldContinue()) {
+        if (!shouldContinue() && !postingStarted) {
+          emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
           return staleAbort();
         }
         await this.client.cancelOrder(openOrder.venueOrderId, {
@@ -282,7 +550,8 @@ export class PolymarketExecution {
         );
       }
 
-      if (!shouldContinue()) {
+      if (!shouldContinue() && !postingStarted) {
+        emitLifecycle("reconcile_result", { accepted: false, reason: "STALE_ATTEMPT_ABORTED" });
         return staleAbort();
       }
       await this.refreshLiveState({ shouldContinue: params.executionGuard });
@@ -290,7 +559,7 @@ export class PolymarketExecution {
       const filledShares = fill ? fill.shares : 0;
       const fillPrice = fill && fill.shares > 0 ? fill.notional / fill.shares : undefined;
 
-      return {
+      const out: ExecutionResult = {
         action: entryAction,
         accepted: true,
         filledShares,
@@ -298,6 +567,13 @@ export class PolymarketExecution {
         orderId: placed.orderId,
         reason: filledShares > 0 ? "LIVE_FILLED_OR_PARTIAL" : "LIVE_PLACED_NO_FILL"
       };
+      emitLifecycle("reconcile_result", {
+        accepted: true,
+        reason: out.reason,
+        orderId: out.orderId ?? null,
+        filledShares: out.filledShares
+      });
+      return out;
     } catch (error) {
       openOrder.status = "REJECTED";
       this.logger.error(
@@ -314,15 +590,121 @@ export class PolymarketExecution {
       }
       this.logger.error(payload, "Polymarket order rejected");
       const normalizedReason = this.normalizeOrderRejectReason(error);
-      return {
+      const out: ExecutionResult = {
         action: entryAction,
         accepted: false,
         filledShares: 0,
         reason: normalizedReason
       };
+      emitLifecycle("reconcile_result", {
+        accepted: false,
+        reason: out.reason
+      });
+      return out;
     } finally {
+      const filledShares =
+        openOrder.venueOrderId && this.fillsByVenueOrderId.has(openOrder.venueOrderId)
+          ? this.fillsByVenueOrderId.get(openOrder.venueOrderId)?.shares ?? 0
+          : 0;
+      const releasedCashUsd = openOrder.side === "BUY" && !(filledShares > 0) ? Math.max(0, openOrder.notionalUsd) : 0;
+      const reservedCashUsdBefore = this.getReservedOpenBuyNotionalUsd();
       this.openOrders.delete(localOrderId);
+      const reservedCashUsdAfter = this.getReservedOpenBuyNotionalUsd();
+      if (releasedCashUsd > 0) {
+        this.logger.info(
+          {
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            localOrderId,
+            venueOrderId: openOrder.venueOrderId ?? null,
+            side: params.side,
+            releasedCashUsd,
+            reservedCashUsdBefore,
+            reservedCashUsdAfter,
+            finalOrderStatus: openOrder.status
+          },
+          "POLY_V2_RESERVED_BUYING_POWER_RELEASED"
+        );
+      }
     }
+  }
+
+  async cancelUnfilledEntryOrders(params: {
+    marketId: string;
+    tokenId?: string;
+    maxAgeMs?: number;
+    reason: string;
+    executionGuard?: () => boolean;
+  }): Promise<{ requestedCount: number; cancelledCount: number }> {
+    const nowTs = Date.now();
+    const maxAgeMs = Number.isFinite(params.maxAgeMs) ? Math.max(0, Number(params.maxAgeMs)) : 0;
+    const shouldContinue = (): boolean => (params.executionGuard ? params.executionGuard() : true);
+    const targets = Array.from(this.openOrders.values()).filter((row) => {
+      if (row.side !== "BUY" || row.status !== "NEW") return false;
+      if (row.marketId !== params.marketId) return false;
+      if (params.tokenId && row.tokenId !== params.tokenId) return false;
+      if ((row.matchedShares || 0) > 0) return false;
+      if (maxAgeMs > 0 && nowTs - row.createdTs < maxAgeMs) return false;
+      return true;
+    });
+    let cancelledCount = 0;
+    for (const order of targets) {
+      if (!shouldContinue()) break;
+      if (!order.venueOrderId) {
+        order.status = "CANCELLED";
+        cancelledCount += 1;
+        continue;
+      }
+      try {
+        await this.client.cancelOrder(order.venueOrderId, {
+          executionGuard: params.executionGuard
+        });
+        order.status = "CANCELLED";
+        cancelledCount += 1;
+      } catch (error) {
+        this.logger.warn(
+          {
+            marketId: order.marketId,
+            tokenId: order.tokenId,
+            orderId: order.venueOrderId,
+            reason: params.reason,
+            errorSummary: shortErrorSummary(error)
+          },
+          "POLY_LIVE_CANCEL_FAILED"
+        );
+      }
+    }
+    return {
+      requestedCount: targets.length,
+      cancelledCount
+    };
+  }
+
+  countOpenEntryOrdersForMarket(marketId: string): number {
+    return Array.from(this.openOrders.values()).filter((row) => row.side === "BUY" && row.status === "NEW" && row.marketId === marketId)
+      .length;
+  }
+
+  private getReservedOpenBuyNotionalUsd(): number {
+    let reserved = 0;
+    for (const order of this.openOrders.values()) {
+      if (order.side !== "BUY" || order.status !== "NEW") continue;
+      const matchedShares = Number.isFinite(order.matchedShares) ? Number(order.matchedShares) : 0;
+      const matchedNotional = Math.max(0, Math.min(order.shares, matchedShares) * order.limitPrice);
+      reserved += Math.max(0, order.notionalUsd - matchedNotional);
+    }
+    return reserved;
+  }
+
+  private getUnsettledOpenBuyNotionalUsd(): number {
+    let unsettled = 0;
+    for (const order of this.openOrders.values()) {
+      if (order.side !== "BUY" || order.status !== "NEW") continue;
+      const matchedShares = Number.isFinite(order.matchedShares) ? Number(order.matchedShares) : 0;
+      const matchedNotional = Math.max(0, Math.min(order.shares, matchedShares) * order.limitPrice);
+      unsettled += matchedNotional;
+    }
+    return unsettled;
   }
 
   async executeExit(params: {
@@ -917,6 +1299,99 @@ function isTerminalStatus(status: string): boolean {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function normalizeBuyLimitPrice(
+  rawPrice: number,
+  tickSize: "0.1" | "0.01" | "0.001" | "0.0001"
+): number {
+  const clamped = clamp(rawPrice, 0.0001, 0.9999);
+  const tick = Number(tickSize);
+  const precision = tickSize.includes(".") ? tickSize.split(".")[1].length : 0;
+  const ticks = clamped / tick;
+  const roundedTicks = Math.floor(ticks);
+  const rounded = Number((roundedTicks * tick).toFixed(precision));
+  return clamp(rounded, tick, 1 - tick);
+}
+
+function floorToPrecision(value: number, decimals: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const factor = 10 ** Math.max(0, Math.floor(decimals));
+  return Math.floor(value * factor) / factor;
+}
+
+function ceilToPrecision(value: number, decimals: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const factor = 10 ** Math.max(0, Math.floor(decimals));
+  return Math.ceil(value * factor) / factor;
+}
+
+function getMinVenueShares(): number {
+  const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || 5);
+  if (!Number.isFinite(envValue)) return 5;
+  return Math.max(1, Math.floor(envValue));
+}
+
+function getMaxEntryNotionalUsd(): number {
+  const envValue = Number(process.env.POLY_LIVE_MAX_ENTRY_COST_USD || process.env.POLY_MAX_ENTRY_NOTIONAL_USD || 3);
+  if (!Number.isFinite(envValue)) return 3;
+  return Math.max(0.1, Math.min(1_000, envValue));
+}
+
+function getMinEntryNotionalUsd(): number {
+  const envValue = Number(process.env.POLY_LIVE_MIN_ENTRY_COST_USD || process.env.POLY_MIN_ENTRY_NOTIONAL_USD || 1);
+  if (!Number.isFinite(envValue)) return 1;
+  return Math.max(0.1, Math.min(1_000, envValue));
+}
+
+function getTargetEntryNotionalUsd(): number {
+  const envValue = Number(process.env.POLY_LIVE_TARGET_ENTRY_COST_USD || 2);
+  if (!Number.isFinite(envValue)) return 2;
+  return Math.max(0.1, Math.min(1_000, envValue));
+}
+
+function getMaxSharesPerEntry(): number {
+  const envValue = Number(process.env.POLY_MAX_SHARES_PER_ENTRY || 25);
+  if (!Number.isFinite(envValue)) return 25;
+  return Math.max(1, Math.min(100_000, Math.floor(envValue)));
+}
+
+function getMinVenueNotionalUsd(): number {
+  const envValue = Number(process.env.POLYMARKET_MIN_ORDER_NOTIONAL_USD || 0);
+  if (!Number.isFinite(envValue)) return 0;
+  return Math.max(0, Math.min(100, envValue));
+}
+
+function getMarketableBufferBps(): number {
+  const envValue = Number(process.env.POLY_MARKETABLE_BUFFER_BPS || 50);
+  if (!Number.isFinite(envValue)) return 50;
+  return Math.max(0, Math.min(2_000, envValue));
+}
+
+function getSizingFeeBufferBps(): number {
+  const envValue = Number(process.env.POLY_LIVE_SIZING_FEE_BUFFER_BPS || 30);
+  if (!Number.isFinite(envValue)) return 30;
+  return Math.max(0, Math.min(1_000, envValue));
+}
+
+function normalizeEntryOrderMode(value: EntryOrderMode | string | undefined): EntryOrderMode {
+  const normalized = String(value || process.env.POLY_ENTRY_ORDER_MODE || "MARKETABLE").trim().toUpperCase();
+  return normalized === "RESTING" ? "RESTING" : "MARKETABLE";
+}
+
+function readKnownAffordableUsd(): number | null {
+  const candidates = [
+    process.env.POLY_AVAILABLE_USD,
+    process.env.POLY_USDC_BALANCE_USD,
+    process.env.POLY_USDC_ALLOWANCE_USD
+  ];
+  for (const raw of candidates) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
 }
 
 function serializeErrorDetails(error: unknown): Record<string, unknown> {

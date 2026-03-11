@@ -18,8 +18,10 @@ import { DashboardServer } from "./web/DashboardServer";
 import { PolymarketEngine } from "./polymarket/PolymarketEngine";
 import { Btc5mLiveRunner } from "./polymarket/live/Btc5mLiveRunner";
 import { getTradingTruthReporter } from "./logging/truth";
+import { initNetworkTransport } from "./http/networkTransport";
 
 async function main(): Promise<void> {
+  initNetworkTransport();
   const config = loadConfig();
   const logger = buildLogger(config);
   const truthLogger = logger.child({ module: "truth" });

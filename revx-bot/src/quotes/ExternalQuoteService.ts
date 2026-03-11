@@ -1,5 +1,6 @@
 import { BotConfig } from "../config";
 import { Logger } from "../logger";
+import { initNetworkTransport } from "../http/networkTransport";
 
 export type VenueQuote = {
   venue: string;
@@ -12,7 +13,7 @@ export type VenueQuote = {
 
 type SupportedVenue = "coinbase" | "kraken";
 
-const REQUEST_TIMEOUT_MS = 1_500;
+const REQUEST_TIMEOUT_MS = 5_000;
 
 export class ExternalQuoteService {
   private readonly venues: string[];
@@ -56,7 +57,7 @@ export class ExternalQuoteService {
     if (this.polling) return;
     this.polling = true;
     try {
-      await Promise.all(this.venues.map((venue) => this.fetchVenue(venue)));
+      await Promise.allSettled(this.venues.map((venue) => this.fetchVenue(venue)));
     } finally {
       this.polling = false;
     }
@@ -130,6 +131,7 @@ export class ExternalQuoteService {
 }
 
 async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<unknown> {
+  initNetworkTransport();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -190,4 +192,3 @@ function mapKrakenPair(symbol: string): string {
   const quote = quoteRaw ?? "USD";
   return `${base}${quote}`;
 }
-

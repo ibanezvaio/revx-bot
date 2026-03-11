@@ -51,6 +51,10 @@ export type Btc5mIntelligence = {
   score: number | null;
   pUpModel: number;
   fallbackUsed: boolean;
+  rawSignalScore?: number | null;
+  intelScore?: number | null;
+  crossVenueBiasScore?: number | null;
+  baseProbability?: number | null;
 };
 
 export type Btc5mDecision = {

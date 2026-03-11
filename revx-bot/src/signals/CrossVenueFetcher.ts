@@ -13,7 +13,24 @@ export class CrossVenueFetcher {
 
   async fetch(symbol: string, nowTs = Date.now()): Promise<QuoteVenue[]> {
     const venues = this.resolveVenues();
-    const rows = await Promise.all(venues.map((venue) => this.fetchOne(venue, symbol, nowTs)));
+    const settled = await Promise.allSettled(venues.map((venue) => this.fetchOne(venue, symbol, nowTs)));
+    const rows = settled.map((result, index) => {
+      if (result.status === "fulfilled") return result.value;
+      const venue = venues[index];
+      return {
+        venue,
+        symbol,
+        quote: venue === "binance" ? "USDT" : "USD",
+        ts: nowTs,
+        bid: null,
+        ask: null,
+        mid: null,
+        spread_bps: null,
+        latency_ms: 0,
+        ok: false,
+        error: result.reason instanceof Error ? result.reason.message : String(result.reason)
+      } satisfies QuoteVenue;
+    });
     return rows.sort((a, b) => a.venue.localeCompare(b.venue));
   }
 
@@ -27,9 +44,7 @@ export class CrossVenueFetcher {
   }
 
   private async fetchOne(venue: FetchVenue, symbol: string, nowTs: number): Promise<QuoteVenue> {
-    const timeoutMs = this.config.signalRefreshMs > 0
-      ? Math.min(this.config.signalRefreshMs, this.config.venueTimeoutMs)
-      : this.config.venueTimeoutMs;
+    const timeoutMs = Math.max(8_000, this.config.venueTimeoutMs);
     let attempt = 0;
     let lastError = "";
 
@@ -80,4 +95,3 @@ function asNumOrNull(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
-

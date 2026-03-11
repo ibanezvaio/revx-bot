@@ -14,6 +14,8 @@ type SelectInput = {
 };
 
 export class Btc5mSelector {
+  private readonly unavailableTokenIdsBySlug = new Map<string, Set<string>>();
+
   constructor(
     private readonly config: BotConfig,
     private readonly logger: Logger,
@@ -23,6 +25,7 @@ export class Btc5mSelector {
   async select(input: SelectInput): Promise<Btc5mSelectionResult> {
     const tick = input.tick;
     const attemptedSlugs = [tick.currentSlug, tick.nextSlug, tick.prevSlug];
+    this.pruneUnavailableSlugs(new Set(attemptedSlugs));
     const cycleUnbookableTokenIds = new Set<string>();
     let lastReason = "NO_DIRECT_MARKET";
 
@@ -55,9 +58,13 @@ export class Btc5mSelector {
             lastReason = "TOKEN_ID_MISSING";
             continue;
           }
-          if (cycleUnbookableTokenIds.has(tokenId)) {
+          if (cycleUnbookableTokenIds.has(tokenId) || this.isSideBookUnavailable(slug, tokenId)) {
             candidateRejected = true;
             lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
+            this.logger.warn(
+              { slug, side, tokenId, reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN" },
+              "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
+            );
             continue;
           }
 
@@ -67,6 +74,7 @@ export class Btc5mSelector {
             sideBook.reason.toLowerCase().includes("no orderbook exists for the requested token id")
           ) {
             cycleUnbookableTokenIds.add(tokenId);
+            this.markSideBookUnavailable(slug, tokenId, sideBook.reason);
             candidateRejected = true;
             lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
             continue;
@@ -171,6 +179,42 @@ export class Btc5mSelector {
     };
   }
 
+  isSideBookUnavailable(slug: string, tokenId: string): boolean {
+    const normalizedSlug = String(slug || "").trim();
+    const normalizedTokenId = String(tokenId || "").trim();
+    if (!normalizedSlug || !normalizedTokenId) return false;
+    const tokenSet = this.unavailableTokenIdsBySlug.get(normalizedSlug);
+    return Boolean(tokenSet?.has(normalizedTokenId));
+  }
+
+  markSideBookUnavailable(slug: string, tokenId: string, reason: string): void {
+    const normalizedSlug = String(slug || "").trim();
+    const normalizedTokenId = String(tokenId || "").trim();
+    if (!normalizedSlug || !normalizedTokenId) return;
+    let tokenSet = this.unavailableTokenIdsBySlug.get(normalizedSlug);
+    if (!tokenSet) {
+      tokenSet = new Set<string>();
+      this.unavailableTokenIdsBySlug.set(normalizedSlug, tokenSet);
+    }
+    if (tokenSet.has(normalizedTokenId)) {
+      this.logger.warn(
+        { slug: normalizedSlug, tokenId: normalizedTokenId, reason },
+        "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
+      );
+      return;
+    }
+    tokenSet.add(normalizedTokenId);
+    this.logger.warn({ slug: normalizedSlug, tokenId: normalizedTokenId, reason }, "POLY_V2_SIDE_BOOK_UNAVAILABLE");
+  }
+
+  private pruneUnavailableSlugs(activeSlugs: Set<string>): void {
+    for (const slug of this.unavailableTokenIdsBySlug.keys()) {
+      if (!activeSlugs.has(slug)) {
+        this.unavailableTokenIdsBySlug.delete(slug);
+      }
+    }
+  }
+
   private getSideOrder(): Btc5mSide[] {
     const configuredOrder = String(process.env.POLY_V2_BOOK_CHECK_ORDER || "YES_NO").trim().toUpperCase();
     return configuredOrder === "NO_YES" ? ["NO", "YES"] : ["YES", "NO"];
@@ -224,7 +268,11 @@ export class Btc5mSelector {
       };
     } catch (error) {
       const reason = normalizeErrorReason(error);
-      this.logger.warn({ slug, side, tokenId, reason }, "POLY_V2_SIDE_BOOK_UNAVAILABLE");
+      if (reason.toLowerCase().includes("no orderbook exists for the requested token id")) {
+        this.markSideBookUnavailable(slug, tokenId, reason);
+      } else {
+        this.logger.warn({ slug, side, tokenId, reason }, "POLY_V2_SIDE_BOOK_UNAVAILABLE");
+      }
       return {
         side,
         tokenId,

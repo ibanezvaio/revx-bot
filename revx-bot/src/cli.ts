@@ -20,9 +20,11 @@ import { PolymarketEngine } from "./polymarket/PolymarketEngine";
 import { PolymarketClient } from "./polymarket/PolymarketClient";
 import { GammaSeedScanner } from "./polymarket/GammaSeedScanner";
 import { MarketScanner } from "./polymarket/MarketScanner";
+import { initNetworkTransport } from "./http/networkTransport";
 
 
 async function run(): Promise<void> {
+  initNetworkTransport();
   const command = process.argv[2] ?? "status";
   const args = process.argv.slice(3);
   const config = loadConfig();

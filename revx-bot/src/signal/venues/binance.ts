@@ -2,18 +2,27 @@ import { computeSpreadBps } from "../math";
 import { ExternalVenueSnapshot } from "../types";
 import { fetchJsonWithTimeout } from "./http";
 
+export function resolveBinanceTickerUrl(_symbol: string): string {
+  return "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT";
+}
+
 export async function fetchBinanceTicker(
   symbol: string,
-  timeoutMs: number
+  timeoutMs: number,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ExternalVenueSnapshot> {
   const started = Date.now();
-  const url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT";
+  const url = resolveBinanceTickerUrl(symbol);
   try {
-    const payload = (await fetchJsonWithTimeout(url, timeoutMs)) as Record<string, unknown>;
+    const payload = (await fetchJsonWithTimeout(url, timeoutMs, {
+      parentSignal: options.signal
+    })) as Record<string, unknown>;
     const bid = parseNum(payload.bidPrice);
     const ask = parseNum(payload.askPrice);
-    const mid =
-      Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0 ? (bid + ask) / 2 : null;
+    if (!(Number.isFinite(bid) && bid > 0) || !(Number.isFinite(ask) && ask > 0)) {
+      throw new Error("BINANCE_MISSING_BID_ASK");
+    }
+    const mid = (bid + ask) / 2;
     const spreadBps =
       mid && Number.isFinite(bid) && Number.isFinite(ask)
         ? computeSpreadBps(bid, ask)
@@ -51,4 +60,3 @@ function parseNum(value: unknown): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : Number.NaN;
 }
-

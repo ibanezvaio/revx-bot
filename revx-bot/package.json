@@ -20,6 +20,7 @@
     "dry-run": "node dist/cli.js dry-run",
     "simulate": "node dist/cli.js simulate --minutes 5",
     "signal-smoke": "npm run build && node dist/scripts/signal-smoke.js",
+    "signal:venues-debug": "npm run build && node dist/scripts/debugVenueFetch.js",
     "test:elite-signals": "npm run build && node dist/scripts/testEliteSignals.js",
     "test:fair-price": "npm run build && node dist/scripts/testFairPriceModel.js",
     "test:adverse-selection": "npm run build && node dist/scripts/testAdverseSelection.js",

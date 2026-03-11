@@ -1034,7 +1034,8 @@ export class PolymarketClient {
   }): Promise<{ orderId: string }> {
     validateTokenId(params.tokenId);
     validatePrice(params.limitPrice);
-    validateSize(params.size);
+    const normalizedSize = normalizeOrderSizeForVenue(params.size);
+    validateSize(normalizedSize);
 
     const authClient = await this.getAuthClient();
     const authInfo = this.authClientInfo;
@@ -1050,7 +1051,7 @@ export class PolymarketClient {
           tokenId: params.tokenId,
           side: params.side,
           price: params.limitPrice,
-          size: params.size,
+          size: normalizedSize,
           expirationSec: expirationPlan.expirationSec,
           feeRateBps,
           tickSize,
@@ -2447,6 +2448,23 @@ function validateSize(size: number): void {
   if (!Number.isFinite(size) || size <= 0) {
     throw new Error(`Invalid size: ${size}`);
   }
+}
+
+function normalizeOrderSizeForVenue(size: number): number {
+  if (!Number.isFinite(size) || size <= 0) return size;
+  const normalized = Number(size.toFixed(12));
+  const minShares = getMinVenueShares();
+  const epsilon = 1e-6;
+  if (normalized < minShares && minShares - normalized <= epsilon) {
+    return minShares;
+  }
+  return normalized;
+}
+
+function getMinVenueShares(): number {
+  const raw = Number(process.env.POLY_MIN_SHARES || 5);
+  if (!Number.isFinite(raw) || raw <= 0) return 5;
+  return raw;
 }
 
 function asNumber(value: unknown): number {

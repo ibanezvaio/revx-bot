@@ -1,29 +1,35 @@
 import { computeSpreadBps } from "../math";
 import { ExternalVenueSnapshot } from "../types";
-import { fetchJsonWithTimeout } from "./http";
+import { fetchJsonWithNativeHttps } from "./nativeHttps";
+
+export function resolveCoinbaseTickerUrl(_symbol: string): string {
+  return "https://api.exchange.coinbase.com/products/BTC-USD/book?level=1";
+}
 
 export async function fetchCoinbaseTicker(
   symbol: string,
-  timeoutMs: number
+  timeoutMs: number,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ExternalVenueSnapshot> {
   const started = Date.now();
-  const url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker";
+  const url = resolveCoinbaseTickerUrl(symbol);
   try {
-    const payload = (await fetchJsonWithTimeout(url, timeoutMs)) as Record<string, unknown>;
-    const bid = parseNum(payload.bid);
-    const ask = parseNum(payload.ask);
-    const price = parseNum(payload.price);
-    const mid =
-      Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0
-        ? (bid + ask) / 2
-        : Number.isFinite(price) && price > 0
-          ? price
-          : null;
+    const payload = (await fetchJsonWithNativeHttps(url, timeoutMs, {
+      parentSignal: options.signal
+    })) as Record<string, unknown>;
+    const bids = asTupleArray(payload.bids);
+    const asks = asTupleArray(payload.asks);
+    const bid = parseNum(bids[0]?.[0]);
+    const ask = parseNum(asks[0]?.[0]);
+    if (!(Number.isFinite(bid) && bid > 0) || !(Number.isFinite(ask) && ask > 0)) {
+      throw new Error("COINBASE_MISSING_BID_ASK");
+    }
+    const mid = (bid + ask) / 2;
     const spreadBps =
       mid && Number.isFinite(bid) && Number.isFinite(ask)
         ? computeSpreadBps(bid, ask)
         : null;
-    const remoteTs = parseTimeMs(payload.time);
+    const remoteTs = parseTimeMs(payload.time) ?? parseTimeMs(payload.timestamp);
     return {
       symbol,
       venue: "coinbase",
@@ -58,9 +64,15 @@ function parseNum(value: unknown): number {
   return Number.isFinite(n) ? n : Number.NaN;
 }
 
+function asTupleArray(value: unknown): Array<[string | number, string | number]> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((row): row is [string | number, string | number] => {
+    return Array.isArray(row) && row.length >= 2;
+  });
+}
+
 function parseTimeMs(value: unknown): number | null {
   if (typeof value !== "string") return null;
   const ts = Date.parse(value);
   return Number.isFinite(ts) ? ts : null;
 }
-

@@ -2,9 +2,9 @@ import { BotConfig } from "../config";
 import { Logger } from "../logger";
 import { clamp, emaUpdate } from "./math";
 import { FairPriceModel } from "./FairPriceModel";
-import { fetchBinanceTicker } from "./venues/binance";
-import { fetchCoinbaseTicker } from "./venues/coinbase";
-import { fetchKrakenTicker } from "./venues/kraken";
+import { fetchBinanceTicker, resolveBinanceTickerUrl } from "./venues/binance";
+import { fetchCoinbaseTicker, resolveCoinbaseTickerUrl } from "./venues/coinbase";
+import { fetchKrakenTicker, resolveKrakenTickerUrl } from "./venues/kraken";
 import {
   CrossVenueComputation,
   ExternalVenueSnapshot,
@@ -50,7 +50,24 @@ export class CrossVenueSignalEngine {
 
   async compute(symbol: string, revxMid: number, nowTs = Date.now()): Promise<CrossVenueComputation> {
     const venues = this.resolveConfiguredVenues();
-    const rawSnapshots = await Promise.all(venues.map((venue) => this.refreshVenue(venue, symbol, nowTs)));
+    const effectiveTimeoutMs = Math.max(8_000, this.config.venueTimeoutMs);
+    const settled = await Promise.allSettled(venues.map((venue) => this.refreshVenue(venue, symbol, nowTs)));
+    const rawSnapshots = settled.map((result, index) => {
+      if (result.status === "fulfilled") return result.value;
+      return {
+        symbol,
+        venue: venues[index],
+        quote: venues[index] === "binance" ? "USDT" : "USD",
+        ts: nowTs,
+        bid: null,
+        ask: null,
+        mid: null,
+        spread_bps: null,
+        latency_ms: 0,
+        ok: false,
+        error: result.reason instanceof Error ? result.reason.message : String(result.reason)
+      } satisfies ExternalVenueSnapshot;
+    });
     const fair = this.fairPriceModel.compute(symbol, revxMid, rawSnapshots, nowTs);
     const venueHealth = this.fairPriceModel.toVenueHealth(fair.venues);
     const healthyVenues = venueHealth.filter((row) => row.ok && !row.stale && row.mid && row.mid > 0);
@@ -101,11 +118,36 @@ export class CrossVenueSignalEngine {
       const ageMs = Math.max(0, nowTs - Number(row.ts || nowTs));
       const fresh = ageMs <= this.config.fairStaleMs;
       const accepted = Boolean(row.ok) && Number(row.mid || 0) > 0 && fresh;
+      const abortCause = classifyAbortCause(row.error);
+      const httpStatus = extractHttpStatus(row.error);
+      const responseStatus = row.ok
+        ? "OK"
+        : abortCause === "LOCAL_TIMEOUT"
+          ? "TIMEOUT"
+          : abortCause === "PARENT_SIGNAL"
+            ? "ABORTED"
+            : "FAILED";
       return {
         provider: row.venue,
+        url: getProviderUrl(row.venue, symbol),
+        method: "GET",
         requestedSymbol: symbol,
         responseOk: Boolean(row.ok),
+        responseStatus,
         mid: row.mid,
+        timeoutMs: effectiveTimeoutMs,
+        signalAbortedBeforeFetch: false,
+        parentSignalAborted: abortCause === "PARENT_SIGNAL",
+        abortCause,
+        httpStatus,
+        abortSource:
+          abortCause === "LOCAL_TIMEOUT"
+            ? "local_timeout"
+            : abortCause === "PARENT_SIGNAL"
+              ? "parent_shutdown"
+              : abortCause === "UNKNOWN_ABORT"
+                ? "unknown_abort"
+                : "none",
         ageMs,
         fresh,
         accepted,
@@ -176,10 +218,43 @@ export class CrossVenueSignalEngine {
       }
     }
 
-    const fetchPromise = this.fetchVenueSnapshot(venue, symbol)
+    const timeoutMs = Math.max(8_000, this.config.venueTimeoutMs);
+    const providerUrl = getProviderUrl(venue, symbol);
+    const signalAbortedBeforeFetch = false;
+    const parentSignalAborted = false;
+    const startTs = Date.now();
+
+    this.logger.debug(
+      {
+        provider: venue,
+        url: providerUrl,
+        requestedSymbol: symbol,
+        method: "GET",
+        startTs,
+        timeoutMs,
+        signalAbortedBeforeFetch,
+        parentSignalAborted,
+        status: "START"
+      },
+      "Cross-venue provider start"
+    );
+
+    const fetchPromise = this.fetchVenueSnapshot(venue, symbol, timeoutMs)
       .then((snapshot) => {
+        const endTs = Date.now();
+        const elapsedMs = Math.max(0, endTs - startTs);
         const ageMs = Math.max(0, nowTs - Number(snapshot.ts || nowTs));
         const fresh = ageMs <= this.config.fairStaleMs;
+        const abortCause = classifyAbortCause(snapshot.error);
+        const httpStatus = extractHttpStatus(snapshot.error);
+        const failurePhase = classifyFailurePhase(snapshot.error);
+        const status = snapshot.ok
+          ? "SUCCESS"
+          : abortCause === "LOCAL_TIMEOUT"
+            ? "TIMEOUT"
+            : abortCause === "PARENT_SIGNAL"
+              ? "ABORTED_PARENT"
+              : "BAD_RESPONSE";
         if (snapshot.ok && snapshot.mid !== null && snapshot.mid > 0) {
           runtime.failureCount = 0;
           runtime.nextAllowedTs = nowTs + this.config.venueRefreshMs;
@@ -194,10 +269,30 @@ export class CrossVenueSignalEngine {
         this.logger.debug(
           {
             provider: venue,
+            url: providerUrl,
             requestedSymbol: symbol,
+            method: "GET",
             responseOk: snapshot.ok,
             mid: snapshot.mid,
-            status: snapshot.ok ? "OK" : "BAD_RESPONSE",
+            status,
+            responseStatus: status,
+            startTs,
+            endTs,
+            elapsedMs,
+            signalAbortedBeforeFetch,
+            timeoutMs,
+            parentSignalAborted,
+            abortCause,
+            httpStatus,
+            failurePhase,
+            abortSource:
+              abortCause === "LOCAL_TIMEOUT"
+                ? "local_timeout"
+                : abortCause === "PARENT_SIGNAL"
+                  ? "parent_shutdown"
+                  : abortCause === "UNKNOWN_ABORT"
+                    ? "unknown_abort"
+                    : "none",
             ageMs,
             fresh,
             error: snapshot.error ?? null
@@ -209,6 +304,8 @@ export class CrossVenueSignalEngine {
         return snapshot;
       })
       .catch((error) => {
+        const endTs = Date.now();
+        const elapsedMs = Math.max(0, endTs - startTs);
         runtime.failureCount += 1;
         const backoffMs = Math.min(
           this.config.venueMaxBackoffMs,
@@ -228,13 +325,37 @@ export class CrossVenueSignalEngine {
           ok: false,
           error: (error as Error).message
         };
+        const abortCause = classifyAbortCause(failed.error);
+        const httpStatus = extractHttpStatus(failed.error);
+        const failurePhase = classifyFailurePhase(failed.error);
+        const status = abortCause === "LOCAL_TIMEOUT" ? "TIMEOUT" : "FETCH_ERROR";
         this.logger.debug(
           {
             provider: venue,
+            url: providerUrl,
             requestedSymbol: symbol,
+            method: "GET",
             responseOk: false,
             mid: null,
-            status: "FETCH_ERROR",
+            status,
+            responseStatus: status,
+            startTs,
+            endTs,
+            elapsedMs,
+            signalAbortedBeforeFetch,
+            timeoutMs,
+            parentSignalAborted,
+            abortCause,
+            httpStatus,
+            failurePhase,
+            abortSource:
+              abortCause === "LOCAL_TIMEOUT"
+                ? "local_timeout"
+                : abortCause === "PARENT_SIGNAL"
+                  ? "parent_shutdown"
+                  : abortCause === "UNKNOWN_ABORT"
+                    ? "unknown_abort"
+                    : "none",
             ageMs: 0,
             fresh: false,
             error: failed.error ?? null
@@ -260,15 +381,16 @@ export class CrossVenueSignalEngine {
 
   private async fetchVenueSnapshot(
     venue: VenueId,
-    symbol: string
+    symbol: string,
+    timeoutMs: number
   ): Promise<ExternalVenueSnapshot> {
     if (venue === "coinbase") {
-      return fetchCoinbaseTicker(symbol, this.config.venueTimeoutMs);
+      return fetchCoinbaseTicker(symbol, timeoutMs);
     }
     if (venue === "binance") {
-      return fetchBinanceTicker(symbol, this.config.venueTimeoutMs);
+      return fetchBinanceTicker(symbol, timeoutMs);
     }
-    return fetchKrakenTicker(symbol, this.config.venueTimeoutMs);
+    return fetchKrakenTicker(symbol, timeoutMs);
   }
 
   private trimRolling(nowTs: number): void {
@@ -297,4 +419,37 @@ function emptyRuntime(): VenueRuntime {
 function computeAlpha(sampleMs: number, periodMs: number): number {
   const periods = Math.max(2, Math.round(periodMs / Math.max(sampleMs, 1)));
   return clamp(2 / (periods + 1), 0.01, 0.99);
+}
+
+function classifyAbortCause(errorText: string | undefined): string {
+  const text = String(errorText || "").toUpperCase();
+  if (text.includes("LOCAL_TIMEOUT")) return "LOCAL_TIMEOUT";
+  if (text.includes("ABORTED_PARENT_SIGNAL")) return "PARENT_SIGNAL";
+  if (text.includes("ABORTED")) return "UNKNOWN_ABORT";
+  return "NONE";
+}
+
+function classifyFailurePhase(errorText: string | undefined): string {
+  const text = String(errorText || "").toLowerCase();
+  const match = text.match(/phase=([a-z_]+)/);
+  if (match?.[1]) return match[1];
+  return "unknown";
+}
+
+function extractHttpStatus(errorText: string | undefined): number | null {
+  const text = String(errorText || "");
+  const patterns = [/status=(\d{3})/i, /HTTP[\s_](\d{3})/i];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const parsed = Number(match[1]);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function getProviderUrl(venue: VenueId, symbol: string): string {
+  if (venue === "coinbase") return resolveCoinbaseTickerUrl(symbol);
+  if (venue === "binance") return resolveBinanceTickerUrl(symbol);
+  return resolveKrakenTickerUrl(symbol);
 }

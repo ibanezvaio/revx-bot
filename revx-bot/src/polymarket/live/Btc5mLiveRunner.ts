@@ -40,6 +40,8 @@ type RuntimeState = {
   lastFetchErr: string | null;
   lastDecisionTs: number;
   lastUpdateTs: number;
+  entriesInWindow: number;
+  realizedPnlUsd: number;
 };
 
 type ExecutionAttempt = {
@@ -47,14 +49,44 @@ type ExecutionAttempt = {
   executionSlug: string;
   selectedSlug: string;
   currentSlugAtCreate: string;
+  intendedOrderMode: "MARKETABLE_ENTRY" | "RESTING_ENTRY";
   side: "YES" | "NO";
   tokenId: string;
   retryCount: number;
   createdTs: number;
   deadlineTs: number;
+  postingStarted: boolean;
+  postReturned: boolean;
+  awaitingSettlement: boolean;
   tick: Btc5mTick;
   selected: Btc5mSelectedMarket;
   decision: Btc5mDecision;
+};
+
+type ProfitTakeAttempt = {
+  attemptId: string;
+  executionSlug: string;
+  marketId: string;
+  tokenId: string;
+  side: "YES" | "NO";
+  shares: number;
+  bidPrice: number;
+  avgPrice: number;
+  createdTs: number;
+};
+
+type WindowEntryState = {
+  entries: number;
+  realizedPnlUsd: number;
+  cooldownUntilTs: number;
+  clearedSinceLastEntry: boolean;
+};
+
+type ReferenceOracle = {
+  price: number | null;
+  ageMs: number | null;
+  ts: number | null;
+  source: string;
 };
 
 export class Btc5mLiveRunner {
@@ -76,11 +108,16 @@ export class Btc5mLiveRunner {
   private readonly recentTicks: Array<Record<string, unknown>> = [];
   private activeExecutionAttempt: ExecutionAttempt | null = null;
   private activeExecutionTask: Promise<void> | null = null;
+  private activeProfitTakeAttempt: ProfitTakeAttempt | null = null;
+  private activeProfitTakeTask: Promise<void> | null = null;
   private executionAttemptSeq = 0;
   private executionCooldownUntilTs = 0;
+  private entryAttemptCooldownUntilTs = 0;
   private invalidatedAttemptIds = new Set<string>();
   private previousCurrentSlug: string | null = null;
   private lastRolloverTs = 0;
+  private lastProfitPollTs = 0;
+  private readonly windowEntryStateBySlug = new Map<string, WindowEntryState>();
   private state: RuntimeState = {
     running: false,
     fetchOk: false,
@@ -101,7 +138,9 @@ export class Btc5mLiveRunner {
     lastFetchOkTs: 0,
     lastFetchErr: "STARTING",
     lastDecisionTs: 0,
-    lastUpdateTs: 0
+    lastUpdateTs: 0,
+    entriesInWindow: 0,
+    realizedPnlUsd: 0
   };
 
   constructor(
@@ -130,6 +169,8 @@ export class Btc5mLiveRunner {
     this.state.holdReason = "STARTING";
     this.state.blockedBy = "STARTING";
     this.state.lastFetchErr = "STARTING";
+    this.state.entriesInWindow = 0;
+    this.state.realizedPnlUsd = 0;
     this.firstTickPromise = new Promise<void>((resolve) => {
       this.firstTickResolve = resolve;
     });
@@ -187,6 +228,7 @@ export class Btc5mLiveRunner {
   async stop(reason = "STOPPED"): Promise<void> {
     this.stopRequested = true;
     this.invalidateExecutionAttempt("STOP_REQUESTED", { currentSlug: this.state.currentBucketSlug ?? null });
+    this.activeProfitTakeAttempt = null;
     if (this.loopTask) {
       await this.loopTask.catch(() => undefined);
     }
@@ -314,8 +356,8 @@ export class Btc5mLiveRunner {
         remainingSec: this.state.remainingSec,
         chosenSide: this.state.chosenSide,
         chosenDirection: this.state.chosenDirection,
-        entriesInWindow: 0,
-        realizedPnlUsd: 0,
+        entriesInWindow: this.state.entriesInWindow,
+        realizedPnlUsd: this.state.realizedPnlUsd,
         resolutionSource: null,
         lifecycleStatus: this.state.selectedSlug ? "ACTIVE" : "EMPTY"
       },
@@ -356,10 +398,9 @@ export class Btc5mLiveRunner {
   }
 
   private async runLoop(): Promise<void> {
-    const loopMs = 2_000;
     while (!this.stopRequested) {
       await this.processCycle(true);
-      await sleep(loopMs);
+      await sleep(this.getDecisionLoopMs());
     }
   }
 
@@ -440,6 +481,16 @@ export class Btc5mLiveRunner {
     }
 
     const reference = this.getReferencePrice(tick.tickNowMs);
+    this.logger.warn(
+      {
+        source: reference.source,
+        ts: reference.ts,
+        ageMs: reference.ageMs,
+        staleThresholdMs: this.config.polymarket.live.oracleHardBlockMs,
+        warnThresholdMs: this.config.polymarket.live.oracleWarnMs
+      },
+      "POLY_V2_ORACLE_STATUS"
+    );
     const selectionResult = await this.selector.select({
       tick
     });
@@ -473,6 +524,8 @@ export class Btc5mLiveRunner {
       this.state.selectedTokenId = null;
       this.state.chosenSide = null;
       this.state.chosenDirection = null;
+      this.state.entriesInWindow = 0;
+      this.state.realizedPnlUsd = 0;
       this.state.action = "HOLD";
       this.state.holdReason = blocker;
       this.state.blockedBy = blocker;
@@ -518,6 +571,8 @@ export class Btc5mLiveRunner {
       this.state.selectedTokenId = null;
       this.state.chosenSide = null;
       this.state.chosenDirection = null;
+      this.state.entriesInWindow = 0;
+      this.state.realizedPnlUsd = 0;
       this.state.action = "HOLD";
       this.state.holdReason = selectedInvariant.reason;
       this.state.blockedBy = selectedInvariant.reason;
@@ -552,6 +607,7 @@ export class Btc5mLiveRunner {
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: selectedInvariant.reason });
       return;
     }
+    this.syncWindowEntryState(selected.slug, selected.marketId, tick.tickNowMs);
 
     const intelligence = this.resolveDirectionalIntelligence({
       nowMs: tick.tickNowMs,
@@ -577,22 +633,40 @@ export class Btc5mLiveRunner {
       intelligence,
       oracleAgeMs: reference.ageMs
     });
-    const executionDispatch = this.dispatchExecutionAttempt({
+    const profitTakeDispatch = await this.maybeDispatchProfitTake({
       tick,
       selected,
-      decision,
       allowExecution
     });
+    const executionDispatch = profitTakeDispatch
+      ? { action: "HOLD" as const, blocker: profitTakeDispatch }
+      : await this.dispatchExecutionAttempt({
+          tick,
+          selected,
+          decision,
+          allowExecution
+        });
 
     const finalAction = executionDispatch.action;
     const finalBlocker = executionDispatch.blocker;
     const chosenSide = decision.chosenSide;
+    this.logDecisionBreakdown({
+      intelligence,
+      decision,
+      selected,
+      tick,
+      finalChosenSide: chosenSide,
+      finalAction
+    });
     const selectedTokenId =
       chosenSide === "YES" ? selected.yesTokenId : chosenSide === "NO" ? selected.noTokenId : null;
+    const windowState = this.getWindowEntryState(selected.slug);
     this.state.selectedSlug = selected.slug;
     this.state.selectedTokenId = selectedTokenId;
     this.state.chosenSide = chosenSide;
     this.state.chosenDirection = chosenSide ? chosenDirectionForSide(chosenSide) : null;
+    this.state.entriesInWindow = windowState.entries;
+    this.state.realizedPnlUsd = windowState.realizedPnlUsd;
     this.state.action = finalAction;
     this.state.holdReason = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
     this.state.blockedBy = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
@@ -631,12 +705,12 @@ export class Btc5mLiveRunner {
     });
   }
 
-  private dispatchExecutionAttempt(input: {
+  private async dispatchExecutionAttempt(input: {
     tick: Btc5mTick;
     selected: Btc5mSelectedMarket;
     decision: Btc5mDecision;
     allowExecution: boolean;
-  }): { action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | null } {
+  }): Promise<{ action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | null }> {
     if (input.decision.action === "HOLD") {
       return { action: "HOLD", blocker: input.decision.blocker || "HOLD" };
     }
@@ -649,6 +723,12 @@ export class Btc5mLiveRunner {
     if (Date.now() < this.executionCooldownUntilTs) {
       return { action: "HOLD", blocker: "EXECUTION_COOLDOWN" };
     }
+    if (Date.now() < this.entryAttemptCooldownUntilTs) {
+      return { action: "HOLD", blocker: "ENTRY_ATTEMPT_COOLDOWN" };
+    }
+    if (this.activeProfitTakeAttempt) {
+      return { action: "HOLD", blocker: "PROFIT_TAKE_IN_FLIGHT" };
+    }
 
     const tokenId =
       input.decision.chosenSide === "YES"
@@ -656,8 +736,24 @@ export class Btc5mLiveRunner {
         : input.decision.chosenSide === "NO"
           ? input.selected.noTokenId
           : null;
+    const intendedOrderMode = this.getEntryOrderMode();
     if (!input.decision.chosenSide || !tokenId) {
       return { action: "HOLD", blocker: "TOKEN_NOT_BOOKABLE" };
+    }
+    if (
+      input.decision.oracleAgeMs !== null &&
+      Number.isFinite(input.decision.oracleAgeMs) &&
+      input.decision.oracleAgeMs > input.decision.oracleHardBlockMs
+    ) {
+      return { action: "HOLD", blocker: "STALE_ORACLE_HARD_BLOCK" };
+    }
+    const sideBookAvailable = await this.verifySideBookAvailableForExecution({
+      slug: input.selected.slug,
+      side: input.decision.chosenSide,
+      tokenId
+    });
+    if (!sideBookAvailable) {
+      return { action: "HOLD", blocker: "SIDE_BOOK_UNAVAILABLE" };
     }
     if (input.selected.slug !== input.tick.currentSlug) {
       this.logger.warn(
@@ -673,6 +769,56 @@ export class Btc5mLiveRunner {
         "POLY_V2_SKIP_NEXT_MARKET_EXECUTION"
       );
       return { action: "HOLD", blocker: "NEXT_MARKET_PRELOAD_ONLY" };
+    }
+    const windowState = this.getWindowEntryState(input.selected.slug);
+    const maxEntriesPerWindow = this.getMaxEntriesPerWindow();
+    const maxOpenEntryOrdersPerWindow = this.getMaxOpenEntryOrdersPerWindow();
+    if (windowState.entries >= maxEntriesPerWindow) {
+      this.logger.warn(
+        {
+          selectedSlug: input.selected.slug,
+          currentSlug: input.tick.currentSlug,
+          entriesInWindow: windowState.entries,
+          maxEntriesPerWindow,
+          hasActiveAttempt: Boolean(this.activeExecutionAttempt),
+          reason: "MAX_ENTRIES_PER_WINDOW"
+        },
+        "POLY_V2_REENTRY_EVAL"
+      );
+      return { action: "HOLD", blocker: "MAX_ENTRIES_PER_WINDOW" };
+    }
+
+    const hasPositionForMarket = this.hasOpenPositionForMarket(input.selected.marketId);
+    if (windowState.entries > 0 && !hasPositionForMarket) {
+      if (!windowState.clearedSinceLastEntry) {
+        this.logger.warn(
+          {
+            selectedSlug: input.selected.slug,
+            currentSlug: input.tick.currentSlug,
+            entriesInWindow: windowState.entries,
+            maxEntriesPerWindow,
+            hasActiveAttempt: Boolean(this.activeExecutionAttempt),
+            reason: "REENTRY_WAIT_CLEAR"
+          },
+          "POLY_V2_REENTRY_EVAL"
+        );
+        return { action: "HOLD", blocker: "REENTRY_WAIT_CLEAR" };
+      }
+      if (Date.now() < windowState.cooldownUntilTs) {
+        this.logger.warn(
+          {
+            selectedSlug: input.selected.slug,
+            currentSlug: input.tick.currentSlug,
+            entriesInWindow: windowState.entries,
+            maxEntriesPerWindow,
+            cooldownUntilTs: windowState.cooldownUntilTs,
+            hasActiveAttempt: Boolean(this.activeExecutionAttempt),
+            reason: "REENTRY_COOLDOWN"
+          },
+          "POLY_V2_REENTRY_EVAL"
+        );
+        return { action: "HOLD", blocker: "REENTRY_COOLDOWN" };
+      }
     }
 
     const postRolloverGraceMs = this.getPostRolloverGraceMs();
@@ -696,15 +842,50 @@ export class Btc5mLiveRunner {
 
     const active = this.activeExecutionAttempt;
     if (active && this.isExecutionAttemptActive(active)) {
-      const sameAttemptTarget =
-        active.executionSlug === input.selected.slug && active.side === input.decision.chosenSide && active.tokenId === tokenId;
-      if (sameAttemptTarget) {
-        return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
+      let activeCleared = false;
+      if (active.postingStarted) {
+        const activeAgeMs = Date.now() - active.createdTs;
+        const staleByAge = activeAgeMs >= this.getUnfilledEntryMaxAgeMs();
+        const staleByRollover = active.executionSlug !== input.tick.currentSlug;
+        const staleBySuperseded = active.executionSlug !== input.selected.slug;
+        const staleBySettlement = active.awaitingSettlement;
+        const shouldClear =
+          staleByAge || staleByRollover || staleBySuperseded || staleBySettlement || active.postReturned;
+        if (shouldClear) {
+          const staleReason = staleByRollover
+            ? "ROLLOVER"
+            : staleBySuperseded
+              ? "SUPERSEDED"
+              : staleByAge
+                ? "UNFILLED_MAX_AGE"
+                : staleBySettlement
+                  ? "AWAITING_SETTLEMENT"
+                  : "POST_RETURNED";
+          void this.cancelUnfilledOrdersForAttempt(active, staleReason);
+          this.clearInflightExecutionState(active, `STALE_ATTEMPT_ABORTED:${staleReason}`, this.getReentryAfterUnfilledEnabled());
+          if (this.getReentryAfterUnfilledEnabled()) {
+            this.logReentryEligible(active, staleReason);
+          }
+          activeCleared = true;
+        } else {
+          return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
+        }
       }
-      this.invalidateExecutionAttempt("SUPERSEDED", {
-        currentSlug: input.tick.currentSlug,
-        selectedSlug: input.selected.slug
-      });
+      if (!activeCleared) {
+        const sameAttemptTarget =
+          active.executionSlug === input.selected.slug && active.side === input.decision.chosenSide && active.tokenId === tokenId;
+        if (sameAttemptTarget) {
+          return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
+        }
+        this.invalidateExecutionAttempt("SUPERSEDED", {
+          currentSlug: input.tick.currentSlug,
+          selectedSlug: input.selected.slug
+        });
+      }
+    }
+    const openEntryOrdersForMarket = this.execution.countOpenEntryOrdersForMarket(input.selected.marketId);
+    if (openEntryOrdersForMarket >= maxOpenEntryOrdersPerWindow) {
+      return { action: "HOLD", blocker: "MAX_OPEN_ENTRY_ORDERS_PER_WINDOW" };
     }
 
     const attempt: ExecutionAttempt = {
@@ -712,11 +893,15 @@ export class Btc5mLiveRunner {
       executionSlug: input.selected.slug,
       selectedSlug: input.selected.slug,
       currentSlugAtCreate: input.tick.currentSlug,
+      intendedOrderMode,
       side: input.decision.chosenSide,
       tokenId,
       retryCount: 0,
       createdTs: Date.now(),
       deadlineTs: Date.now() + this.getExecutionDeadlineMs(),
+      postingStarted: false,
+      postReturned: false,
+      awaitingSettlement: false,
       tick: input.tick,
       selected: input.selected,
       decision: input.decision
@@ -731,10 +916,15 @@ export class Btc5mLiveRunner {
         side: attempt.side,
         tokenId: attempt.tokenId,
         retryCount: attempt.retryCount,
+        intendedOrderMode,
+        entriesInWindow: windowState.entries,
+        maxEntriesPerWindow,
         reason: "CREATED"
       },
       "POLY_V2_EXECUTION_ATTEMPT_CREATED"
     );
+    this.logExecutionAttemptLifecycle(attempt, "created");
+    this.entryAttemptCooldownUntilTs = Date.now() + this.getEntryAttemptCooldownMs();
     this.startExecutionAttempt(attempt);
     return { action: input.decision.action, blocker: null };
   }
@@ -765,7 +955,10 @@ export class Btc5mLiveRunner {
         if (timeoutHandle) clearTimeout(timeoutHandle);
 
         if (raceResult === "TIMEOUT") {
-          this.applyExecutionCooldown("EXECUTION_DEADLINE_EXCEEDED", this.getExecutionCooldownMs(), attempt);
+          this.logExecutionAttemptLifecycle(attempt, "deadline_exceeded", {
+            postingStarted: attempt.postingStarted,
+            postReturned: attempt.postReturned
+          });
           this.logger.warn(
             {
               attemptId: attempt.attemptId,
@@ -779,6 +972,36 @@ export class Btc5mLiveRunner {
             },
             "POLY_V2_EXECUTION_TIMEOUT"
           );
+          if (attempt.postingStarted) {
+            attempt.awaitingSettlement = true;
+            this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
+              reason: "deadline_exceeded_after_post_start"
+            });
+            void this.cancelUnfilledOrdersForAttempt(attempt, "EXECUTION_DEADLINE_EXCEEDED");
+            this.clearInflightExecutionState(attempt, "EXECUTION_DEADLINE_EXCEEDED", this.getReentryAfterUnfilledEnabled());
+            if (this.getReentryAfterUnfilledEnabled()) {
+              this.logReentryEligible(attempt, "EXECUTION_DEADLINE_EXCEEDED");
+            }
+            void executionPromise
+              .then((settleResult) => {
+                this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
+                  action: settleResult.action,
+                  blocker: settleResult.blocker
+                });
+                if (settleResult.action === "HOLD" && settleResult.blocker && isTransientExecutionError(settleResult.blocker)) {
+                  this.applyExecutionCooldown(settleResult.blocker, this.getExecutionCooldownMs(), attempt);
+                }
+              })
+              .catch((error) => {
+                this.applyExecutionCooldown("AWAITING_SETTLEMENT_ERROR", this.getExecutionCooldownMs(), attempt);
+                this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
+                  error: shortError(error)
+                });
+              });
+            return;
+          }
+
+          this.applyExecutionCooldown("EXECUTION_DEADLINE_EXCEEDED", this.getExecutionCooldownMs(), attempt);
           this.resetExecutionAttemptState("EXECUTION_DEADLINE_EXCEEDED", attempt);
           return;
         }
@@ -789,12 +1012,32 @@ export class Btc5mLiveRunner {
         }
 
         if (raceResult.action === "HOLD" && raceResult.blocker) {
+          if (raceResult.blocker === "LIVE_PLACED_NO_FILL") {
+            void this.cancelUnfilledOrdersForAttempt(attempt, "LIVE_PLACED_NO_FILL");
+            this.clearInflightExecutionState(attempt, "LIVE_PLACED_NO_FILL", this.getReentryAfterUnfilledEnabled());
+            if (this.getReentryAfterUnfilledEnabled()) {
+              this.logReentryEligible(attempt, "LIVE_PLACED_NO_FILL");
+            }
+            return;
+          }
           if (raceResult.blocker === "STALE_AFTER_POST") {
+            attempt.awaitingSettlement = true;
+            void this.cancelUnfilledOrdersForAttempt(attempt, "STALE_AFTER_POST");
             this.applyExecutionCooldown("STALE_AFTER_POST", this.getStaleAfterPostCooldownMs(), attempt);
-            this.resetExecutionAttemptState("STALE_AFTER_POST", attempt);
+            this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
+              reason: "STALE_AFTER_POST"
+            });
+            this.clearInflightExecutionState(attempt, "STALE_AFTER_POST", this.getReentryAfterUnfilledEnabled());
+            if (this.getReentryAfterUnfilledEnabled()) {
+              this.logReentryEligible(attempt, "STALE_AFTER_POST");
+            }
             return;
           }
           if (raceResult.blocker === "STALE_ATTEMPT_ABORTED") {
+            this.clearInflightExecutionState(attempt, "STALE_ATTEMPT_ABORTED", this.getReentryAfterUnfilledEnabled());
+            if (this.getReentryAfterUnfilledEnabled()) {
+              this.logReentryEligible(attempt, "STALE_ATTEMPT_ABORTED");
+            }
             this.resetExecutionAttemptState("STALE_ATTEMPT_ABORTED", attempt);
             return;
           }
@@ -815,6 +1058,13 @@ export class Btc5mLiveRunner {
             "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
           );
         }
+        if (raceResult.action === "BUY_YES" || raceResult.action === "BUY_NO") {
+          this.recordWindowEntry(attempt.executionSlug);
+        }
+        this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
+          action: raceResult.action,
+          blocker: raceResult.blocker
+        });
       } catch (error) {
         this.applyExecutionCooldown("EXECUTION_EXCEPTION", this.getExecutionCooldownMs(), attempt);
         this.logger.warn(
@@ -832,6 +1082,11 @@ export class Btc5mLiveRunner {
         );
         this.resetExecutionAttemptState("EXECUTION_EXCEPTION", attempt);
       } finally {
+        this.logExecutionAttemptLifecycle(attempt, "final_state", {
+          postingStarted: attempt.postingStarted,
+          postReturned: attempt.postReturned,
+          awaitingSettlement: attempt.awaitingSettlement
+        });
         if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
           this.activeExecutionAttempt = null;
         }
@@ -849,6 +1104,19 @@ export class Btc5mLiveRunner {
   ): void {
     const attempt = this.activeExecutionAttempt;
     if (!attempt) return;
+    if (attempt.postingStarted) {
+      const reentryEligible = this.getReentryAfterUnfilledEnabled() && reason !== "STOP_REQUESTED";
+      attempt.awaitingSettlement = true;
+      this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
+        reason: `${reason}_deferred_post_started`
+      });
+      void this.cancelUnfilledOrdersForAttempt(attempt, reason);
+      this.clearInflightExecutionState(attempt, `STALE_ATTEMPT_ABORTED:${reason}`, reentryEligible);
+      if (reentryEligible) {
+        this.logReentryEligible(attempt, reason);
+      }
+      return;
+    }
     this.invalidatedAttemptIds.add(attempt.attemptId);
     this.logger.warn(
       {
@@ -886,6 +1154,101 @@ export class Btc5mLiveRunner {
     }
   }
 
+  private clearInflightExecutionState(
+    attempt: ExecutionAttempt,
+    reason: string,
+    reentryEligible: boolean
+  ): void {
+    this.invalidatedAttemptIds.add(attempt.attemptId);
+    if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
+      this.activeExecutionAttempt = null;
+    }
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason,
+        reentryEligible
+      },
+      "POLY_V2_INFLIGHT_CLEARED"
+    );
+  }
+
+  private async cancelUnfilledOrdersForAttempt(attempt: ExecutionAttempt, reason: string): Promise<void> {
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_UNFILLED_ORDER_CANCEL_REQUEST"
+    );
+    try {
+      const result = await this.execution.cancelUnfilledEntryOrders({
+        marketId: attempt.selected.marketId,
+        tokenId: attempt.tokenId,
+        maxAgeMs: 0,
+        reason
+      });
+      this.logger.warn(
+        {
+          attemptId: attempt.attemptId,
+          executionSlug: attempt.executionSlug,
+          currentSlug: this.state.currentBucketSlug,
+          selectedSlug: attempt.selectedSlug,
+          side: attempt.side,
+          tokenId: attempt.tokenId,
+          retryCount: attempt.retryCount,
+          reason,
+          requestedCount: result.requestedCount,
+          cancelledCount: result.cancelledCount
+        },
+        "POLY_V2_UNFILLED_ORDER_CANCELLED"
+      );
+    } catch (error) {
+      this.logger.warn(
+        {
+          attemptId: attempt.attemptId,
+          executionSlug: attempt.executionSlug,
+          currentSlug: this.state.currentBucketSlug,
+          selectedSlug: attempt.selectedSlug,
+          side: attempt.side,
+          tokenId: attempt.tokenId,
+          retryCount: attempt.retryCount,
+          reason,
+          error: shortError(error)
+        },
+        "POLY_V2_UNFILLED_ORDER_CANCELLED"
+      );
+    }
+  }
+
+  private logReentryEligible(attempt: ExecutionAttempt, reason: string): void {
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        retryCount: attempt.retryCount,
+        reason
+      },
+      "POLY_V2_REENTRY_ELIGIBLE"
+    );
+  }
+
   private applyExecutionCooldown(reason: string, cooldownMs: number, attempt: ExecutionAttempt): void {
     const untilTs = Date.now() + cooldownMs;
     if (untilTs > this.executionCooldownUntilTs) {
@@ -909,11 +1272,40 @@ export class Btc5mLiveRunner {
   }
 
   private isExecutionAttemptActive(attempt: ExecutionAttempt): boolean {
-    if (Date.now() > attempt.deadlineTs) return false;
+    if (!attempt.postingStarted && Date.now() > attempt.deadlineTs) return false;
     if (this.invalidatedAttemptIds.has(attempt.attemptId)) return false;
     if (this.activeExecutionAttempt?.attemptId !== attempt.attemptId) return false;
-    if (!this.isExecutionSlugEligible(attempt.executionSlug, deriveBtc5mTickContext(Date.now()))) return false;
+    if (!attempt.postingStarted && !this.isExecutionSlugEligible(attempt.executionSlug, deriveBtc5mTickContext(Date.now()))) return false;
     return true;
+  }
+
+  private logExecutionAttemptLifecycle(
+    attempt: ExecutionAttempt,
+    state:
+      | "created"
+      | "posting_started"
+      | "post_returned"
+      | "deadline_exceeded"
+      | "awaiting_settlement"
+      | "reconcile_result"
+      | "final_state",
+    extra: Record<string, unknown> = {}
+  ): void {
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: this.state.currentBucketSlug,
+        selectedSlug: attempt.selectedSlug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        intendedOrderMode: attempt.intendedOrderMode,
+        retryCount: attempt.retryCount,
+        state,
+        ...extra
+      },
+      "POLY_V2_EXECUTION_ATTEMPT_LIFECYCLE"
+    );
   }
 
   private logExecutionAttemptStale(attempt: ExecutionAttempt, reason: string): void {
@@ -957,15 +1349,114 @@ export class Btc5mLiveRunner {
     return slug === tick.currentSlug;
   }
 
+  private async verifySideBookAvailableForExecution(input: {
+    slug: string;
+    side: "YES" | "NO";
+    tokenId: string;
+  }): Promise<boolean> {
+    if (this.selector.isSideBookUnavailable(input.slug, input.tokenId)) {
+      this.logger.warn(
+        {
+          slug: input.slug,
+          side: input.side,
+          tokenId: input.tokenId,
+          reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+        },
+        "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
+      );
+      return false;
+    }
+    try {
+      const quote = await this.client.getTokenPriceQuote(input.tokenId, { slug: input.slug });
+      const quoteAvailable = quote.bestAsk !== null || quote.bestBid !== null;
+      if (!quoteAvailable) {
+        this.logger.warn(
+          {
+            slug: input.slug,
+            side: input.side,
+            tokenId: input.tokenId,
+            reason: "EMPTY_LIVE_QUOTE"
+          },
+          "POLY_V2_SIDE_BOOK_UNAVAILABLE"
+        );
+      }
+      return quoteAvailable;
+    } catch (error) {
+      const reason = shortError(error);
+      if (reason.toLowerCase().includes("no orderbook exists for the requested token id")) {
+        this.selector.markSideBookUnavailable(input.slug, input.tokenId, reason);
+      }
+      return false;
+    }
+  }
+
   private getExecutionDeadlineMs(): number {
-    const envValue = Number(process.env.POLY_V2_EXECUTION_DEADLINE_MS || 25_000);
-    if (!Number.isFinite(envValue)) return 25_000;
-    return Math.max(1_000, Math.min(30_000, Math.floor(envValue)));
+    const envValue = Number(process.env.POLY_V2_EXECUTION_DEADLINE_MS || 60_000);
+    if (!Number.isFinite(envValue)) return 60_000;
+    return Math.max(5_000, Math.min(180_000, Math.floor(envValue)));
+  }
+
+  private getDecisionLoopMs(): number {
+    const envValue = Number(process.env.POLY_V2_DECISION_LOOP_MS || 750);
+    if (!Number.isFinite(envValue)) return 750;
+    return Math.max(250, Math.min(5_000, Math.floor(envValue)));
+  }
+
+  private getProfitTakePollMs(): number {
+    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_POLL_MS || 1_000);
+    if (!Number.isFinite(envValue)) return 1_000;
+    return Math.max(250, Math.min(10_000, Math.floor(envValue)));
+  }
+
+  private getMaxEntriesPerWindow(): number {
+    const envValue = Number(process.env.POLY_V2_MAX_ENTRIES_PER_WINDOW || 3);
+    if (!Number.isFinite(envValue)) return 3;
+    return Math.max(1, Math.min(20, Math.floor(envValue)));
+  }
+
+  private getEntryAttemptCooldownMs(): number {
+    const envValue = Number(process.env.POLY_V2_ENTRY_COOLDOWN_MS || 1_200);
+    if (!Number.isFinite(envValue)) return 1_200;
+    return Math.max(250, Math.min(60_000, Math.floor(envValue)));
+  }
+
+  private getReentryCooldownMs(): number {
+    const envValue = Number(process.env.POLY_V2_REENTRY_COOLDOWN_MS || 4_000);
+    if (!Number.isFinite(envValue)) return 4_000;
+    return Math.max(250, Math.min(120_000, Math.floor(envValue)));
+  }
+
+  private getProfitTakeMinEdge(): number {
+    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_MIN_EDGE || 0.01);
+    if (!Number.isFinite(envValue)) return 0.01;
+    return Math.max(0.0001, Math.min(0.25, envValue));
+  }
+
+  private getUnfilledEntryMaxAgeMs(): number {
+    const envValue = Number(process.env.POLY_UNFILLED_ENTRY_MAX_AGE_MS || 8_000);
+    if (!Number.isFinite(envValue)) return 8_000;
+    return Math.max(500, Math.min(120_000, Math.floor(envValue)));
+  }
+
+  private getMaxOpenEntryOrdersPerWindow(): number {
+    const envValue = Number(process.env.POLY_MAX_OPEN_ENTRY_ORDERS_PER_WINDOW || 1);
+    if (!Number.isFinite(envValue)) return 1;
+    return Math.max(1, Math.min(10, Math.floor(envValue)));
+  }
+
+  private getEntryOrderMode(): "MARKETABLE_ENTRY" | "RESTING_ENTRY" {
+    const normalized = String(process.env.POLY_ENTRY_ORDER_MODE || "MARKETABLE").trim().toUpperCase();
+    return normalized === "RESTING" ? "RESTING_ENTRY" : "MARKETABLE_ENTRY";
+  }
+
+  private getReentryAfterUnfilledEnabled(): boolean {
+    const normalized = String(process.env.POLY_REENTRY_AFTER_UNFILLED || "true").trim().toLowerCase();
+    return normalized !== "0" && normalized !== "false" && normalized !== "no";
   }
 
   private getExecutionCooldownMs(): number {
-    const envValue = Number(process.env.POLY_V2_EXECUTION_COOLDOWN_MS || 5_000);
-    if (!Number.isFinite(envValue)) return 5_000;
+    const envValue = Number(process.env.POLY_V2_EXECUTION_COOLDOWN_MS || 1_500);
+    if (!Number.isFinite(envValue)) return 1_500;
     return Math.max(1_000, Math.min(120_000, Math.floor(envValue)));
   }
 
@@ -979,6 +1470,258 @@ export class Btc5mLiveRunner {
     const envValue = Number(process.env.POLY_V2_POST_ROLLOVER_GRACE_MS || 6_000);
     if (!Number.isFinite(envValue)) return 6_000;
     return Math.max(0, Math.min(30_000, Math.floor(envValue)));
+  }
+
+  private getWindowEntryState(slug: string): WindowEntryState {
+    const existing = this.windowEntryStateBySlug.get(slug);
+    if (existing) return existing;
+    const initial: WindowEntryState = {
+      entries: 0,
+      realizedPnlUsd: 0,
+      cooldownUntilTs: 0,
+      clearedSinceLastEntry: true
+    };
+    this.windowEntryStateBySlug.set(slug, initial);
+    return initial;
+  }
+
+  private syncWindowEntryState(slug: string, marketId: string, nowMs: number): void {
+    const state = this.getWindowEntryState(slug);
+    const hasPosition = this.hasOpenPositionForMarket(marketId);
+    const hasOpenOrder = this.hasOpenOrderForMarket(marketId);
+    if (state.entries <= 0) {
+      state.clearedSinceLastEntry = true;
+      return;
+    }
+    if (!hasPosition && !hasOpenOrder && !state.clearedSinceLastEntry) {
+      state.clearedSinceLastEntry = true;
+      state.cooldownUntilTs = Math.max(state.cooldownUntilTs, nowMs + this.getReentryCooldownMs());
+      this.logger.warn(
+        {
+          selectedSlug: slug,
+          marketId,
+          entriesInWindow: state.entries,
+          cooldownUntilTs: state.cooldownUntilTs,
+          reason: "CLEARED_STATE"
+        },
+        "POLY_V2_REENTRY_EVAL"
+      );
+    }
+  }
+
+  private recordWindowEntry(slug: string): void {
+    const state = this.getWindowEntryState(slug);
+    state.entries += 1;
+    state.clearedSinceLastEntry = false;
+  }
+
+  private recordWindowExit(slug: string, realizedPnlUsd: number, nowMs: number): void {
+    const state = this.getWindowEntryState(slug);
+    state.realizedPnlUsd += realizedPnlUsd;
+    state.cooldownUntilTs = Math.max(state.cooldownUntilTs, nowMs + this.getReentryCooldownMs());
+    state.clearedSinceLastEntry = true;
+  }
+
+  private hasOpenPositionForMarket(marketId: string): boolean {
+    return this.execution.getPositions().some((row) => row.marketId === marketId && row.shares > 0);
+  }
+
+  private hasOpenOrderForMarket(marketId: string): boolean {
+    return this.execution.getOpenOrders().some((row) => row.marketId === marketId && row.status === "NEW");
+  }
+
+  private async maybeDispatchProfitTake(input: {
+    tick: Btc5mTick;
+    selected: Btc5mSelectedMarket;
+    allowExecution: boolean;
+  }): Promise<string | null> {
+    if (!input.allowExecution || !this.canMutateVenueState()) return null;
+    if (input.selected.slug !== input.tick.currentSlug) return null;
+    if (this.activeProfitTakeAttempt) return "PROFIT_TAKE_IN_FLIGHT";
+    if (this.activeExecutionAttempt && this.isExecutionAttemptActive(this.activeExecutionAttempt)) {
+      const active = this.activeExecutionAttempt;
+      const activeAgeMs = Date.now() - active.createdTs;
+      const staleByAge = activeAgeMs >= this.getUnfilledEntryMaxAgeMs();
+      const staleByRollover = active.executionSlug !== input.tick.currentSlug;
+      const staleBySettlement = active.awaitingSettlement || active.postReturned;
+      if (active.postingStarted && (staleByAge || staleByRollover || staleBySettlement)) {
+        const staleReason = staleByRollover ? "ROLLOVER" : staleByAge ? "UNFILLED_MAX_AGE" : "AWAITING_SETTLEMENT";
+        void this.cancelUnfilledOrdersForAttempt(active, staleReason);
+        this.clearInflightExecutionState(active, `STALE_ATTEMPT_ABORTED:${staleReason}`, this.getReentryAfterUnfilledEnabled());
+        if (this.getReentryAfterUnfilledEnabled()) {
+          this.logReentryEligible(active, staleReason);
+        }
+      } else {
+        return "EXECUTION_IN_FLIGHT";
+      }
+    }
+    if (input.tick.tickNowMs - this.lastProfitPollTs < this.getProfitTakePollMs()) {
+      return null;
+    }
+    this.lastProfitPollTs = input.tick.tickNowMs;
+
+    const positions = this.execution
+      .getPositions()
+      .filter((row) => row.marketId === input.selected.marketId && row.shares > 0);
+    if (positions.length === 0) {
+      this.logger.warn(
+        {
+          selectedSlug: input.selected.slug,
+          currentSlug: input.tick.currentSlug,
+          remainingSec: input.tick.remainingSec,
+          openPositionCount: 0,
+          reason: "NO_OPEN_POSITION"
+        },
+        "POLY_V2_PROFIT_TAKE_EVAL"
+      );
+      return null;
+    }
+
+    const minEdge = this.getProfitTakeMinEdge();
+    let best:
+      | {
+          side: "YES" | "NO";
+          tokenId: string;
+          shares: number;
+          bidPrice: number;
+          avgPrice: number;
+          edge: number;
+        }
+      | null = null;
+    for (const position of positions) {
+      if (this.selector.isSideBookUnavailable(input.selected.slug, position.tokenId)) {
+        this.logger.warn(
+          {
+            slug: input.selected.slug,
+            tokenId: position.tokenId,
+            side: position.side,
+            reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN"
+          },
+          "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
+        );
+        continue;
+      }
+      const book = position.side === "YES" ? input.selected.yesBook : input.selected.noBook;
+      const bid = Number(book.bestBid);
+      if (!Number.isFinite(bid) || bid <= 0) continue;
+      const edge = bid - position.avgPrice;
+      if (edge >= minEdge && (!best || edge > best.edge)) {
+        best = {
+          side: position.side,
+          tokenId: position.tokenId,
+          shares: position.shares,
+          bidPrice: bid,
+          avgPrice: position.avgPrice,
+          edge
+        };
+      }
+    }
+    if (!best) {
+      this.logger.warn(
+        {
+          selectedSlug: input.selected.slug,
+          currentSlug: input.tick.currentSlug,
+          remainingSec: input.tick.remainingSec,
+          openPositionCount: positions.length,
+          minEdge
+        },
+        "POLY_V2_PROFIT_TAKE_EVAL"
+      );
+      return null;
+    }
+
+    const attempt: ProfitTakeAttempt = {
+      attemptId: `pt-${++this.executionAttemptSeq}`,
+      executionSlug: input.selected.slug,
+      marketId: input.selected.marketId,
+      tokenId: best.tokenId,
+      side: best.side,
+      shares: best.shares,
+      bidPrice: best.bidPrice,
+      avgPrice: best.avgPrice,
+      createdTs: Date.now()
+    };
+    this.activeProfitTakeAttempt = attempt;
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        executionSlug: attempt.executionSlug,
+        currentSlug: input.tick.currentSlug,
+        selectedSlug: input.selected.slug,
+        side: attempt.side,
+        tokenId: attempt.tokenId,
+        shares: attempt.shares,
+        bidPrice: attempt.bidPrice,
+        avgPrice: attempt.avgPrice,
+        edge: best.edge
+      },
+      "POLY_V2_PROFIT_TAKE_EVAL"
+    );
+    this.startProfitTakeAttempt(attempt, input.selected);
+    return "PROFIT_TAKE_IN_FLIGHT";
+  }
+
+  private startProfitTakeAttempt(attempt: ProfitTakeAttempt, selected: Btc5mSelectedMarket): void {
+    let task: Promise<void> | null = null;
+    task = (async () => {
+      try {
+        const result = await this.execution.executeExit({
+          marketId: attempt.marketId,
+          tokenId: attempt.tokenId,
+          side: attempt.side,
+          shares: attempt.shares,
+          bidPrice: attempt.bidPrice,
+          tickSize: selected.tickSize,
+          negRisk: selected.negRisk
+        });
+        const fillPrice = Number(result.fillPrice ?? attempt.bidPrice);
+        const filledShares = Number(result.filledShares || 0);
+        const realizedPnlUsd =
+          result.accepted && filledShares > 0 && Number.isFinite(fillPrice)
+            ? (fillPrice - attempt.avgPrice) * filledShares
+            : 0;
+        if (result.accepted && filledShares > 0) {
+          this.recordWindowExit(attempt.executionSlug, realizedPnlUsd, Date.now());
+        }
+        this.logger.warn(
+          {
+            attemptId: attempt.attemptId,
+            executionSlug: attempt.executionSlug,
+            currentSlug: this.state.currentBucketSlug,
+            selectedSlug: this.state.selectedSlug,
+            side: attempt.side,
+            tokenId: attempt.tokenId,
+            accepted: result.accepted,
+            blocker: result.reason || null,
+            filledShares,
+            fillPrice: Number.isFinite(fillPrice) ? fillPrice : null,
+            realizedPnlUsd
+          },
+          "POLY_V2_PROFIT_TAKE_RESULT"
+        );
+      } catch (error) {
+        this.logger.warn(
+          {
+            attemptId: attempt.attemptId,
+            executionSlug: attempt.executionSlug,
+            currentSlug: this.state.currentBucketSlug,
+            selectedSlug: this.state.selectedSlug,
+            side: attempt.side,
+            tokenId: attempt.tokenId,
+            reason: shortError(error)
+          },
+          "POLY_V2_PROFIT_TAKE_RESULT"
+        );
+      } finally {
+        if (this.activeProfitTakeAttempt?.attemptId === attempt.attemptId) {
+          this.activeProfitTakeAttempt = null;
+        }
+        if (this.activeProfitTakeTask === task) {
+          this.activeProfitTakeTask = null;
+        }
+      }
+    })();
+    this.activeProfitTakeTask = task;
   }
 
   private async maybeExecuteDecision(input: {
@@ -1014,6 +1757,7 @@ export class Btc5mLiveRunner {
     }
     const executionGuard = (): boolean => {
       if (!input.attempt) return true;
+      if (input.attempt.postingStarted) return true;
       return this.isExecutionAttemptActive(input.attempt);
     };
 
@@ -1024,7 +1768,7 @@ export class Btc5mLiveRunner {
       this.config.polymarket.live.oracleHardBlockMs
     );
     if (oracleAgeMs !== null && Number.isFinite(oracleAgeMs) && oracleAgeMs > oracleHardBlockMs) {
-      return { action: "HOLD", blocker: "STALE_ORACLE" };
+      return { action: "HOLD", blocker: "STALE_ORACLE_HARD_BLOCK" };
     }
     const exposure = this.execution.getTotalExposureUsd();
     const remainingExposureBudget = Math.max(0, this.config.polymarket.risk.maxExposure - exposure);
@@ -1085,19 +1829,55 @@ export class Btc5mLiveRunner {
             marketId: input.selected.marketId,
             tokenId: executionTokenId,
             yesAsk: input.decision.sideAsk,
+            yesBid: input.selected.yesBook.bestBid,
             notionalUsd,
             tickSize: input.selected.tickSize,
             negRisk: input.selected.negRisk,
-            executionGuard
+            orderMode: input.attempt?.intendedOrderMode === "RESTING_ENTRY" ? "RESTING" : "MARKETABLE",
+            executionGuard,
+            executionLifecycle: (event, payload) => {
+              if (!input.attempt) return;
+              if (event === "posting_started") {
+                input.attempt.postingStarted = true;
+                this.logExecutionAttemptLifecycle(input.attempt, "posting_started", payload || {});
+                return;
+              }
+              if (event === "post_returned") {
+                input.attempt.postReturned = true;
+                this.logExecutionAttemptLifecycle(input.attempt, "post_returned", payload || {});
+                return;
+              }
+              if (event === "reconcile_result") {
+                this.logExecutionAttemptLifecycle(input.attempt, "reconcile_result", payload || {});
+              }
+            }
           })
         : await this.execution.executeBuyNo({
             marketId: input.selected.marketId,
             tokenId: executionTokenId,
             noAsk: input.decision.sideAsk,
+            noBid: input.selected.noBook.bestBid,
             notionalUsd,
             tickSize: input.selected.tickSize,
             negRisk: input.selected.negRisk,
-            executionGuard
+            orderMode: input.attempt?.intendedOrderMode === "RESTING_ENTRY" ? "RESTING" : "MARKETABLE",
+            executionGuard,
+            executionLifecycle: (event, payload) => {
+              if (!input.attempt) return;
+              if (event === "posting_started") {
+                input.attempt.postingStarted = true;
+                this.logExecutionAttemptLifecycle(input.attempt, "posting_started", payload || {});
+                return;
+              }
+              if (event === "post_returned") {
+                input.attempt.postReturned = true;
+                this.logExecutionAttemptLifecycle(input.attempt, "post_returned", payload || {});
+                return;
+              }
+              if (event === "reconcile_result") {
+                this.logExecutionAttemptLifecycle(input.attempt, "reconcile_result", payload || {});
+              }
+            }
           });
     if (!executionGuard()) {
       if (input.attempt) {
@@ -1106,7 +1886,17 @@ export class Btc5mLiveRunner {
       return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     if (!result.accepted) {
+      if (isSideBookUnavailableReason(result.reason)) {
+        this.selector.markSideBookUnavailable(
+          input.selected.slug,
+          executionTokenId,
+          result.reason || "SIDE_BOOK_UNAVAILABLE"
+        );
+      }
       return { action: "HOLD", blocker: result.reason || "LIVE_REJECTED" };
+    }
+    if (!(result.filledShares > 0)) {
+      return { action: "HOLD", blocker: "LIVE_PLACED_NO_FILL" };
     }
     return {
       action: input.decision.chosenSide === "YES" ? "BUY_YES" : "BUY_NO",
@@ -1190,6 +1980,39 @@ export class Btc5mLiveRunner {
     );
   }
 
+  private logDecisionBreakdown(input: {
+    intelligence: Btc5mIntelligence;
+    decision: Btc5mDecision;
+    selected: Btc5mSelectedMarket;
+    tick: Btc5mTick;
+    finalChosenSide: "YES" | "NO" | null;
+    finalAction: "BUY_YES" | "BUY_NO" | "HOLD";
+  }): void {
+    this.logger.warn(
+      {
+        rawSignalScore: finiteOrNull(input.intelligence.rawSignalScore),
+        intelScore: finiteOrNull(input.intelligence.intelScore),
+        crossVenueBiasScore: finiteOrNull(input.intelligence.crossVenueBiasScore),
+        baseProbability: finiteOrNull(input.intelligence.baseProbability),
+        pUpModel: finiteOrNull(input.decision.pUpModel),
+        yesPrice: finiteOrNull(input.selected.yesBook.bestAsk),
+        noPrice: finiteOrNull(input.selected.noBook.bestAsk),
+        yesEdge: finiteOrNull(input.decision.yesEdge),
+        noEdge: finiteOrNull(input.decision.noEdge),
+        finalChosenSide: input.finalChosenSide,
+        finalAction: input.finalAction,
+        intelligenceSource: input.decision.intelligenceSource,
+        intelligencePosture: input.decision.intelligencePosture,
+        intelligenceScore: finiteOrNull(input.decision.intelligenceScore),
+        oracleAgeMs: input.decision.oracleAgeMs,
+        selectedSlug: input.selected.slug,
+        currentSlug: input.tick.currentSlug,
+        remainingSec: input.tick.remainingSec
+      },
+      "POLY_V2_DECISION_BREAKDOWN"
+    );
+  }
+
   private logInvariantBroken(tick: Btc5mTick, reason: string, extra: Record<string, unknown>): void {
     this.logger.error(
       {
@@ -1216,26 +2039,52 @@ export class Btc5mLiveRunner {
     }
   }
 
-  private getReferencePrice(nowMs: number): { price: number | null; ageMs: number | null } {
+  private getReferencePrice(nowMs: number): ReferenceOracle {
     if (!this.store) {
-      return { price: null, ageMs: null };
+      return { price: null, ageMs: null, ts: null, source: "NONE" };
     }
     const quotes = this.store
       .getLatestVenueQuotes(this.config.symbol)
       .filter((row) => Number.isFinite(row.mid) && row.mid !== null && Number(row.mid) > 0);
-    if (quotes.length === 0) {
-      return { price: null, ageMs: null };
+    if (quotes.length > 0) {
+      const latestTs = Math.max(...quotes.map((row) => Number(row.ts || 0)));
+      const mids = quotes
+        .filter((row) => Number(row.ts || 0) >= latestTs - 5_000)
+        .map((row) => Number(row.mid))
+        .filter((row) => Number.isFinite(row) && row > 0)
+        .sort((a, b) => a - b);
+      const mid = mids.length > 0 ? mids[Math.floor(mids.length / 2)] : null;
+      const sourceVenues = quotes
+        .filter((row) => Number(row.ts || 0) >= latestTs - 5_000)
+        .map((row) => String(row.venue || "").trim())
+        .filter((row) => row.length > 0)
+        .sort()
+        .join(",");
+      return {
+        price: mid,
+        ageMs: latestTs > 0 ? Math.max(0, nowMs - latestTs) : null,
+        ts: latestTs > 0 ? latestTs : null,
+        source: sourceVenues ? `EXTERNAL_VENUES:${sourceVenues}` : "EXTERNAL_VENUES"
+      };
     }
-    const latestTs = Math.max(...quotes.map((row) => Number(row.ts || 0)));
-    const mids = quotes
-      .filter((row) => Number(row.ts || 0) >= latestTs - 5_000)
-      .map((row) => Number(row.mid))
-      .filter((row) => Number.isFinite(row) && row > 0)
-      .sort((a, b) => a - b);
-    const mid = mids.length > 0 ? mids[Math.floor(mids.length / 2)] : null;
+
+    const latestTicker = this.store.getRecentTickerSnapshots(this.config.symbol, 1)[0] ?? null;
+    const tickerMid = latestTicker && Number.isFinite(latestTicker.mid) && latestTicker.mid > 0 ? latestTicker.mid : null;
+    const tickerTs = latestTicker && Number.isFinite(latestTicker.ts) && latestTicker.ts > 0 ? latestTicker.ts : null;
+    if (tickerMid !== null && tickerTs !== null) {
+      return {
+        price: tickerMid,
+        ageMs: Math.max(0, nowMs - tickerTs),
+        ts: tickerTs,
+        source: "TICKER_SNAPSHOT"
+      };
+    }
+
     return {
-      price: mid,
-      ageMs: latestTs > 0 ? Math.max(0, nowMs - latestTs) : null
+      price: null,
+      ageMs: null,
+      ts: null,
+      source: "NONE"
     };
   }
 
@@ -1246,6 +2095,14 @@ export class Btc5mLiveRunner {
     fallbackMid: number | null;
   }): Btc5mIntelligence {
     const components: Array<{ name: string; weight: number; score: number; posture: string }> = [];
+    const baseProbability = inferProbabilityFallback({
+      referencePrice: input.referencePrice,
+      priceToBeat: input.priceToBeat,
+      fallbackMid: input.fallbackMid
+    });
+    let rawSignalScore: number | null = null;
+    let intelScore: number | null = null;
+    let crossVenueBiasScore: number | null = null;
 
     if (this.signalsEngine && this.config.signalsEnabled) {
       const aggregate = this.signalsEngine.getLatestAggregate();
@@ -1254,10 +2111,11 @@ export class Btc5mLiveRunner {
       const impact = clampRange(Number(aggregate.impact || 0), 0, 1);
       if (aggregate.ts > 0 || aggregate.latestTs > 0 || confidence > 0 || impact > 0) {
         const strength = clampRange(Math.max(0.1, impact) * confidence, 0, 1);
+        rawSignalScore = direction * strength;
         components.push({
           name: "SIGNALS_ENGINE",
           weight: 0.45,
-          score: direction * strength,
+          score: rawSignalScore,
           posture: String(aggregate.state || "NORMAL")
         });
       }
@@ -1270,10 +2128,11 @@ export class Btc5mLiveRunner {
       const impact = clampRange(Number(posture.impact || 0), 0, 1);
       if (posture.ts > 0 || confidence > 0 || impact > 0) {
         const strength = clampRange(Math.max(0.1, impact) * confidence, 0, 1);
+        intelScore = direction * strength;
         components.push({
           name: "INTEL_ENGINE",
           weight: 0.35,
-          score: direction * strength,
+          score: intelScore,
           posture: String(posture.state || "NORMAL")
         });
       }
@@ -1285,26 +2144,26 @@ export class Btc5mLiveRunner {
     if (signalBias === "LONG" || signalBias === "SHORT" || signalBias === "NEUTRAL") {
       const direction = signalBias === "LONG" ? 1 : signalBias === "SHORT" ? -1 : 0;
       const confidence = clampRange(Number(signalBiasConfidence || 0), 0, 1);
+      crossVenueBiasScore = direction * confidence;
       components.push({
         name: "CROSS_VENUE_BIAS",
         weight: 0.20,
-        score: direction * confidence,
+        score: crossVenueBiasScore,
         posture: signalBias
       });
     }
 
     if (components.length === 0) {
-      const pUpFallback = inferProbabilityFallback({
-        referencePrice: input.referencePrice,
-        priceToBeat: input.priceToBeat,
-        fallbackMid: input.fallbackMid
-      });
       return {
         source: "HEURISTIC_FALLBACK",
         posture: null,
         score: null,
-        pUpModel: pUpFallback,
-        fallbackUsed: true
+        pUpModel: baseProbability,
+        fallbackUsed: true,
+        rawSignalScore,
+        intelScore,
+        crossVenueBiasScore,
+        baseProbability
       };
     }
 
@@ -1321,7 +2180,11 @@ export class Btc5mLiveRunner {
       posture: components.map((row) => row.posture).join("|"),
       score: intelligenceScore,
       pUpModel,
-      fallbackUsed: false
+      fallbackUsed: false,
+      rawSignalScore,
+      intelScore,
+      crossVenueBiasScore,
+      baseProbability
     };
   }
 
@@ -1345,6 +2208,11 @@ function chosenDirectionForSide(side: "YES" | "NO"): "UP" | "DOWN" {
   return side === "YES" ? "UP" : "DOWN";
 }
 
+function finiteOrNull(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function shortError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error || "unknown_error");
@@ -1360,6 +2228,16 @@ function isTransientExecutionError(reason: string): boolean {
     normalized.includes("ECONNREFUSED") ||
     normalized.includes("SOCKET") ||
     normalized.includes("ABORT")
+  );
+}
+
+function isSideBookUnavailableReason(reason: string | null | undefined): boolean {
+  const normalized = String(reason || "").toUpperCase();
+  return (
+    normalized.includes("SIDE_BOOK_UNAVAILABLE") ||
+    normalized.includes("SIDE_NOT_BOOKABLE") ||
+    normalized.includes("MISSING_ORDERBOOK_FOR_SELECTED_TOKEN") ||
+    normalized.includes("NO ORDERBOOK EXISTS")
   );
 }
 
