@@ -1125,7 +1125,7 @@ export function loadConfig(): BotConfig {
   const polymarketBaseEdge = clampNumber(numberWithDefault("POLYMARKET_BASE_EDGE", 0.005), 0, 0.5);
   const polymarketVolK = clampNumber(numberWithDefault("POLYMARKET_VOL_K", 1.5), 0, 200);
   const polymarketClosePenalty = clampNumber(numberWithDefault("POLYMARKET_CLOSE_PENALTY", 0.02), 0, 1);
-  const polymarketMaxSpread = clampNumber(numberWithDefault("POLYMARKET_MAX_SPREAD", 0.12), 0, 1);
+  const polymarketMaxSpread = clampNumber(numberWithDefault("POLYMARKET_MAX_SPREAD", 0.60), 0, 1);
 
   const polymarketFractionalKelly = clampNumber(
     numberWithDefault("POLYMARKET_FRACTIONAL_KELLY", 0.2),
@@ -1238,7 +1238,6 @@ export function loadConfig(): BotConfig {
   const polymarketCancelAllOnStartRaw = optional("POLYMARKET_CANCEL_ALL_ON_START");
   const polymarketDebugDisableRevolutBaselineWhileLive = boolWithFallback(
     [
-      "REVX_DISABLE_BASELINE_FOR_POLY_TEST",
       "POLYMARKET_DEBUG_DISABLE_REVOLUT_BASELINE_WHILE_LIVE",
       "POLYMARKET_DISABLE_REVOLUT_BASELINE_WHILE_LIVE"
     ],
@@ -1250,13 +1249,32 @@ export function loadConfig(): BotConfig {
     300
   );
   const polymarketLiveMinEdgeThreshold = clampNumber(
-    numberWithFallback(["POLYMARKET_LIVE_MIN_EDGE", "POLYMARKET_LIVE_MIN_EDGE_THRESHOLD"], 0.0005),
+    numberWithFallback(
+      [
+        "POLYMARKET_LIVE_MIN_EDGE",
+        "POLYMARKET_LIVE_MIN_EDGE_THRESHOLD",
+        "POLY_LIVE_MIN_EDGE",
+        "POLY_LIVE_MIN_EDGE_THRESHOLD",
+        "POLY_V2_MIN_EDGE_THRESHOLD",
+        "POLYMARKET_MIN_EDGE",
+        "POLYMARKET_MIN_EDGE_THRESHOLD"
+      ],
+      0.0005
+    ),
     0,
     0.5
   );
   const polymarketLiveEnableNoSide = boolWithDefault("POLYMARKET_LIVE_ENABLE_NO_SIDE", true);
   const polymarketLiveMaxSpread = clampNumber(
-    numberWithDefault("POLYMARKET_LIVE_MAX_SPREAD", Math.min(1, polymarketMaxSpread + 0.02)),
+    numberWithFallback(
+      [
+        "POLYMARKET_LIVE_MAX_SPREAD",
+        "POLY_LIVE_MAX_SPREAD",
+        "POLY_V2_MAX_SPREAD",
+        "POLYMARKET_MAX_SPREAD"
+      ],
+      Math.min(1, polymarketMaxSpread + 0.60)
+    ),
     0,
     1
   );

@@ -657,6 +657,21 @@ export class Btc5mLiveRunner {
       intelligence,
       oracleAgeMs: reference.ageMs
     });
+    this.logger.warn(
+      {
+        minEdgeThresholdConfig: this.config.polymarket.live.minEdgeThreshold,
+        maxSpreadConfig: this.config.polymarket.live.maxSpread,
+        yesSpread: Number.isFinite(decision.yesSpread) ? decision.yesSpread : null,
+        noSpread: Number.isFinite(decision.noSpread) ? decision.noSpread : null,
+        yesAsk: selected.yesBook.bestAsk,
+        noAsk: selected.noBook.bestAsk,
+        pUpModel: Number.isFinite(Number(decision.pUpModel)) ? Number(decision.pUpModel) : null,
+        yesEdge: Number.isFinite(decision.yesEdge) ? decision.yesEdge : null,
+        noEdge: Number.isFinite(decision.noEdge) ? decision.noEdge : null,
+        chosenBlocker: decision.blocker
+      },
+      "POLY_V2_GATE_INPUTS"
+    );
     const profitTakeDispatch = await this.maybeDispatchProfitTake({
       tick,
       selected,
