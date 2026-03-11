@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { rmSync } from "node:fs";
 import { LagProfiler } from "../LagProfiler";
 import { runBtc5mSelectorV2Tests } from "./Btc5mSelectorV2.test";
+import { runBtc5mLiveRunnerStateMachineTests } from "./Btc5mLiveRunnerStateMachine.test";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -74,6 +75,7 @@ async function run(): Promise<void> {
   rmSync(`${logPath}.2`, { force: true });
   rmSync(`${logPath}.3`, { force: true });
   await runBtc5mSelectorV2Tests();
+  await runBtc5mLiveRunnerStateMachineTests();
   // eslint-disable-next-line no-console
   console.log("LagProfiler tests: PASS");
 }
