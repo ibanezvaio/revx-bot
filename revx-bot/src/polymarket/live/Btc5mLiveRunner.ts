@@ -10,7 +10,7 @@ import { PolymarketExecution } from "../Execution";
 import { PolymarketRisk } from "../Risk";
 import { Sizing } from "../Sizing";
 import { Btc5mExecutionGate } from "./Btc5mExecutionGate";
-import { Btc5mSelector } from "./Btc5mSelector";
+import { BTC5M_SELECTOR_REASONS, Btc5mSelector } from "./Btc5mSelector";
 import { Btc5mDecision, Btc5mIntelligence, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
 
 type RunnerDeps = {
@@ -43,6 +43,24 @@ type RuntimeState = {
   entriesInWindow: number;
   realizedPnlUsd: number;
 };
+
+type RunnerExecutionState = "IDLE" | "ENTRY_PENDING" | "POSITION_OPEN" | "EXIT_PENDING" | "COOLDOWN";
+
+type ExecutionStaleReason = "ROLLOVER" | "SUPERSEDED" | "DEADLINE_EXCEEDED" | "STALE_AFTER_POST" | "MANUAL_STOP";
+
+type RunnerExecutionBlocker =
+  | "EXECUTION_IN_FLIGHT"
+  | "EXECUTION_COOLDOWN"
+  | "ENTRY_ATTEMPT_COOLDOWN"
+  | "PROFIT_TAKE_IN_FLIGHT"
+  | "MAX_ENTRIES_PER_WINDOW"
+  | "MAX_OPEN_ENTRY_ORDERS_PER_WINDOW"
+  | "REENTRY_WAIT_CLEAR"
+  | "REENTRY_COOLDOWN"
+  | "POST_ROLLOVER_GRACE"
+  | "STALE_ATTEMPT_ABORTED"
+  | "LIVE_PLACED_NO_FILL"
+  | "LIVE_EXECUTION_DISABLED";
 
 type ExecutionAttempt = {
   attemptId: string;
@@ -108,12 +126,14 @@ export class Btc5mLiveRunner {
   private readonly recentTicks: Array<Record<string, unknown>> = [];
   private activeExecutionAttempt: ExecutionAttempt | null = null;
   private activeExecutionTask: Promise<void> | null = null;
+  private executionState: RunnerExecutionState = "IDLE";
   private activeProfitTakeAttempt: ProfitTakeAttempt | null = null;
   private activeProfitTakeTask: Promise<void> | null = null;
   private executionAttemptSeq = 0;
   private executionCooldownUntilTs = 0;
   private entryAttemptCooldownUntilTs = 0;
   private invalidatedAttemptIds = new Set<string>();
+  private finalizedAttemptIds = new Set<string>();
   private previousCurrentSlug: string | null = null;
   private lastRolloverTs = 0;
   private lastProfitPollTs = 0;
@@ -171,6 +191,7 @@ export class Btc5mLiveRunner {
     this.state.lastFetchErr = "STARTING";
     this.state.entriesInWindow = 0;
     this.state.realizedPnlUsd = 0;
+    this.transitionExecutionState("IDLE", "RUNNER_START");
     this.firstTickPromise = new Promise<void>((resolve) => {
       this.firstTickResolve = resolve;
     });
@@ -227,7 +248,7 @@ export class Btc5mLiveRunner {
 
   async stop(reason = "STOPPED"): Promise<void> {
     this.stopRequested = true;
-    this.invalidateExecutionAttempt("STOP_REQUESTED", { currentSlug: this.state.currentBucketSlug ?? null });
+    this.invalidateExecutionAttempt("MANUAL_STOP", { currentSlug: this.state.currentBucketSlug ?? null });
     this.activeProfitTakeAttempt = null;
     if (this.loopTask) {
       await this.loopTask.catch(() => undefined);
@@ -240,6 +261,7 @@ export class Btc5mLiveRunner {
     this.state.holdReason = reason;
     this.state.blockedBy = reason;
     this.state.lastUpdateTs = Date.now();
+    this.transitionExecutionState("IDLE", "RUNNER_STOPPED");
   }
 
   getLagSnapshot(limit = 50): any {
@@ -266,7 +288,7 @@ export class Btc5mLiveRunner {
       latestLag: this.getLagSnapshot(1).stats,
       sniperWindow: {
         minRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
-        maxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec
+        maxRemainingSec: this.getLiveEntryMaxRemainingSec()
       },
       tradingPaused: false,
       pauseReason: null,
@@ -477,6 +499,7 @@ export class Btc5mLiveRunner {
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: tickInvariant.reason });
+      this.refreshExecutionState(null);
       return;
     }
 
@@ -495,9 +518,8 @@ export class Btc5mLiveRunner {
       tick
     });
     const selected = selectionResult.selected;
-    const selectionReason = String(selectionResult.reason || "");
-    const networkFailure =
-      selectionReason.includes("NETWORK") || selectionReason.includes("timeout") || selectionReason.includes("Timeout");
+    const selectionReason = String(selectionResult.reason || BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS);
+    const networkFailure = selectionReason === BTC5M_SELECTOR_REASONS.NETWORK_ERROR;
     this.state.fetchOk = !networkFailure;
     if (this.state.fetchOk) {
       this.state.lastFetchOkTs = tick.tickNowMs;
@@ -509,36 +531,30 @@ export class Btc5mLiveRunner {
     this.logger.warn(
       {
         selectedSlug: selected?.slug ?? null,
+        marketId: selected?.marketId ?? null,
         yesTokenId: selected?.yesTokenId ?? null,
         noTokenId: selected?.noTokenId ?? null,
-        selectedTokenId: selected?.selectedTokenId ?? null,
-        orderbookOk: selected?.orderbookOk ?? false,
-        reason: selectionResult.reason
+        reason: selectionReason,
+        remainingSec: selected?.remainingSec ?? tick.remainingSec,
+        attemptedSlugs: selectionResult.attemptedSlugs ?? []
       },
-      "POLY_V2_SELECTION"
+      "POLY_V2_SELECTOR_RESULT"
     );
 
     if (!selected) {
-      const blocker = selectionResult.reason || "NO_DIRECT_MARKET";
+      const blocker = selectionReason;
       this.state.selectedSlug = null;
       this.state.selectedTokenId = null;
       this.state.chosenSide = null;
       this.state.chosenDirection = null;
       this.state.entriesInWindow = 0;
       this.state.realizedPnlUsd = 0;
-      this.state.action = "HOLD";
-      this.state.holdReason = blocker;
-      this.state.blockedBy = blocker;
-      this.state.warningState = blocker === "NO_DIRECT_MARKET" ? null : blocker;
-      this.logger.warn(
-        {
-          tickNowSec: tick.tickNowSec,
-          currentSlug: tick.currentSlug,
-          nextSlug: tick.nextSlug,
-          reason: blocker
-        },
-        "POLY_V2_NO_MARKET"
-      );
+      this.applyHoldReason({
+        reason: blocker,
+        tick,
+        selectedSlug: null
+      });
+      this.state.warningState = blocker === BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS ? null : blocker;
       this.logDecision({
         edge: Number.NaN,
         yesEdge: Number.NaN,
@@ -562,6 +578,7 @@ export class Btc5mLiveRunner {
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker });
+      this.refreshExecutionState(null);
       return;
     }
 
@@ -605,9 +622,16 @@ export class Btc5mLiveRunner {
         action: "HOLD"
       });
       this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: selectedInvariant.reason });
+      this.refreshExecutionState(null);
       return;
     }
     this.syncWindowEntryState(selected.slug, selected.marketId, tick.tickNowMs);
+    if (this.activeExecutionAttempt && this.activeExecutionAttempt.executionSlug !== selected.slug) {
+      this.invalidateExecutionAttempt("SUPERSEDED", {
+        currentSlug: tick.currentSlug,
+        selectedSlug: selected.slug
+      });
+    }
 
     const intelligence = this.resolveDirectionalIntelligence({
       nowMs: tick.tickNowMs,
@@ -650,6 +674,19 @@ export class Btc5mLiveRunner {
     const finalAction = executionDispatch.action;
     const finalBlocker = executionDispatch.blocker;
     const chosenSide = decision.chosenSide;
+    const dispatchTokenId =
+      chosenSide === "YES" ? selected.yesTokenId : chosenSide === "NO" ? selected.noTokenId : null;
+    this.logger.warn(
+      {
+        action: finalAction,
+        chosenSide,
+        tokenId: dispatchTokenId,
+        blocker: finalBlocker,
+        edge: Number.isFinite(decision.edge) ? decision.edge : null,
+        remainingSec: decision.remainingSec
+      },
+      "POLY_V2_ACTION_DISPATCH"
+    );
     this.logDecisionBreakdown({
       intelligence,
       decision,
@@ -667,9 +704,17 @@ export class Btc5mLiveRunner {
     this.state.chosenDirection = chosenSide ? chosenDirectionForSide(chosenSide) : null;
     this.state.entriesInWindow = windowState.entries;
     this.state.realizedPnlUsd = windowState.realizedPnlUsd;
-    this.state.action = finalAction;
-    this.state.holdReason = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
-    this.state.blockedBy = finalAction === "HOLD" ? finalBlocker || "HOLD" : null;
+    if (finalAction === "HOLD") {
+      this.applyHoldReason({
+        reason: finalBlocker || "HOLD",
+        tick,
+        selectedSlug: selected.slug
+      });
+    } else {
+      this.state.action = finalAction;
+      this.state.holdReason = null;
+      this.state.blockedBy = null;
+    }
     this.state.warningState = finalAction === "HOLD" ? finalBlocker : decision.warning;
     this.state.lastDecisionTs = tick.tickNowMs;
 
@@ -703,6 +748,7 @@ export class Btc5mLiveRunner {
       action: finalAction,
       blocker: finalBlocker
     });
+    this.refreshExecutionState(selected);
   }
 
   private async dispatchExecutionAttempt(input: {
@@ -710,7 +756,7 @@ export class Btc5mLiveRunner {
     selected: Btc5mSelectedMarket;
     decision: Btc5mDecision;
     allowExecution: boolean;
-  }): Promise<{ action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | null }> {
+  }): Promise<{ action: "BUY_YES" | "BUY_NO" | "HOLD"; blocker: string | RunnerExecutionBlocker | null }> {
     if (input.decision.action === "HOLD") {
       return { action: "HOLD", blocker: input.decision.blocker || "HOLD" };
     }
@@ -738,14 +784,14 @@ export class Btc5mLiveRunner {
           : null;
     const intendedOrderMode = this.getEntryOrderMode();
     if (!input.decision.chosenSide || !tokenId) {
-      return { action: "HOLD", blocker: "TOKEN_NOT_BOOKABLE" };
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     if (
       input.decision.oracleAgeMs !== null &&
       Number.isFinite(input.decision.oracleAgeMs) &&
       input.decision.oracleAgeMs > input.decision.oracleHardBlockMs
     ) {
-      return { action: "HOLD", blocker: "STALE_ORACLE_HARD_BLOCK" };
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     const sideBookAvailable = await this.verifySideBookAvailableForExecution({
       slug: input.selected.slug,
@@ -753,7 +799,7 @@ export class Btc5mLiveRunner {
       tokenId
     });
     if (!sideBookAvailable) {
-      return { action: "HOLD", blocker: "SIDE_BOOK_UNAVAILABLE" };
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     if (input.selected.slug !== input.tick.currentSlug) {
       this.logger.warn(
@@ -768,7 +814,7 @@ export class Btc5mLiveRunner {
         },
         "POLY_V2_SKIP_NEXT_MARKET_EXECUTION"
       );
-      return { action: "HOLD", blocker: "NEXT_MARKET_PRELOAD_ONLY" };
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     const windowState = this.getWindowEntryState(input.selected.slug);
     const maxEntriesPerWindow = this.getMaxEntriesPerWindow();
@@ -842,7 +888,6 @@ export class Btc5mLiveRunner {
 
     const active = this.activeExecutionAttempt;
     if (active && this.isExecutionAttemptActive(active)) {
-      let activeCleared = false;
       if (active.postingStarted) {
         const activeAgeMs = Date.now() - active.createdTs;
         const staleByAge = activeAgeMs >= this.getUnfilledEntryMaxAgeMs();
@@ -852,36 +897,34 @@ export class Btc5mLiveRunner {
         const shouldClear =
           staleByAge || staleByRollover || staleBySuperseded || staleBySettlement || active.postReturned;
         if (shouldClear) {
-          const staleReason = staleByRollover
+          const staleReason: ExecutionStaleReason = staleByRollover
             ? "ROLLOVER"
             : staleBySuperseded
               ? "SUPERSEDED"
-              : staleByAge
-                ? "UNFILLED_MAX_AGE"
-                : staleBySettlement
-                  ? "AWAITING_SETTLEMENT"
-                  : "POST_RETURNED";
-          void this.cancelUnfilledOrdersForAttempt(active, staleReason);
-          this.clearInflightExecutionState(active, `STALE_ATTEMPT_ABORTED:${staleReason}`, this.getReentryAfterUnfilledEnabled());
-          if (this.getReentryAfterUnfilledEnabled()) {
-            this.logReentryEligible(active, staleReason);
-          }
-          activeCleared = true;
+              : "STALE_AFTER_POST";
+          void this.cleanupExecutionAttempt(active, {
+            reason: staleReason,
+            blocker: "STALE_ATTEMPT_ABORTED",
+            cooldownMs: staleReason === "STALE_AFTER_POST" ? this.getStaleAfterPostCooldownMs() : this.getExecutionCooldownMs(),
+            cancelUnfilled: true,
+            reentryEligible: this.getReentryAfterUnfilledEnabled(),
+            finalState: "STALE_ABORTED"
+          });
+          return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
         } else {
           return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
         }
       }
-      if (!activeCleared) {
-        const sameAttemptTarget =
-          active.executionSlug === input.selected.slug && active.side === input.decision.chosenSide && active.tokenId === tokenId;
-        if (sameAttemptTarget) {
-          return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
-        }
-        this.invalidateExecutionAttempt("SUPERSEDED", {
-          currentSlug: input.tick.currentSlug,
-          selectedSlug: input.selected.slug
-        });
+      const sameAttemptTarget =
+        active.executionSlug === input.selected.slug && active.side === input.decision.chosenSide && active.tokenId === tokenId;
+      if (sameAttemptTarget) {
+        return { action: "HOLD", blocker: "EXECUTION_IN_FLIGHT" };
       }
+      this.invalidateExecutionAttempt("SUPERSEDED", {
+        currentSlug: input.tick.currentSlug,
+        selectedSlug: input.selected.slug
+      });
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
     const openEntryOrdersForMarket = this.execution.countOpenEntryOrdersForMarket(input.selected.marketId);
     if (openEntryOrdersForMarket >= maxOpenEntryOrdersPerWindow) {
@@ -925,6 +968,11 @@ export class Btc5mLiveRunner {
     );
     this.logExecutionAttemptLifecycle(attempt, "created");
     this.entryAttemptCooldownUntilTs = Date.now() + this.getEntryAttemptCooldownMs();
+    this.transitionExecutionState("ENTRY_PENDING", "ENTRY_ATTEMPT_CREATED", {
+      attemptId: attempt.attemptId,
+      slug: attempt.executionSlug,
+      tokenId: attempt.tokenId
+    });
     this.startExecutionAttempt(attempt);
     return { action: input.decision.action, blocker: null };
   }
@@ -932,9 +980,22 @@ export class Btc5mLiveRunner {
   private startExecutionAttempt(attempt: ExecutionAttempt): void {
     let task: Promise<void> | null = null;
     task = (async () => {
+      let finalState = "CLOSED";
+      let finalBlocker: string | null = null;
+      let finalizedByCleanup = false;
       try {
         if (!this.isExecutionAttemptActive(attempt)) {
-          this.logExecutionAttemptStale(attempt, "STALE_BEFORE_START");
+          await this.cleanupExecutionAttempt(attempt, {
+            reason: "SUPERSEDED",
+            blocker: "STALE_ATTEMPT_ABORTED",
+            cooldownMs: this.getExecutionCooldownMs(),
+            cancelUnfilled: false,
+            reentryEligible: this.getReentryAfterUnfilledEnabled(),
+            finalState: "STALE_ABORTED"
+          });
+          finalState = "STALE_ABORTED";
+          finalBlocker = "STALE_ATTEMPT_ABORTED";
+          finalizedByCleanup = true;
           return;
         }
 
@@ -972,73 +1033,62 @@ export class Btc5mLiveRunner {
             },
             "POLY_V2_EXECUTION_TIMEOUT"
           );
-          if (attempt.postingStarted) {
-            attempt.awaitingSettlement = true;
-            this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
-              reason: "deadline_exceeded_after_post_start"
-            });
-            void this.cancelUnfilledOrdersForAttempt(attempt, "EXECUTION_DEADLINE_EXCEEDED");
-            this.clearInflightExecutionState(attempt, "EXECUTION_DEADLINE_EXCEEDED", this.getReentryAfterUnfilledEnabled());
-            if (this.getReentryAfterUnfilledEnabled()) {
-              this.logReentryEligible(attempt, "EXECUTION_DEADLINE_EXCEEDED");
-            }
-            void executionPromise
-              .then((settleResult) => {
-                this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
-                  action: settleResult.action,
-                  blocker: settleResult.blocker
-                });
-                if (settleResult.action === "HOLD" && settleResult.blocker && isTransientExecutionError(settleResult.blocker)) {
-                  this.applyExecutionCooldown(settleResult.blocker, this.getExecutionCooldownMs(), attempt);
-                }
-              })
-              .catch((error) => {
-                this.applyExecutionCooldown("AWAITING_SETTLEMENT_ERROR", this.getExecutionCooldownMs(), attempt);
-                this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
-                  error: shortError(error)
-                });
-              });
-            return;
-          }
-
-          this.applyExecutionCooldown("EXECUTION_DEADLINE_EXCEEDED", this.getExecutionCooldownMs(), attempt);
-          this.resetExecutionAttemptState("EXECUTION_DEADLINE_EXCEEDED", attempt);
+          await this.cleanupExecutionAttempt(attempt, {
+            reason: "DEADLINE_EXCEEDED",
+            blocker: "STALE_ATTEMPT_ABORTED",
+            cooldownMs: this.getExecutionCooldownMs(),
+            cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+            reentryEligible: this.getReentryAfterUnfilledEnabled(),
+            finalState: "DEADLINE_EXCEEDED"
+          });
+          finalState = "DEADLINE_EXCEEDED";
+          finalBlocker = "STALE_ATTEMPT_ABORTED";
+          finalizedByCleanup = true;
           return;
         }
 
         if (!this.isExecutionAttemptActive(attempt)) {
-          this.logExecutionAttemptStale(attempt, "STALE_AFTER_EXECUTION");
+          await this.cleanupExecutionAttempt(attempt, {
+            reason: "SUPERSEDED",
+            blocker: "STALE_ATTEMPT_ABORTED",
+            cooldownMs: this.getExecutionCooldownMs(),
+            cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+            reentryEligible: this.getReentryAfterUnfilledEnabled(),
+            finalState: "STALE_ABORTED"
+          });
+          finalState = "STALE_ABORTED";
+          finalBlocker = "STALE_ATTEMPT_ABORTED";
+          finalizedByCleanup = true;
           return;
         }
 
         if (raceResult.action === "HOLD" && raceResult.blocker) {
           if (raceResult.blocker === "LIVE_PLACED_NO_FILL") {
-            void this.cancelUnfilledOrdersForAttempt(attempt, "LIVE_PLACED_NO_FILL");
-            this.clearInflightExecutionState(attempt, "LIVE_PLACED_NO_FILL", this.getReentryAfterUnfilledEnabled());
-            if (this.getReentryAfterUnfilledEnabled()) {
-              this.logReentryEligible(attempt, "LIVE_PLACED_NO_FILL");
-            }
-            return;
-          }
-          if (raceResult.blocker === "STALE_AFTER_POST") {
-            attempt.awaitingSettlement = true;
-            void this.cancelUnfilledOrdersForAttempt(attempt, "STALE_AFTER_POST");
-            this.applyExecutionCooldown("STALE_AFTER_POST", this.getStaleAfterPostCooldownMs(), attempt);
-            this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
-              reason: "STALE_AFTER_POST"
+            await this.cleanupExecutionAttempt(attempt, {
+              reason: "STALE_AFTER_POST",
+              blocker: "LIVE_PLACED_NO_FILL",
+              cooldownMs: this.getExecutionCooldownMs(),
+              cancelUnfilled: true,
+              reentryEligible: this.getReentryAfterUnfilledEnabled(),
+              finalState: "NO_FILL"
             });
-            this.clearInflightExecutionState(attempt, "STALE_AFTER_POST", this.getReentryAfterUnfilledEnabled());
-            if (this.getReentryAfterUnfilledEnabled()) {
-              this.logReentryEligible(attempt, "STALE_AFTER_POST");
-            }
+            finalState = "NO_FILL";
+            finalBlocker = "LIVE_PLACED_NO_FILL";
+            finalizedByCleanup = true;
             return;
           }
           if (raceResult.blocker === "STALE_ATTEMPT_ABORTED") {
-            this.clearInflightExecutionState(attempt, "STALE_ATTEMPT_ABORTED", this.getReentryAfterUnfilledEnabled());
-            if (this.getReentryAfterUnfilledEnabled()) {
-              this.logReentryEligible(attempt, "STALE_ATTEMPT_ABORTED");
-            }
-            this.resetExecutionAttemptState("STALE_ATTEMPT_ABORTED", attempt);
+            await this.cleanupExecutionAttempt(attempt, {
+              reason: "STALE_AFTER_POST",
+              blocker: "STALE_ATTEMPT_ABORTED",
+              cooldownMs: this.getStaleAfterPostCooldownMs(),
+              cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+              reentryEligible: this.getReentryAfterUnfilledEnabled(),
+              finalState: "STALE_ABORTED"
+            });
+            finalState = "STALE_ABORTED";
+            finalBlocker = "STALE_ATTEMPT_ABORTED";
+            finalizedByCleanup = true;
             return;
           }
           if (isTransientExecutionError(raceResult.blocker)) {
@@ -1057,9 +1107,13 @@ export class Btc5mLiveRunner {
             },
             "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
           );
+          finalBlocker = raceResult.blocker;
+          finalState = "ABORTED";
         }
         if (raceResult.action === "BUY_YES" || raceResult.action === "BUY_NO") {
           this.recordWindowEntry(attempt.executionSlug);
+          finalState = "ENTRY_ACCEPTED";
+          finalBlocker = null;
         }
         this.logExecutionAttemptLifecycle(attempt, "reconcile_result", {
           action: raceResult.action,
@@ -1080,44 +1134,54 @@ export class Btc5mLiveRunner {
           },
           "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
         );
-        this.resetExecutionAttemptState("EXECUTION_EXCEPTION", attempt);
+        await this.cleanupExecutionAttempt(attempt, {
+          reason: "STALE_AFTER_POST",
+          blocker: "STALE_ATTEMPT_ABORTED",
+          cooldownMs: this.getExecutionCooldownMs(),
+          cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+          reentryEligible: this.getReentryAfterUnfilledEnabled(),
+          finalState: "ABORTED"
+        });
+        finalState = "ABORTED";
+        finalBlocker = "STALE_ATTEMPT_ABORTED";
+        finalizedByCleanup = true;
       } finally {
-        this.logExecutionAttemptLifecycle(attempt, "final_state", {
+        this.logExecutionAttemptLifecycle(attempt, "closed", {
           postingStarted: attempt.postingStarted,
           postReturned: attempt.postReturned,
           awaitingSettlement: attempt.awaitingSettlement
         });
+        if (!finalizedByCleanup && !this.finalizedAttemptIds.has(attempt.attemptId)) {
+          this.finalizedAttemptIds.add(attempt.attemptId);
+          this.logger.warn(
+            {
+              attemptId: attempt.attemptId,
+              finalState,
+              blocker: finalBlocker,
+              filledShares: null,
+              orderId: null
+            },
+            "POLY_V2_ATTEMPT_FINALIZED"
+          );
+        }
         if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
           this.activeExecutionAttempt = null;
         }
         if (this.activeExecutionTask === task) {
           this.activeExecutionTask = null;
         }
+        this.refreshExecutionState(attempt.selected);
       }
     })();
     this.activeExecutionTask = task;
   }
 
   private invalidateExecutionAttempt(
-    reason: string,
+    reason: ExecutionStaleReason,
     context: { currentSlug: string | null; selectedSlug?: string | null }
   ): void {
     const attempt = this.activeExecutionAttempt;
     if (!attempt) return;
-    if (attempt.postingStarted) {
-      const reentryEligible = this.getReentryAfterUnfilledEnabled() && reason !== "STOP_REQUESTED";
-      attempt.awaitingSettlement = true;
-      this.logExecutionAttemptLifecycle(attempt, "awaiting_settlement", {
-        reason: `${reason}_deferred_post_started`
-      });
-      void this.cancelUnfilledOrdersForAttempt(attempt, reason);
-      this.clearInflightExecutionState(attempt, `STALE_ATTEMPT_ABORTED:${reason}`, reentryEligible);
-      if (reentryEligible) {
-        this.logReentryEligible(attempt, reason);
-      }
-      return;
-    }
-    this.invalidatedAttemptIds.add(attempt.attemptId);
     this.logger.warn(
       {
         attemptId: attempt.attemptId,
@@ -1131,55 +1195,20 @@ export class Btc5mLiveRunner {
       },
       "POLY_V2_EXECUTION_ATTEMPT_ABORTED"
     );
-    this.activeExecutionAttempt = null;
+    void this.cleanupExecutionAttempt(attempt, {
+      reason,
+      blocker: "STALE_ATTEMPT_ABORTED",
+      cooldownMs: reason === "STALE_AFTER_POST" ? this.getStaleAfterPostCooldownMs() : this.getExecutionCooldownMs(),
+      cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+      reentryEligible: this.getReentryAfterUnfilledEnabled() && reason !== "MANUAL_STOP",
+      finalState: "STALE_ABORTED"
+    });
   }
 
-  private resetExecutionAttemptState(reason: string, attempt: ExecutionAttempt): void {
-    this.invalidatedAttemptIds.add(attempt.attemptId);
-    this.logger.warn(
-      {
-        attemptId: attempt.attemptId,
-        executionSlug: attempt.executionSlug,
-        currentSlug: this.state.currentBucketSlug,
-        selectedSlug: attempt.selectedSlug,
-        side: attempt.side,
-        tokenId: attempt.tokenId,
-        retryCount: attempt.retryCount,
-        reason
-      },
-      "POLY_V2_EXECUTION_ATTEMPT_RESET"
-    );
-    if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
-      this.activeExecutionAttempt = null;
-    }
-  }
-
-  private clearInflightExecutionState(
+  private async cancelUnfilledOrdersForAttempt(
     attempt: ExecutionAttempt,
-    reason: string,
-    reentryEligible: boolean
-  ): void {
-    this.invalidatedAttemptIds.add(attempt.attemptId);
-    if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
-      this.activeExecutionAttempt = null;
-    }
-    this.logger.warn(
-      {
-        attemptId: attempt.attemptId,
-        executionSlug: attempt.executionSlug,
-        currentSlug: this.state.currentBucketSlug,
-        selectedSlug: attempt.selectedSlug,
-        side: attempt.side,
-        tokenId: attempt.tokenId,
-        retryCount: attempt.retryCount,
-        reason,
-        reentryEligible
-      },
-      "POLY_V2_INFLIGHT_CLEARED"
-    );
-  }
-
-  private async cancelUnfilledOrdersForAttempt(attempt: ExecutionAttempt, reason: string): Promise<void> {
+    reason: string
+  ): Promise<{ requestedCount: number; cancelledCount: number }> {
     this.logger.warn(
       {
         attemptId: attempt.attemptId,
@@ -1215,6 +1244,10 @@ export class Btc5mLiveRunner {
         },
         "POLY_V2_UNFILLED_ORDER_CANCELLED"
       );
+      return {
+        requestedCount: Number(result.requestedCount || 0),
+        cancelledCount: Number(result.cancelledCount || 0)
+      };
     } catch (error) {
       this.logger.warn(
         {
@@ -1230,6 +1263,7 @@ export class Btc5mLiveRunner {
         },
         "POLY_V2_UNFILLED_ORDER_CANCELLED"
       );
+      return { requestedCount: 0, cancelledCount: 0 };
     }
   }
 
@@ -1271,6 +1305,127 @@ export class Btc5mLiveRunner {
     );
   }
 
+  private transitionExecutionState(
+    to: RunnerExecutionState,
+    reason: string,
+    ctx: { attemptId?: string | null; slug?: string | null; tokenId?: string | null } = {}
+  ): void {
+    const from = this.executionState;
+    if (from === to) return;
+    this.executionState = to;
+    this.logger.warn(
+      {
+        from,
+        to,
+        reason,
+        attemptId: ctx.attemptId ?? null,
+        slug: ctx.slug ?? null,
+        tokenId: ctx.tokenId ?? null
+      },
+      "POLY_V2_STATE_TRANSITION"
+    );
+  }
+
+  private refreshExecutionState(selected: Btc5mSelectedMarket | null): void {
+    const now = Date.now();
+    if (this.activeProfitTakeAttempt) {
+      this.transitionExecutionState("EXIT_PENDING", "PROFIT_TAKE_ACTIVE", {
+        attemptId: this.activeProfitTakeAttempt.attemptId,
+        slug: this.activeProfitTakeAttempt.executionSlug,
+        tokenId: this.activeProfitTakeAttempt.tokenId
+      });
+      return;
+    }
+    if (this.activeExecutionAttempt && this.isExecutionAttemptActive(this.activeExecutionAttempt)) {
+      this.transitionExecutionState("ENTRY_PENDING", "ENTRY_ATTEMPT_ACTIVE", {
+        attemptId: this.activeExecutionAttempt.attemptId,
+        slug: this.activeExecutionAttempt.executionSlug,
+        tokenId: this.activeExecutionAttempt.tokenId
+      });
+      return;
+    }
+    if (now < this.executionCooldownUntilTs || now < this.entryAttemptCooldownUntilTs) {
+      this.transitionExecutionState("COOLDOWN", "EXECUTION_COOLDOWN_ACTIVE");
+      return;
+    }
+    if (selected && this.hasOpenPositionForMarket(selected.marketId)) {
+      this.transitionExecutionState("POSITION_OPEN", "OPEN_POSITION_PRESENT", {
+        slug: selected.slug
+      });
+      return;
+    }
+    this.transitionExecutionState("IDLE", "NO_ACTIVE_ATTEMPTS");
+  }
+
+  private staleReasonFromToken(reason: string): ExecutionStaleReason {
+    const normalized = String(reason || "").trim().toUpperCase();
+    if (normalized.includes("ROLLOVER")) return "ROLLOVER";
+    if (normalized.includes("SUPERSEDED")) return "SUPERSEDED";
+    if (normalized.includes("DEADLINE")) return "DEADLINE_EXCEEDED";
+    if (normalized.includes("MANUAL_STOP")) return "MANUAL_STOP";
+    return "STALE_AFTER_POST";
+  }
+
+  private async cleanupExecutionAttempt(
+    attempt: ExecutionAttempt,
+    input: {
+      reason: ExecutionStaleReason;
+      blocker: RunnerExecutionBlocker;
+      cooldownMs: number;
+      cancelUnfilled: boolean;
+      reentryEligible: boolean;
+      finalState: "STALE_ABORTED" | "DEADLINE_EXCEEDED" | "NO_FILL" | "ABORTED";
+      filledShares?: number;
+      orderId?: string | null;
+    }
+  ): Promise<void> {
+    if (this.finalizedAttemptIds.has(attempt.attemptId)) {
+      return;
+    }
+    this.finalizedAttemptIds.add(attempt.attemptId);
+    this.invalidatedAttemptIds.add(attempt.attemptId);
+    this.applyExecutionCooldown(input.reason, input.cooldownMs, attempt);
+    if (this.activeExecutionAttempt?.attemptId === attempt.attemptId) {
+      this.activeExecutionAttempt = null;
+    }
+    this.transitionExecutionState("COOLDOWN", `ATTEMPT_${input.reason}`, {
+      attemptId: attempt.attemptId,
+      slug: attempt.executionSlug,
+      tokenId: attempt.tokenId
+    });
+    let cancelRequested = false;
+    let cancelledCount = 0;
+    if (input.cancelUnfilled) {
+      cancelRequested = true;
+      const cancelResult = await this.cancelUnfilledOrdersForAttempt(attempt, input.reason);
+      cancelledCount = cancelResult.cancelledCount;
+    }
+    const cooldownUntilTs = Math.max(this.executionCooldownUntilTs, this.entryAttemptCooldownUntilTs);
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        reason: input.reason,
+        cancelRequested,
+        cancelledCount,
+        cooldownUntilTs
+      },
+      "POLY_V2_ATTEMPT_CLEANUP"
+    );
+    if (input.reentryEligible) {
+      this.logReentryEligible(attempt, input.reason);
+    }
+    this.logger.warn(
+      {
+        attemptId: attempt.attemptId,
+        finalState: input.finalState,
+        blocker: input.blocker,
+        filledShares: Number.isFinite(input.filledShares) ? input.filledShares : null,
+        orderId: input.orderId ?? null
+      },
+      "POLY_V2_ATTEMPT_FINALIZED"
+    );
+  }
+
   private isExecutionAttemptActive(attempt: ExecutionAttempt): boolean {
     if (!attempt.postingStarted && Date.now() > attempt.deadlineTs) return false;
     if (this.invalidatedAttemptIds.has(attempt.attemptId)) return false;
@@ -1288,7 +1443,7 @@ export class Btc5mLiveRunner {
       | "deadline_exceeded"
       | "awaiting_settlement"
       | "reconcile_result"
-      | "final_state",
+      | "closed",
     extra: Record<string, unknown> = {}
   ): void {
     this.logger.warn(
@@ -1308,23 +1463,8 @@ export class Btc5mLiveRunner {
     );
   }
 
-  private logExecutionAttemptStale(attempt: ExecutionAttempt, reason: string): void {
-    this.logger.warn(
-      {
-        attemptId: attempt.attemptId,
-        executionSlug: attempt.executionSlug,
-        currentSlug: this.state.currentBucketSlug,
-        selectedSlug: attempt.selectedSlug,
-        side: attempt.side,
-        tokenId: attempt.tokenId,
-        retryCount: attempt.retryCount,
-        reason
-      },
-      "POLY_V2_EXECUTION_ATTEMPT_STALE"
-    );
-  }
-
   private abortStaleAttempt(attempt: ExecutionAttempt, reason: string): { action: "HOLD"; blocker: string } {
+    const staleReason = this.staleReasonFromToken(reason);
     this.logger.warn(
       {
         attemptId: attempt.attemptId,
@@ -1338,10 +1478,14 @@ export class Btc5mLiveRunner {
       },
       "POLY_V2_ABORT_STALE_ATTEMPT"
     );
-    this.logExecutionAttemptStale(attempt, reason);
-    if (reason === "STALE_AFTER_POST") {
-      return { action: "HOLD", blocker: "STALE_AFTER_POST" };
-    }
+    void this.cleanupExecutionAttempt(attempt, {
+      reason: staleReason,
+      blocker: "STALE_ATTEMPT_ABORTED",
+      cooldownMs: staleReason === "STALE_AFTER_POST" ? this.getStaleAfterPostCooldownMs() : this.getExecutionCooldownMs(),
+      cancelUnfilled: attempt.postingStarted || attempt.postReturned,
+      reentryEligible: this.getReentryAfterUnfilledEnabled(),
+      finalState: "STALE_ABORTED"
+    });
     return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
   }
 
@@ -1400,6 +1544,12 @@ export class Btc5mLiveRunner {
     const envValue = Number(process.env.POLY_V2_DECISION_LOOP_MS || 750);
     if (!Number.isFinite(envValue)) return 750;
     return Math.max(250, Math.min(5_000, Math.floor(envValue)));
+  }
+
+  private getLiveEntryMaxRemainingSec(): number {
+    const envValue = Number(process.env.POLY_V2_MAX_ENTRY_REMAINING_SEC || 300);
+    if (!Number.isFinite(envValue)) return 300;
+    return Math.max(this.config.polymarket.live.minEntryRemainingSec + 1, Math.min(600, Math.floor(envValue)));
   }
 
   private getProfitTakePollMs(): number {
@@ -1545,12 +1695,15 @@ export class Btc5mLiveRunner {
       const staleByRollover = active.executionSlug !== input.tick.currentSlug;
       const staleBySettlement = active.awaitingSettlement || active.postReturned;
       if (active.postingStarted && (staleByAge || staleByRollover || staleBySettlement)) {
-        const staleReason = staleByRollover ? "ROLLOVER" : staleByAge ? "UNFILLED_MAX_AGE" : "AWAITING_SETTLEMENT";
-        void this.cancelUnfilledOrdersForAttempt(active, staleReason);
-        this.clearInflightExecutionState(active, `STALE_ATTEMPT_ABORTED:${staleReason}`, this.getReentryAfterUnfilledEnabled());
-        if (this.getReentryAfterUnfilledEnabled()) {
-          this.logReentryEligible(active, staleReason);
-        }
+        const staleReason: ExecutionStaleReason = staleByRollover ? "ROLLOVER" : "STALE_AFTER_POST";
+        void this.cleanupExecutionAttempt(active, {
+          reason: staleReason,
+          blocker: "STALE_ATTEMPT_ABORTED",
+          cooldownMs: staleReason === "STALE_AFTER_POST" ? this.getStaleAfterPostCooldownMs() : this.getExecutionCooldownMs(),
+          cancelUnfilled: true,
+          reentryEligible: this.getReentryAfterUnfilledEnabled(),
+          finalState: "STALE_ABORTED"
+        });
       } else {
         return "EXECUTION_IN_FLIGHT";
       }
@@ -1642,6 +1795,11 @@ export class Btc5mLiveRunner {
       createdTs: Date.now()
     };
     this.activeProfitTakeAttempt = attempt;
+    this.transitionExecutionState("EXIT_PENDING", "PROFIT_TAKE_ATTEMPT_CREATED", {
+      attemptId: attempt.attemptId,
+      slug: attempt.executionSlug,
+      tokenId: attempt.tokenId
+    });
     this.logger.warn(
       {
         attemptId: attempt.attemptId,
@@ -1719,6 +1877,7 @@ export class Btc5mLiveRunner {
         if (this.activeProfitTakeTask === task) {
           this.activeProfitTakeTask = null;
         }
+        this.refreshExecutionState(selected);
       }
     })();
     this.activeProfitTakeTask = task;
@@ -1783,7 +1942,7 @@ export class Btc5mLiveRunner {
       yesAsk: input.decision.sideAsk,
       conviction: Math.min(0.8, Math.max(0.1, Math.abs(input.decision.edge) * 200)),
       remainingSec: tauSec,
-      entryMaxRemainingSec: this.config.polymarket.paper.entryMaxRemainingSec,
+      entryMaxRemainingSec: this.getLiveEntryMaxRemainingSec(),
       depthCapNotionalUsd: remainingWindowBudget,
       remainingWindowBudget,
       remainingExposureBudget,
@@ -2200,6 +2359,22 @@ export class Btc5mLiveRunner {
       this.config.polymarket.liveConfirmed &&
       this.config.polymarket.liveExecutionEnabled &&
       !this.config.polymarket.killSwitch
+    );
+  }
+
+  private applyHoldReason(input: { reason: string; tick: Btc5mTick; selectedSlug: string | null }): void {
+    const normalizedReason = String(input.reason || "HOLD");
+    this.state.action = "HOLD";
+    this.state.holdReason = normalizedReason;
+    this.state.blockedBy = normalizedReason;
+    this.logger.warn(
+      {
+        reason: normalizedReason,
+        selectedSlug: input.selectedSlug,
+        currentSlug: input.tick.currentSlug,
+        tickNowSec: input.tick.tickNowSec
+      },
+      "POLY_V2_HOLD_REASON"
     );
   }
 }
