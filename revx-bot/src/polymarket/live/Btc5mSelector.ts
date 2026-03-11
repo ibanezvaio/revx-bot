@@ -13,6 +13,36 @@ type SelectInput = {
   tick: Btc5mTick;
 };
 
+export const BTC5M_SELECTOR_REASONS = {
+  NO_CANDIDATE_MARKETS: "NO_CANDIDATE_MARKETS",
+  CANDIDATE_NOT_TRADABLE: "CANDIDATE_NOT_TRADABLE",
+  TOKEN_ID_MISSING: "TOKEN_ID_MISSING",
+  ORDERBOOK_MISSING_YES: "ORDERBOOK_MISSING_YES",
+  ORDERBOOK_MISSING_NO: "ORDERBOOK_MISSING_NO",
+  NETWORK_ERROR: "NETWORK_ERROR",
+  OK: "OK"
+} as const;
+
+export type Btc5mSelectorReason = (typeof BTC5M_SELECTOR_REASONS)[keyof typeof BTC5M_SELECTOR_REASONS];
+
+type CandidateSeed = {
+  row: Record<string, unknown>;
+  expectedSlug: string;
+  source: "current_slug" | "next_slug" | "prev_slug";
+  alignmentRank: number;
+  tradabilityHintScore: number;
+};
+
+type CandidateOutcome =
+  | {
+      selected: Btc5mSelectedMarket;
+      reason: "OK";
+    }
+  | {
+      selected: null;
+      reason: Exclude<Btc5mSelectorReason, "OK">;
+    };
+
 export class Btc5mSelector {
   private readonly unavailableTokenIdsBySlug = new Map<string, Set<string>>();
 
@@ -26,89 +56,37 @@ export class Btc5mSelector {
     const tick = input.tick;
     const attemptedSlugs = [tick.currentSlug, tick.nextSlug, tick.prevSlug];
     this.pruneUnavailableSlugs(new Set(attemptedSlugs));
-    const cycleUnbookableTokenIds = new Set<string>();
-    let lastReason = "NO_DIRECT_MARKET";
 
-    for (const slug of attemptedSlugs) {
-      const source =
-        slug === tick.currentSlug ? "current_slug" : slug === tick.nextSlug ? "next_slug" : "prev_slug";
+    const discovery = await this.discoverCandidates(tick, attemptedSlugs);
+    if (discovery.candidates.length === 0) {
+      return {
+        tick,
+        attemptedSlugs,
+        selected: null,
+        reason: discovery.networkError
+          ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+          : BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS
+      };
+    }
 
-      let rows: RawPolymarketMarket[] = [];
-      try {
-        rows = await this.client.getMarketsBySlugPathFirst(slug);
-      } catch (error) {
-        lastReason = normalizeErrorReason(error);
-        continue;
-      }
+    const ranked = discovery.candidates.sort((a, b) => {
+      if (a.alignmentRank !== b.alignmentRank) return a.alignmentRank - b.alignmentRank;
+      return b.tradabilityHintScore - a.tradabilityHintScore;
+    });
 
-      for (const row of rows) {
-        const candidate = await this.normalizeCandidate(row as Record<string, unknown>, slug, tick, source);
-        if (!candidate) {
-          continue;
-        }
-
-        const sideOrder = this.getSideOrder();
-        const sideBooks: Partial<Record<Btc5mSide, Btc5mSideBook>> = {};
-        let candidateRejected = false;
-
-        for (const side of sideOrder) {
-          const tokenId = side === "YES" ? candidate.yesTokenId : candidate.noTokenId;
-          if (!tokenId) {
-            candidateRejected = true;
-            lastReason = "TOKEN_ID_MISSING";
-            continue;
-          }
-          if (cycleUnbookableTokenIds.has(tokenId) || this.isSideBookUnavailable(slug, tokenId)) {
-            candidateRejected = true;
-            lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
-            this.logger.warn(
-              { slug, side, tokenId, reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN" },
-              "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
-            );
-            continue;
-          }
-
-          const sideBook = await this.fetchSideBook(slug, side, tokenId);
-          if (
-            sideBook.reason &&
-            sideBook.reason.toLowerCase().includes("no orderbook exists for the requested token id")
-          ) {
-            cycleUnbookableTokenIds.add(tokenId);
-            this.markSideBookUnavailable(slug, tokenId, sideBook.reason);
-            candidateRejected = true;
-            lastReason = "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN";
-            continue;
-          }
-          if (!sideBook.bookable || !sideBook.tokenId) {
-            candidateRejected = true;
-            lastReason = sideBook.reason || "SIDE_NOT_BOOKABLE";
-            continue;
-          }
-
-          sideBooks[side] = sideBook;
-        }
-
-        const yesBook = sideBooks.YES ?? candidate.yesBook;
-        const noBook = sideBooks.NO ?? candidate.noBook;
-        if (candidateRejected || !yesBook.bookable || !noBook.bookable || !yesBook.tokenId || !noBook.tokenId) {
-          continue;
-        }
-
-        const selected: Btc5mSelectedMarket = {
-          ...candidate,
-          chosenSide: null,
-          selectedTokenId: null,
-          yesBook,
-          noBook,
-          orderbookOk: true
-        };
-
+    let firstFailureReason: Exclude<Btc5mSelectorReason, "OK"> | null = null;
+    for (const seed of ranked) {
+      const outcome = await this.evaluateCandidate(seed, tick);
+      if (outcome.selected) {
         return {
           tick,
           attemptedSlugs,
-          selected,
-          reason: "OK"
+          selected: outcome.selected,
+          reason: BTC5M_SELECTOR_REASONS.OK
         };
+      }
+      if (!firstFailureReason) {
+        firstFailureReason = outcome.reason;
       }
     }
 
@@ -116,66 +94,7 @@ export class Btc5mSelector {
       tick,
       attemptedSlugs,
       selected: null,
-      reason: lastReason
-    };
-  }
-
-  private async normalizeCandidate(
-    row: Record<string, unknown>,
-    expectedSlug: string,
-    tick: Btc5mTick,
-    source: "current_slug" | "next_slug" | "prev_slug"
-  ): Promise<Omit<Btc5mSelectedMarket, "chosenSide" | "selectedTokenId" | "orderbookOk"> | null> {
-    const marketId = pickString(row, ["id", "market_id", "conditionId", "condition_id"]);
-    if (!marketId) return null;
-
-    const rowSlug = pickString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || expectedSlug;
-    if (rowSlug !== expectedSlug) return null;
-
-    const context = await this.client.getMarketContext(marketId).catch(() => null);
-    const active = context?.active ?? pickBoolean(row, ["active", "is_active"], true);
-    const closed = context?.closed ?? pickBoolean(row, ["closed", "is_closed", "resolved"], false);
-    const archived = context?.archived ?? pickBoolean(row, ["archived", "is_archived"], false);
-    const acceptingOrders =
-      context?.acceptingOrders ?? pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"], true);
-    const enableOrderBook =
-      context?.enableOrderBook ?? pickBoolean(row, ["enable_order_book", "enableOrderBook"], true);
-
-    if (!active || closed || archived || !acceptingOrders || !enableOrderBook) {
-      return null;
-    }
-
-    const startSec = parseSlugStartSec(rowSlug);
-    if (startSec === null) return null;
-    const endSec = startSec + 300;
-    const remainingSec = Math.max(0, endSec - tick.tickNowSec);
-    const minRemaining = Math.max(1, this.config.polymarket.live.minEntryRemainingSec);
-    const maxRemaining = Math.max(minRemaining, this.config.polymarket.paper.entryMaxRemainingSec);
-    if (!(remainingSec > minRemaining && remainingSec <= maxRemaining)) {
-      return null;
-    }
-
-    const yesTokenId = context?.resolution.yesTokenId ?? extractTokenId(row, "YES");
-    const noTokenId = context?.resolution.noTokenId ?? extractTokenId(row, "NO");
-    if (!yesTokenId || !noTokenId || yesTokenId === noTokenId) {
-      return null;
-    }
-
-    return {
-      marketId,
-      slug: rowSlug,
-      question: pickString(row, ["question", "title", "description", "subtitle"]) || rowSlug,
-      priceToBeat: pickNumber(row, ["price_to_beat", "priceToBeat", "target_price", "strike", "threshold"]),
-      startTs: startSec * 1000,
-      endTs: endSec * 1000,
-      remainingSec,
-      tickSize: normalizeTickSize(pickString(row, ["minimum_tick_size", "tickSize", "tick_size"])),
-      negRisk: pickBoolean(row, ["negRisk", "neg_risk"], false),
-      yesTokenId,
-      noTokenId,
-      yesBook: emptySideBook("YES", yesTokenId),
-      noBook: emptySideBook("NO", noTokenId),
-      selectionSource: source
+      reason: firstFailureReason ?? BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS
     };
   }
 
@@ -207,83 +126,265 @@ export class Btc5mSelector {
     this.logger.warn({ slug: normalizedSlug, tokenId: normalizedTokenId, reason }, "POLY_V2_SIDE_BOOK_UNAVAILABLE");
   }
 
+  private async discoverCandidates(
+    tick: Btc5mTick,
+    attemptedSlugs: string[]
+  ): Promise<{ candidates: CandidateSeed[]; networkError: boolean }> {
+    const candidates: CandidateSeed[] = [];
+    let networkError = false;
+    const sources: Array<"current_slug" | "next_slug" | "prev_slug"> = ["current_slug", "next_slug", "prev_slug"];
+
+    for (let index = 0; index < attemptedSlugs.length; index += 1) {
+      const slug = attemptedSlugs[index];
+      const source = sources[index] || "prev_slug";
+      try {
+        const rows = await this.client.getMarketsBySlugPathFirst(slug);
+        for (const row of rows) {
+          const hintScore = this.computeTradabilityHint(row as Record<string, unknown>);
+          candidates.push({
+            row: row as Record<string, unknown>,
+            expectedSlug: slug,
+            source,
+            alignmentRank: source === "current_slug" ? 0 : source === "next_slug" ? 1 : 2,
+            tradabilityHintScore: hintScore
+          });
+        }
+      } catch {
+        networkError = true;
+      }
+    }
+
+    return { candidates, networkError };
+  }
+
+  private async evaluateCandidate(seed: CandidateSeed, tick: Btc5mTick): Promise<CandidateOutcome> {
+    const candidate = await this.normalizeCandidate(seed, tick);
+    if (!candidate) {
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE
+      };
+    }
+
+    if (!candidate.yesTokenId || !candidate.noTokenId || candidate.yesTokenId === candidate.noTokenId) {
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.TOKEN_ID_MISSING
+      };
+    }
+
+    const yesBook = await this.fetchSideBook(candidate.slug, "YES", candidate.yesTokenId);
+    if (!yesBook.bookable) {
+      return {
+        selected: null,
+        reason:
+          yesBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+            ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES
+      };
+    }
+
+    const noBook = await this.fetchSideBook(candidate.slug, "NO", candidate.noTokenId);
+    if (!noBook.bookable) {
+      return {
+        selected: null,
+        reason:
+          noBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+            ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+      };
+    }
+
+    return {
+      selected: {
+        ...candidate,
+        chosenSide: null,
+        selectedTokenId: null,
+        yesBook: yesBook.book,
+        noBook: noBook.book,
+        orderbookOk: true
+      },
+      reason: "OK"
+    };
+  }
+
+  private async normalizeCandidate(
+    seed: CandidateSeed,
+    tick: Btc5mTick
+  ): Promise<Omit<Btc5mSelectedMarket, "chosenSide" | "selectedTokenId" | "orderbookOk"> | null> {
+    const row = seed.row;
+    const marketId = pickString(row, ["id", "market_id", "conditionId", "condition_id"]);
+    if (!marketId) return null;
+
+    const rowSlug = pickString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || seed.expectedSlug;
+    const expectedBucketStartSec = parseBucketStartSec(seed.expectedSlug);
+    const rowBucketStartSec = parseBucketStartSec(rowSlug);
+    const inferredBucketStartSec = inferBucketStartSec(row);
+    const startSec = rowBucketStartSec ?? expectedBucketStartSec ?? inferredBucketStartSec;
+    if (startSec === null) return null;
+    if (expectedBucketStartSec !== null && rowBucketStartSec !== null && expectedBucketStartSec !== rowBucketStartSec) {
+      return null;
+    }
+
+    const context = await this.client.getMarketContext(marketId).catch(() => null);
+    const active = context?.active ?? pickBoolean(row, ["active", "is_active"], true);
+    const closed = context?.closed ?? pickBoolean(row, ["closed", "is_closed", "resolved"], false);
+    const archived = context?.archived ?? pickBoolean(row, ["archived", "is_archived"], false);
+    const acceptingOrders =
+      context?.acceptingOrders ?? pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"], true);
+    const enableOrderBook =
+      context?.enableOrderBook ?? pickBoolean(row, ["enable_order_book", "enableOrderBook"], true);
+    if (!active || closed || archived || !acceptingOrders || !enableOrderBook) {
+      return null;
+    }
+
+    const endSec = startSec + 300;
+    const remainingSec = Math.max(0, endSec - tick.tickNowSec);
+    const minRemaining = Math.max(1, this.config.polymarket.live.minEntryRemainingSec);
+    if (!(remainingSec > minRemaining && remainingSec <= 600)) {
+      return null;
+    }
+
+    const yesTokenId = context?.resolution.yesTokenId ?? extractTokenId(row, "YES");
+    const noTokenId = context?.resolution.noTokenId ?? extractTokenId(row, "NO");
+
+    return {
+      marketId,
+      slug: rowSlug,
+      question: pickString(row, ["question", "title", "description", "subtitle"]) || rowSlug,
+      priceToBeat: pickNumber(row, ["price_to_beat", "priceToBeat", "target_price", "strike", "threshold"]),
+      startTs: startSec * 1000,
+      endTs: endSec * 1000,
+      remainingSec,
+      tickSize: normalizeTickSize(pickString(row, ["minimum_tick_size", "tickSize", "tick_size"])),
+      negRisk: pickBoolean(row, ["negRisk", "neg_risk"], false),
+      yesTokenId,
+      noTokenId,
+      yesBook: emptySideBook("YES", yesTokenId),
+      noBook: emptySideBook("NO", noTokenId),
+      selectionSource: seed.source
+    };
+  }
+
+  private async fetchSideBook(
+    slug: string,
+    side: Btc5mSide,
+    tokenId: string
+  ): Promise<{ book: Btc5mSideBook; bookable: boolean; reasonCode: Exclude<Btc5mSelectorReason, "OK"> | null }> {
+    if (this.isSideBookUnavailable(slug, tokenId)) {
+      this.logger.warn(
+        { slug, side, tokenId, reason: "MISSING_ORDERBOOK_FOR_SELECTED_TOKEN" },
+        "POLY_V2_SIDE_BOOK_UNAVAILABLE_ALREADY_MARKED"
+      );
+      return {
+        book: emptySideBook(side, tokenId),
+        bookable: false,
+        reasonCode: side === "YES" ? BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+      };
+    }
+
+    try {
+      const quote = await this.client.getTokenPriceQuote(tokenId, { slug });
+      const bestBid = sanitizePrice(quote.bestBid);
+      const bestAsk = sanitizePrice(quote.bestAsk);
+      if (bestBid !== null || bestAsk !== null) {
+        return {
+          book: {
+            side,
+            tokenId,
+            bestBid,
+            bestAsk,
+            mid: sanitizePrice(quote.mid),
+            spread: bestBid !== null && bestAsk !== null ? Math.max(0, bestAsk - bestBid) : null,
+            quoteTs: Number.isFinite(quote.ts) ? quote.ts : null,
+            bookable: true,
+            reason: null
+          },
+          bookable: true,
+          reasonCode: null
+        };
+      }
+    } catch (error) {
+      const reason = normalizeErrorReason(error);
+      if (isNoOrderbookReason(reason)) {
+        this.markSideBookUnavailable(slug, tokenId, reason);
+        return {
+          book: emptySideBook(side, tokenId),
+          bookable: false,
+          reasonCode: side === "YES" ? BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+        };
+      }
+      return {
+        book: emptySideBook(side, tokenId),
+        bookable: false,
+        reasonCode: BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+      };
+    }
+
+    try {
+      const book = await this.client.getTokenOrderBook(tokenId);
+      const bestBid = sanitizePrice(book.bestBid);
+      const bestAsk = sanitizePrice(book.bestAsk);
+      if (bestBid !== null || bestAsk !== null) {
+        return {
+          book: {
+            side,
+            tokenId,
+            bestBid,
+            bestAsk,
+            mid: bestBid !== null && bestAsk !== null ? (bestBid + bestAsk) / 2 : null,
+            spread: bestBid !== null && bestAsk !== null ? Math.max(0, bestAsk - bestBid) : null,
+            quoteTs: Number.isFinite(book.ts) ? book.ts : null,
+            bookable: true,
+            reason: null
+          },
+          bookable: true,
+          reasonCode: null
+        };
+      }
+      return {
+        book: emptySideBook(side, tokenId),
+        bookable: false,
+        reasonCode: side === "YES" ? BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+      };
+    } catch (error) {
+      const reason = normalizeErrorReason(error);
+      if (isNoOrderbookReason(reason)) {
+        this.markSideBookUnavailable(slug, tokenId, reason);
+        return {
+          book: emptySideBook(side, tokenId),
+          bookable: false,
+          reasonCode: side === "YES" ? BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+        };
+      }
+      return {
+        book: emptySideBook(side, tokenId),
+        bookable: false,
+        reasonCode: BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+      };
+    }
+  }
+
+  private computeTradabilityHint(row: Record<string, unknown>): number {
+    const active = pickBoolean(row, ["active", "is_active"], true);
+    const closed = pickBoolean(row, ["closed", "is_closed", "resolved"], false);
+    const archived = pickBoolean(row, ["archived", "is_archived"], false);
+    const acceptingOrders = pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"], true);
+    const enableOrderBook = pickBoolean(row, ["enable_order_book", "enableOrderBook"], true);
+    let score = 0;
+    if (active) score += 3;
+    if (!closed) score += 2;
+    if (!archived) score += 2;
+    if (acceptingOrders) score += 2;
+    if (enableOrderBook) score += 1;
+    return score;
+  }
+
   private pruneUnavailableSlugs(activeSlugs: Set<string>): void {
     for (const slug of this.unavailableTokenIdsBySlug.keys()) {
       if (!activeSlugs.has(slug)) {
         this.unavailableTokenIdsBySlug.delete(slug);
       }
-    }
-  }
-
-  private getSideOrder(): Btc5mSide[] {
-    const configuredOrder = String(process.env.POLY_V2_BOOK_CHECK_ORDER || "YES_NO").trim().toUpperCase();
-    return configuredOrder === "NO_YES" ? ["NO", "YES"] : ["YES", "NO"];
-  }
-
-  private async fetchSideBook(slug: string, side: Btc5mSide, tokenId: string): Promise<Btc5mSideBook> {
-    try {
-      const quote = await this.client.getTokenPriceQuote(tokenId, { slug });
-      const bestBid = sanitizePrice(quote.bestBid);
-      const bestAsk = sanitizePrice(quote.bestAsk);
-      const mid = sanitizePrice(quote.mid);
-      if (bestBid !== null || bestAsk !== null) {
-        return {
-          side,
-          tokenId,
-          bestBid,
-          bestAsk,
-          mid,
-          spread: bestBid !== null && bestAsk !== null ? Math.max(0, bestAsk - bestBid) : null,
-          quoteTs: Number.isFinite(quote.ts) ? quote.ts : null,
-          bookable: true,
-          reason: null
-        };
-      }
-      const book = await this.client.getTokenOrderBook(tokenId);
-      const bookBid = sanitizePrice(book.bestBid);
-      const bookAsk = sanitizePrice(book.bestAsk);
-      if (bookBid !== null || bookAsk !== null) {
-        return {
-          side,
-          tokenId,
-          bestBid: bookBid,
-          bestAsk: bookAsk,
-          mid: bookBid !== null && bookAsk !== null ? (bookBid + bookAsk) / 2 : null,
-          spread: bookBid !== null && bookAsk !== null ? Math.max(0, bookAsk - bookBid) : null,
-          quoteTs: Number.isFinite(book.ts) ? book.ts : null,
-          bookable: true,
-          reason: null
-        };
-      }
-      return {
-        side,
-        tokenId,
-        bestBid: null,
-        bestAsk: null,
-        mid: null,
-        spread: null,
-        quoteTs: Number.isFinite(quote.ts) ? quote.ts : null,
-        bookable: false,
-        reason: "EMPTY_LIVE_QUOTE"
-      };
-    } catch (error) {
-      const reason = normalizeErrorReason(error);
-      if (reason.toLowerCase().includes("no orderbook exists for the requested token id")) {
-        this.markSideBookUnavailable(slug, tokenId, reason);
-      } else {
-        this.logger.warn({ slug, side, tokenId, reason }, "POLY_V2_SIDE_BOOK_UNAVAILABLE");
-      }
-      return {
-        side,
-        tokenId,
-        bestBid: null,
-        bestAsk: null,
-        mid: null,
-        spread: null,
-        quoteTs: null,
-        bookable: false,
-        reason
-      };
     }
   }
 }
@@ -302,11 +403,32 @@ function emptySideBook(side: Btc5mSide, tokenId: string | null): Btc5mSideBook {
   };
 }
 
-function parseSlugStartSec(slug: string): number | null {
-  const match = String(slug || "").trim().match(/btc-updown-5m-(\d{9,})$/i);
-  if (!match) return null;
-  const parsed = Number(match[1]);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+function parseBucketStartSec(slug: string): number | null {
+  const normalized = String(slug || "").trim();
+  if (!normalized) return null;
+  const matches = normalized.match(/\d{9,}/g);
+  if (!matches || matches.length === 0) return null;
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const parsed = Number(matches[index]);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
+function inferBucketStartSec(row: Record<string, unknown>): number | null {
+  const ts =
+    pickNumber(row, ["window_start", "windowStart", "start", "start_ts", "startTs", "start_time", "startTime"]) ??
+    null;
+  if (ts === null) return null;
+  const sec = ts > 1_000_000_000_000 ? Math.floor(ts / 1000) : Math.floor(ts);
+  if (!(sec > 0)) return null;
+  return Math.floor(sec / 300) * 300;
+}
+
+function isNoOrderbookReason(reason: string): boolean {
+  return reason.toLowerCase().includes("no orderbook exists for the requested token id");
 }
 
 function extractTokenId(row: Record<string, unknown>, side: Btc5mSide): string | null {
@@ -319,7 +441,6 @@ function extractTokenId(row: Record<string, unknown>, side: Btc5mSide): string |
   if (clobTokenIds.length >= 2) {
     return side === "YES" ? clobTokenIds[0] : clobTokenIds[1];
   }
-
   return null;
 }
 
@@ -349,9 +470,7 @@ function pickNumber(obj: Record<string, unknown>, keys: string[]): number | null
   for (const key of keys) {
     const value = obj[key];
     const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return parsed;
-    }
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
   return null;
 }

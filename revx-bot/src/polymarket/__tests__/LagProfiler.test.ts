@@ -2,6 +2,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { rmSync } from "node:fs";
 import { LagProfiler } from "../LagProfiler";
+import { runBtc5mSelectorV2Tests } from "./Btc5mSelectorV2.test";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -9,7 +10,7 @@ function assert(condition: boolean, message: string): void {
   }
 }
 
-function run(): void {
+async function run(): Promise<void> {
   const logPath = path.join(tmpdir(), `revx-lag-profiler-${Date.now()}.jsonl`);
   rmSync(logPath, { force: true });
   const profiler = new LagProfiler({
@@ -72,8 +73,13 @@ function run(): void {
   rmSync(logPath, { force: true });
   rmSync(`${logPath}.2`, { force: true });
   rmSync(`${logPath}.3`, { force: true });
+  await runBtc5mSelectorV2Tests();
   // eslint-disable-next-line no-console
   console.log("LagProfiler tests: PASS");
 }
 
-run();
+void run().catch((error) => {
+  // eslint-disable-next-line no-console
+  console.error(error);
+  process.exit(1);
+});
