@@ -205,9 +205,41 @@ async function run(): Promise<void> {
       ts: Date.now()
     })
   };
+  engineAny.directSlugResolver = {
+    lookupBySlugs: async (slugs: string[]) => {
+      const attemptedSlugs = Array.from(new Set(slugs.map((value) => String(value || "").trim()).filter((value) => value.length > 0)));
+      const rows = attemptedSlugs.map((slug) => ({
+        slug,
+        source: "slug_api",
+        row: {
+          id: market.marketId,
+          market_id: market.marketId,
+          slug,
+          eventSlug: slug,
+          question: `Will BTC be above $${market.priceToBeat} at expiry?`,
+          price_to_beat: market.priceToBeat,
+          startTs: market.startTs,
+          endTs: market.endTs,
+          clobTokenIds: [market.yesTokenId, market.noTokenId],
+          acceptingOrders: mockedNow < t2,
+          active: mockedNow < t2,
+          closed: mockedNow >= t2,
+          archived: false,
+          enableOrderBook: true
+        }
+      }));
+      return {
+        attemptedSlugs,
+        rows,
+        hadNetworkError: false,
+        hadData: rows.length > 0
+      };
+    }
+  };
   engineAny.execution = {
     refreshLiveState: async () => {},
     getOpenOrderCount: () => 0,
+    getOpenOrders: () => [],
     getTotalExposureUsd: () => 0,
     getConcurrentWindows: () => 0,
     getPositions: () => [],

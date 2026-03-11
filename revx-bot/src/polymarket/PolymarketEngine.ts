@@ -2817,7 +2817,12 @@ export class PolymarketEngine {
       const marketId = String(position.marketId || "").trim();
       if (marketId.length > 0) out.add(marketId);
     }
-    for (const order of this.execution.getOpenOrders()) {
+    const openOrders =
+      typeof (this.execution as { getOpenOrders?: unknown }).getOpenOrders === "function"
+        ? (this.execution as { getOpenOrders: () => unknown }).getOpenOrders()
+        : [];
+    const openOrdersList = Array.isArray(openOrders) ? openOrders : [];
+    for (const order of openOrdersList) {
       const marketId = String(order.marketId || "").trim();
       if (marketId.length > 0) out.add(marketId);
     }

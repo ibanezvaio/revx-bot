@@ -110,7 +110,7 @@ Safety defaults:
 - `POLYMARKET_STALE_KILL_AFTER_SEC=60` (live mode only; transient stale ticks do not hard-kill before this)
 - `POLYMARKET_HTTP_TIMEOUT_MS=8000` for per-call network timeout
 - engine kill-switch triggers cancel-all on critical breaches
-- `POLYMARKET_KILL_SWITCH=true` forces HOLD-only operation (no place/cancel mutations)
+- `POLYMARKET_KILL_SWITCH=false` forces HOLD-only operation (no place/cancel mutations)
 - paper fills include `POLYMARKET_PAPER_SLIPPAGE_BPS` and `POLYMARKET_PAPER_FEE_BPS`
 - overnight guardrails:
   - `POLYMARKET_PAPER_MAX_NOTIONAL_PER_WINDOW`
