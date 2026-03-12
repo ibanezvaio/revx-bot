@@ -15,6 +15,7 @@ type SelectInput = {
 
 export const BTC5M_SELECTOR_REASONS = {
   NO_CANDIDATE_MARKETS: "NO_CANDIDATE_MARKETS",
+  NO_VIABLE_CANDIDATE_AFTER_FILTER: "NO_VIABLE_CANDIDATE_AFTER_FILTER",
   CANDIDATE_NOT_TRADABLE: "CANDIDATE_NOT_TRADABLE",
   TOKEN_ID_MISSING: "TOKEN_ID_MISSING",
   ORDERBOOK_MISSING_YES: "ORDERBOOK_MISSING_YES",
@@ -37,10 +38,12 @@ type CandidateOutcome =
   | {
       selected: Btc5mSelectedMarket;
       reason: "OK";
+      filteredOut: null;
     }
   | {
       selected: null;
       reason: Exclude<Btc5mSelectorReason, "OK">;
+      filteredOut: "EXTREME" | "WIDE_SPREAD" | "INVALID" | null;
     };
 
 export class Btc5mSelector {
@@ -58,10 +61,20 @@ export class Btc5mSelector {
     this.pruneUnavailableSlugs(new Set(attemptedSlugs));
 
     const discovery = await this.discoverCandidates(tick, attemptedSlugs);
+    let droppedExtreme = 0;
+    let droppedWideSpread = 0;
+    let droppedInvalid = 0;
+    let candidatesAfterFilter = 0;
+    const candidatesBeforeFilter = discovery.candidates.length;
     if (discovery.candidates.length === 0) {
       return {
         tick,
         attemptedSlugs,
+        candidatesBeforeFilter,
+        candidatesAfterFilter,
+        droppedExtreme,
+        droppedWideSpread,
+        droppedInvalid,
         selected: null,
         reason: discovery.networkError
           ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
@@ -75,26 +88,55 @@ export class Btc5mSelector {
     });
 
     let firstFailureReason: Exclude<Btc5mSelectorReason, "OK"> | null = null;
+    const filteredCandidates: Btc5mSelectedMarket[] = [];
     for (const seed of ranked) {
       const outcome = await this.evaluateCandidate(seed, tick);
       if (outcome.selected) {
-        return {
-          tick,
-          attemptedSlugs,
-          selected: outcome.selected,
-          reason: BTC5M_SELECTOR_REASONS.OK
-        };
+        filteredCandidates.push(outcome.selected);
+        candidatesAfterFilter += 1;
+      } else if (outcome.filteredOut === "EXTREME") {
+        droppedExtreme += 1;
+      } else if (outcome.filteredOut === "WIDE_SPREAD") {
+        droppedWideSpread += 1;
+      } else if (outcome.filteredOut === "INVALID") {
+        droppedInvalid += 1;
       }
-      if (!firstFailureReason) {
+      if (!outcome.selected && !firstFailureReason) {
         firstFailureReason = outcome.reason;
       }
     }
 
+    if (filteredCandidates.length > 0) {
+      return {
+        tick,
+        attemptedSlugs,
+        candidatesBeforeFilter,
+        candidatesAfterFilter,
+        droppedExtreme,
+        droppedWideSpread,
+        droppedInvalid,
+        selected: filteredCandidates[0],
+        reason: BTC5M_SELECTOR_REASONS.OK
+      };
+    }
+
+    const filterDroppedAll =
+      candidatesBeforeFilter > 0 &&
+      candidatesAfterFilter === 0 &&
+      (droppedExtreme > 0 || droppedWideSpread > 0 || droppedInvalid > 0);
+
     return {
       tick,
       attemptedSlugs,
+      candidatesBeforeFilter,
+      candidatesAfterFilter,
+      droppedExtreme,
+      droppedWideSpread,
+      droppedInvalid,
       selected: null,
-      reason: firstFailureReason ?? BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS
+      reason: filterDroppedAll
+        ? BTC5M_SELECTOR_REASONS.NO_VIABLE_CANDIDATE_AFTER_FILTER
+        : firstFailureReason ?? BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS
     };
   }
 
@@ -162,16 +204,21 @@ export class Btc5mSelector {
     if (!candidate) {
       return {
         selected: null,
-        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        filteredOut: null
       };
     }
 
     if (!candidate.yesTokenId || !candidate.noTokenId || candidate.yesTokenId === candidate.noTokenId) {
       return {
         selected: null,
-        reason: BTC5M_SELECTOR_REASONS.TOKEN_ID_MISSING
+        reason: BTC5M_SELECTOR_REASONS.TOKEN_ID_MISSING,
+        filteredOut: null
       };
     }
+    const extremeMin = this.getExtremePriceMinConfig();
+    const extremeMax = this.getExtremePriceMaxConfig(extremeMin);
+    const wideSpreadThreshold = this.getWideSpreadThresholdConfig();
 
     const yesBook = await this.fetchSideBook(candidate.slug, "YES", candidate.yesTokenId);
     if (!yesBook.bookable) {
@@ -180,9 +227,11 @@ export class Btc5mSelector {
         reason:
           yesBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
             ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES
+            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES,
+        filteredOut: null
       };
     }
+    const yesAsk = sanitizePrice(yesBook.book.bestAsk);
 
     const noBook = await this.fetchSideBook(candidate.slug, "NO", candidate.noTokenId);
     if (!noBook.bookable) {
@@ -191,7 +240,82 @@ export class Btc5mSelector {
         reason:
           noBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
             ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
+            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO,
+        filteredOut: null
+      };
+    }
+    const noAsk = sanitizePrice(noBook.book.bestAsk);
+    const yesSpread = sanitizeSpread(yesBook.book.spread);
+    const noSpread = sanitizeSpread(noBook.book.spread);
+
+    const invalidQuoteHit =
+      yesAsk === null ||
+      noAsk === null ||
+      yesSpread === null ||
+      noSpread === null ||
+      !Number.isFinite(yesAsk) ||
+      !Number.isFinite(noAsk) ||
+      !Number.isFinite(yesSpread) ||
+      !Number.isFinite(noSpread);
+    if (invalidQuoteHit) {
+      this.logCandidateSkip({
+        candidate,
+        skipReason: "INVALID_QUOTE",
+        extremeMin,
+        extremeMax,
+        yesAsk,
+        noAsk,
+        yesSpread,
+        noSpread,
+        wideSpreadThreshold
+      });
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        filteredOut: "INVALID"
+      };
+    }
+
+    const extremeHit =
+      yesAsk >= extremeMax || yesAsk <= extremeMin || noAsk >= extremeMax || noAsk <= extremeMin;
+    if (extremeHit) {
+      this.logCandidateSkip({
+        candidate,
+        skipReason: "EXTREME_BOOK",
+        extremeMin,
+        extremeMax,
+        yesAsk,
+        noAsk,
+        yesSpread,
+        noSpread,
+        wideSpreadThreshold
+      });
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        filteredOut: "EXTREME"
+      };
+    }
+
+    const wideSpreadHit =
+      (yesSpread !== null && Number.isFinite(yesSpread) && yesSpread >= wideSpreadThreshold) ||
+      (noSpread !== null && Number.isFinite(noSpread) && noSpread >= wideSpreadThreshold);
+    if (wideSpreadHit) {
+      this.logCandidateSkip({
+        candidate,
+        skipReason: "WIDE_SPREAD",
+        extremeMin,
+        extremeMax,
+        yesAsk,
+        noAsk,
+        yesSpread,
+        noSpread,
+        wideSpreadThreshold
+      });
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        filteredOut: "WIDE_SPREAD"
       };
     }
 
@@ -204,8 +328,57 @@ export class Btc5mSelector {
         noBook: noBook.book,
         orderbookOk: true
       },
-      reason: "OK"
+      reason: "OK",
+      filteredOut: null
     };
+  }
+
+  private logCandidateSkip(
+    input: {
+      candidate: Omit<Btc5mSelectedMarket, "chosenSide" | "selectedTokenId" | "orderbookOk">;
+      skipReason: "EXTREME_BOOK" | "WIDE_SPREAD" | "INVALID_QUOTE";
+      extremeMin: number;
+      extremeMax: number;
+      yesAsk: number | null;
+      noAsk: number | null;
+      yesSpread: number | null;
+      noSpread: number | null;
+      wideSpreadThreshold: number;
+    }
+  ): void {
+    this.logger.warn(
+      {
+        marketId: input.candidate.marketId,
+        slug: input.candidate.slug,
+        skipReason: input.skipReason,
+        extremePriceMin: input.extremeMin,
+        extremePriceMax: input.extremeMax,
+        yesAsk: input.yesAsk,
+        noAsk: input.noAsk,
+        yesSpread: input.yesSpread,
+        noSpread: input.noSpread,
+        wideSpreadThreshold: input.wideSpreadThreshold
+      },
+      "POLY_V2_SELECTOR_SKIP"
+    );
+  }
+
+  private getExtremePriceMinConfig(): number {
+    const raw = Number(process.env.POLYMARKET_LIVE_EXTREME_PRICE_MIN || 0.05);
+    if (!Number.isFinite(raw)) return 0.05;
+    return clamp(raw, 0.0001, 0.99);
+  }
+
+  private getExtremePriceMaxConfig(extremeMin: number): number {
+    const raw = Number(process.env.POLYMARKET_LIVE_EXTREME_PRICE_MAX || 0.95);
+    if (!Number.isFinite(raw)) return clamp(0.95, extremeMin, 0.9999);
+    return clamp(raw, extremeMin, 0.9999);
+  }
+
+  private getWideSpreadThresholdConfig(): number {
+    const raw = Number(process.env.POLYMARKET_LIVE_SELECTOR_WIDE_SPREAD_MAX || 0.2);
+    if (!Number.isFinite(raw)) return 0.2;
+    return clamp(raw, 0.001, 1);
   }
 
   private async normalizeCandidate(
@@ -493,6 +666,16 @@ function sanitizePrice(value: unknown): number | null {
   const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
   if (!Number.isFinite(numeric) || numeric <= 0) return null;
   return numeric;
+}
+
+function sanitizeSpread(value: unknown): number | null {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return numeric;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function normalizeErrorReason(error: unknown): string {

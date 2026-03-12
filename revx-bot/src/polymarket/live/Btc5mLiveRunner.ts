@@ -42,6 +42,22 @@ type RuntimeState = {
   lastUpdateTs: number;
   entriesInWindow: number;
   realizedPnlUsd: number;
+  pUpModel: number | null;
+  bestEdge: number | null;
+  yesEdge: number | null;
+  noEdge: number | null;
+  candidatesBeforeFilter: number;
+  candidatesAfterFilter: number;
+  droppedExtreme: number;
+  droppedWideSpread: number;
+  droppedInvalid: number;
+  selectionVersion: number;
+  selectionCommitEpoch: number | null;
+  dispatchValidationBucket: string | null;
+  dispatchValidationRemainingSec: number | null;
+  dispatchEligibilityReason: string | null;
+  reselectionTriggered: boolean;
+  handoffWaitTriggered: boolean;
 };
 
 type RunnerExecutionState = "IDLE" | "ENTRY_PENDING" | "POSITION_OPEN" | "EXIT_PENDING" | "COOLDOWN";
@@ -107,6 +123,14 @@ type ReferenceOracle = {
   source: string;
 };
 
+type DispatchSelectionValidation = {
+  tick: Btc5mTick;
+  selected: Btc5mSelectedMarket | null;
+  dispatchEligibilityReason: string;
+  reselectionTriggered: boolean;
+  handoffWaitTriggered: boolean;
+};
+
 export class Btc5mLiveRunner {
   private readonly client: PolymarketClient;
   private readonly execution: PolymarketExecution;
@@ -138,6 +162,8 @@ export class Btc5mLiveRunner {
   private lastRolloverTs = 0;
   private lastProfitPollTs = 0;
   private readonly windowEntryStateBySlug = new Map<string, WindowEntryState>();
+  private selectionVersion = 0;
+  private selectionCommitEpochSec: number | null = null;
   private state: RuntimeState = {
     running: false,
     fetchOk: false,
@@ -160,7 +186,23 @@ export class Btc5mLiveRunner {
     lastDecisionTs: 0,
     lastUpdateTs: 0,
     entriesInWindow: 0,
-    realizedPnlUsd: 0
+    realizedPnlUsd: 0,
+    pUpModel: null,
+    bestEdge: null,
+    yesEdge: null,
+    noEdge: null,
+    candidatesBeforeFilter: 0,
+    candidatesAfterFilter: 0,
+    droppedExtreme: 0,
+    droppedWideSpread: 0,
+    droppedInvalid: 0,
+    selectionVersion: 0,
+    selectionCommitEpoch: null,
+    dispatchValidationBucket: null,
+    dispatchValidationRemainingSec: null,
+    dispatchEligibilityReason: null,
+    reselectionTriggered: false,
+    handoffWaitTriggered: false
   };
 
   constructor(
@@ -176,7 +218,7 @@ export class Btc5mLiveRunner {
     this.risk = new PolymarketRisk(config, logger);
     this.sizing = new Sizing(config);
     this.selector = new Btc5mSelector(config, logger, this.client);
-    this.gate = new Btc5mExecutionGate(config);
+    this.gate = new Btc5mExecutionGate(config, logger);
   }
 
   async start(): Promise<void> {
@@ -191,6 +233,33 @@ export class Btc5mLiveRunner {
     this.state.lastFetchErr = "STARTING";
     this.state.entriesInWindow = 0;
     this.state.realizedPnlUsd = 0;
+    this.state.pUpModel = null;
+    this.state.bestEdge = null;
+    this.state.yesEdge = null;
+    this.state.noEdge = null;
+    this.state.candidatesBeforeFilter = 0;
+    this.state.candidatesAfterFilter = 0;
+    this.state.droppedExtreme = 0;
+    this.state.droppedWideSpread = 0;
+    this.state.droppedInvalid = 0;
+    this.selectionVersion = 0;
+    this.selectionCommitEpochSec = null;
+    this.state.selectionVersion = 0;
+    this.state.selectionCommitEpoch = null;
+    this.state.dispatchValidationBucket = null;
+    this.state.dispatchValidationRemainingSec = null;
+    this.state.dispatchEligibilityReason = null;
+    this.state.reselectionTriggered = false;
+    this.state.handoffWaitTriggered = false;
+    this.logger.warn(
+      {
+        minEdgeThresholdConfig: this.config.polymarket.live.minEdgeThreshold,
+        maxSpreadConfig: this.config.polymarket.live.maxSpread,
+        minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
+        enableNoSide: this.config.polymarket.live.enableNoSide
+      },
+      "POLY_V2_LIVE_GATE_CONFIG"
+    );
     this.transitionExecutionState("IDLE", "RUNNER_START");
     this.firstTickPromise = new Promise<void>((resolve) => {
       this.firstTickResolve = resolve;
@@ -301,7 +370,23 @@ export class Btc5mLiveRunner {
       lastDiscoverySuccessTs: this.state.lastFetchOkTs || null,
       lastDecisionTs: this.state.lastDecisionTs || null,
       lastSelectedMarketTs: this.state.lastDecisionTs || null,
-      threshold: this.config.polymarket.live.minEdgeThreshold,
+      minEdgeThresholdConfig: this.config.polymarket.live.minEdgeThreshold,
+      pUpModel: this.state.pUpModel,
+      bestEdge: this.state.bestEdge,
+      yesEdge: this.state.yesEdge,
+      noEdge: this.state.noEdge,
+      candidatesBeforeFilter: this.state.candidatesBeforeFilter,
+      candidatesAfterFilter: this.state.candidatesAfterFilter,
+      droppedExtreme: this.state.droppedExtreme,
+      droppedWideSpread: this.state.droppedWideSpread,
+      droppedInvalid: this.state.droppedInvalid,
+      selectionVersion: this.state.selectionVersion,
+      selectionCommitEpoch: this.state.selectionCommitEpoch,
+      dispatchValidationBucket: this.state.dispatchValidationBucket,
+      dispatchValidationRemainingSec: this.state.dispatchValidationRemainingSec,
+      dispatchEligibilityReason: this.state.dispatchEligibilityReason,
+      reselectionTriggered: this.state.reselectionTriggered,
+      handoffWaitTriggered: this.state.handoffWaitTriggered,
       currentBtcMid: null,
       minVenueShares: this.getMinVenueShares(),
       desiredShares: null,
@@ -367,11 +452,18 @@ export class Btc5mLiveRunner {
       resolutionErrorCount: 0,
       resolutionQueueCount: 0,
       selection: {
-        finalCandidatesCount: this.state.selectedSlug ? 1 : 0,
-        discoveredCandidatesCount: this.state.selectedSlug ? 1 : 0,
-        windowsCount: this.state.selectedSlug ? 1 : 0,
+        finalCandidatesCount: this.state.candidatesAfterFilter,
+        discoveredCandidatesCount: this.state.candidatesBeforeFilter,
+        windowsCount: this.state.candidatesAfterFilter,
         selectedSlug: this.state.selectedSlug,
         selectedMarketId: null,
+        selectionVersion: this.state.selectionVersion,
+        selectionCommitEpoch: this.state.selectionCommitEpoch,
+        dispatchValidationBucket: this.state.dispatchValidationBucket,
+        dispatchValidationRemainingSec: this.state.dispatchValidationRemainingSec,
+        dispatchEligibilityReason: this.state.dispatchEligibilityReason,
+        reselectionTriggered: this.state.reselectionTriggered,
+        handoffWaitTriggered: this.state.handoffWaitTriggered,
         windowStartTs: this.state.currentBucketStartSec !== null ? this.state.currentBucketStartSec * 1000 : null,
         windowEndTs:
           this.state.currentBucketStartSec !== null ? (this.state.currentBucketStartSec + 300) * 1000 : null,
@@ -435,6 +527,11 @@ export class Btc5mLiveRunner {
     this.state.tickNowSec = tick.tickNowSec;
     this.state.lastFetchAttemptTs = tick.tickNowMs;
     this.state.lastUpdateTs = tick.tickNowMs;
+    this.state.dispatchValidationBucket = tick.currentSlug;
+    this.state.dispatchValidationRemainingSec = tick.remainingSec;
+    this.state.dispatchEligibilityReason = null;
+    this.state.reselectionTriggered = false;
+    this.state.handoffWaitTriggered = false;
     if (this.previousCurrentSlug && this.previousCurrentSlug !== tick.currentSlug) {
       this.logger.warn(
         {
@@ -445,6 +542,7 @@ export class Btc5mLiveRunner {
         "POLY_V2_MARKET_ROLLOVER"
       );
       this.lastRolloverTs = tick.tickNowMs;
+      this.invalidateSelectionCommit("ROLLOVER");
       this.invalidateExecutionAttempt("ROLLOVER", {
         currentSlug: tick.currentSlug,
         selectedSlug: this.activeExecutionAttempt?.selectedSlug ?? null
@@ -475,6 +573,10 @@ export class Btc5mLiveRunner {
       this.state.holdReason = tickInvariant.reason;
       this.state.blockedBy = tickInvariant.reason;
       this.state.warningState = "INVARIANT";
+      this.state.pUpModel = null;
+      this.state.bestEdge = null;
+      this.state.yesEdge = null;
+      this.state.noEdge = null;
       this.logInvariantBroken(tick, tickInvariant.reason, {});
       this.logDecision({
         edge: Number.NaN,
@@ -503,6 +605,9 @@ export class Btc5mLiveRunner {
       return;
     }
 
+    if (this.state.warningState === "DISCOVERY_STALE") {
+      this.invalidateSelectionCommit("DISCOVERY_STALE");
+    }
     const reference = this.getReferencePrice(tick.tickNowMs);
     this.logger.warn(
       {
@@ -519,6 +624,11 @@ export class Btc5mLiveRunner {
     });
     const selected = selectionResult.selected;
     const selectionReason = String(selectionResult.reason || BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS);
+    this.state.candidatesBeforeFilter = Math.max(0, Math.floor(Number(selectionResult.candidatesBeforeFilter || 0)));
+    this.state.candidatesAfterFilter = Math.max(0, Math.floor(Number(selectionResult.candidatesAfterFilter || 0)));
+    this.state.droppedExtreme = Math.max(0, Math.floor(Number(selectionResult.droppedExtreme || 0)));
+    this.state.droppedWideSpread = Math.max(0, Math.floor(Number(selectionResult.droppedWideSpread || 0)));
+    this.state.droppedInvalid = Math.max(0, Math.floor(Number(selectionResult.droppedInvalid || 0)));
     const networkFailure = selectionReason === BTC5M_SELECTOR_REASONS.NETWORK_ERROR;
     this.state.fetchOk = !networkFailure;
     if (this.state.fetchOk) {
@@ -536,13 +646,20 @@ export class Btc5mLiveRunner {
         noTokenId: selected?.noTokenId ?? null,
         reason: selectionReason,
         remainingSec: selected?.remainingSec ?? tick.remainingSec,
-        attemptedSlugs: selectionResult.attemptedSlugs ?? []
+        attemptedSlugs: selectionResult.attemptedSlugs ?? [],
+        candidatesBeforeFilter: this.state.candidatesBeforeFilter,
+        candidatesAfterFilter: this.state.candidatesAfterFilter,
+        droppedExtreme: this.state.droppedExtreme,
+        droppedWideSpread: this.state.droppedWideSpread,
+        droppedInvalid: this.state.droppedInvalid,
+        selectionVersion: this.selectionVersion
       },
       "POLY_V2_SELECTOR_RESULT"
     );
 
     if (!selected) {
       const blocker = selectionReason;
+      this.invalidateSelectionCommit(blocker);
       this.state.selectedSlug = null;
       this.state.selectedTokenId = null;
       this.state.chosenSide = null;
@@ -555,6 +672,10 @@ export class Btc5mLiveRunner {
         selectedSlug: null
       });
       this.state.warningState = blocker === BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS ? null : blocker;
+      this.state.pUpModel = null;
+      this.state.bestEdge = null;
+      this.state.yesEdge = null;
+      this.state.noEdge = null;
       this.logDecision({
         edge: Number.NaN,
         yesEdge: Number.NaN,
@@ -584,6 +705,7 @@ export class Btc5mLiveRunner {
 
     const selectedInvariant = this.validateSelectionInvariant(tick, selected);
     if (!selectedInvariant.ok) {
+      this.invalidateSelectionCommit(selectedInvariant.reason);
       this.state.selectedSlug = selected.slug;
       this.state.selectedTokenId = null;
       this.state.chosenSide = null;
@@ -594,6 +716,10 @@ export class Btc5mLiveRunner {
       this.state.holdReason = selectedInvariant.reason;
       this.state.blockedBy = selectedInvariant.reason;
       this.state.warningState = "INVARIANT";
+      this.state.pUpModel = null;
+      this.state.bestEdge = null;
+      this.state.yesEdge = null;
+      this.state.noEdge = null;
       this.logInvariantBroken(tick, selectedInvariant.reason, {
         selectedSlug: selected.slug,
         selectedTokenId: selected.selectedTokenId,
@@ -625,19 +751,114 @@ export class Btc5mLiveRunner {
       this.refreshExecutionState(null);
       return;
     }
-    this.syncWindowEntryState(selected.slug, selected.marketId, tick.tickNowMs);
-    if (this.activeExecutionAttempt && this.activeExecutionAttempt.executionSlug !== selected.slug) {
+    const dispatchValidationStartVersion = this.selectionVersion;
+    let dispatchValidation = await this.validateSelectionForDispatch({
+      selected,
+      tick,
+      expectedSelectionVersion: dispatchValidationStartVersion
+    });
+    if (
+      this.selectionVersion !== dispatchValidationStartVersion &&
+      dispatchValidation.dispatchEligibilityReason === "ELIGIBLE_CURRENT"
+    ) {
+      dispatchValidation = {
+        ...dispatchValidation,
+        dispatchEligibilityReason: "SELECTION_VERSION_MISMATCH",
+        handoffWaitTriggered: true
+      };
+    }
+    this.state.dispatchValidationBucket = dispatchValidation.tick.currentSlug;
+    this.state.dispatchValidationRemainingSec = dispatchValidation.tick.remainingSec;
+    this.state.dispatchEligibilityReason = dispatchValidation.dispatchEligibilityReason;
+    this.state.reselectionTriggered = dispatchValidation.reselectionTriggered;
+    this.state.handoffWaitTriggered = dispatchValidation.handoffWaitTriggered;
+
+    if (dispatchValidation.dispatchEligibilityReason !== "ELIGIBLE_CURRENT" || !dispatchValidation.selected) {
+      const holdTick = dispatchValidation.tick;
+      const holdSelected = dispatchValidation.selected;
+      this.state.selectedSlug = holdSelected?.slug ?? null;
+      this.state.selectedTokenId = null;
+      this.state.chosenSide = null;
+      this.state.chosenDirection = null;
+      this.state.entriesInWindow = holdSelected ? this.getWindowEntryState(holdSelected.slug).entries : 0;
+      this.state.realizedPnlUsd = holdSelected ? this.getWindowEntryState(holdSelected.slug).realizedPnlUsd : 0;
+      this.state.pUpModel = null;
+      this.state.bestEdge = null;
+      this.state.yesEdge = null;
+      this.state.noEdge = null;
+      const normalizedDispatchHoldReason = this.normalizeDispatchHoldReason(dispatchValidation.dispatchEligibilityReason);
+      this.logger.warn(
+        {
+          action: "HOLD",
+          chosenSide: null,
+          tokenId: null,
+          blocker: normalizedDispatchHoldReason,
+          edge: null,
+          remainingSec: holdTick.remainingSec,
+          selectionVersion: this.selectionVersion,
+          dispatchValidationBucket: this.state.dispatchValidationBucket,
+          dispatchValidationRemainingSec: this.state.dispatchValidationRemainingSec,
+          dispatchEligibilityReason: this.state.dispatchEligibilityReason,
+          reselectionTriggered: this.state.reselectionTriggered,
+          handoffWaitTriggered: this.state.handoffWaitTriggered
+        },
+        "POLY_V2_ACTION_DISPATCH"
+      );
+      this.applyHoldReason({
+        reason: normalizedDispatchHoldReason,
+        tick: holdTick,
+        selectedSlug: holdSelected?.slug ?? null
+      });
+      this.state.warningState = normalizedDispatchHoldReason;
+      this.state.lastDecisionTs = holdTick.tickNowMs;
+      this.logDecision({
+        edge: Number.NaN,
+        yesEdge: Number.NaN,
+        noEdge: Number.NaN,
+        pUpModel: null,
+        intelligenceSource: "NONE",
+        intelligencePosture: null,
+        intelligenceScore: null,
+        threshold: this.config.polymarket.live.minEdgeThreshold,
+        spread: Number.NaN,
+        yesSpread: holdSelected ? Number(holdSelected.yesBook.spread) : Number.NaN,
+        noSpread: holdSelected ? Number(holdSelected.noBook.spread) : Number.NaN,
+        maxSpread: this.config.polymarket.live.maxSpread,
+        remainingSec: holdTick.remainingSec,
+        minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
+        oracleAgeMs: reference.ageMs,
+        blocker: normalizedDispatchHoldReason,
+        blockerSeverity: "hard",
+        warning: null,
+        chosenSide: null,
+        action: "HOLD"
+      });
+      this.pushRecentTick({
+        tickNowSec: holdTick.tickNowSec,
+        selectedSlug: holdSelected?.slug ?? null,
+        action: "HOLD",
+        blocker: normalizedDispatchHoldReason
+      });
+      this.refreshExecutionState(holdSelected ?? null);
+      return;
+    }
+
+    const tickForCycle = dispatchValidation.tick;
+    const selectedForCycle = dispatchValidation.selected;
+
+    this.syncWindowEntryState(selectedForCycle.slug, selectedForCycle.marketId, tickForCycle.tickNowMs);
+    if (this.activeExecutionAttempt && this.activeExecutionAttempt.executionSlug !== selectedForCycle.slug) {
       this.invalidateExecutionAttempt("SUPERSEDED", {
-        currentSlug: tick.currentSlug,
-        selectedSlug: selected.slug
+        currentSlug: tickForCycle.currentSlug,
+        selectedSlug: selectedForCycle.slug
       });
     }
 
     const intelligence = this.resolveDirectionalIntelligence({
-      nowMs: tick.tickNowMs,
+      nowMs: tickForCycle.tickNowMs,
       referencePrice: reference.price,
-      priceToBeat: selected.priceToBeat,
-      fallbackMid: selected.yesBook.mid
+      priceToBeat: selectedForCycle.priceToBeat,
+      fallbackMid: selectedForCycle.yesBook.mid
     });
     if (intelligence.fallbackUsed) {
       this.logger.warn(
@@ -645,15 +866,15 @@ export class Btc5mLiveRunner {
           source: intelligence.source,
           pUpModel: intelligence.pUpModel,
           referencePrice: reference.price,
-          priceToBeat: selected.priceToBeat
+          priceToBeat: selectedForCycle.priceToBeat
         },
         "POLY_V2_INTEL_FALLBACK"
       );
     }
 
     const decision = this.gate.evaluate({
-      tick,
-      selected,
+      tick: tickForCycle,
+      selected: selectedForCycle,
       intelligence,
       oracleAgeMs: reference.ageMs
     });
@@ -663,8 +884,8 @@ export class Btc5mLiveRunner {
         maxSpreadConfig: this.config.polymarket.live.maxSpread,
         yesSpread: Number.isFinite(decision.yesSpread) ? decision.yesSpread : null,
         noSpread: Number.isFinite(decision.noSpread) ? decision.noSpread : null,
-        yesAsk: selected.yesBook.bestAsk,
-        noAsk: selected.noBook.bestAsk,
+        yesAsk: selectedForCycle.yesBook.bestAsk,
+        noAsk: selectedForCycle.noBook.bestAsk,
         pUpModel: Number.isFinite(Number(decision.pUpModel)) ? Number(decision.pUpModel) : null,
         yesEdge: Number.isFinite(decision.yesEdge) ? decision.yesEdge : null,
         noEdge: Number.isFinite(decision.noEdge) ? decision.noEdge : null,
@@ -673,15 +894,15 @@ export class Btc5mLiveRunner {
       "POLY_V2_GATE_INPUTS"
     );
     const profitTakeDispatch = await this.maybeDispatchProfitTake({
-      tick,
-      selected,
+      tick: tickForCycle,
+      selected: selectedForCycle,
       allowExecution
     });
     const executionDispatch = profitTakeDispatch
       ? { action: "HOLD" as const, blocker: profitTakeDispatch }
       : await this.dispatchExecutionAttempt({
-          tick,
-          selected,
+          tick: tickForCycle,
+          selected: selectedForCycle,
           decision,
           allowExecution
         });
@@ -690,7 +911,7 @@ export class Btc5mLiveRunner {
     const finalBlocker = executionDispatch.blocker;
     const chosenSide = decision.chosenSide;
     const dispatchTokenId =
-      chosenSide === "YES" ? selected.yesTokenId : chosenSide === "NO" ? selected.noTokenId : null;
+      chosenSide === "YES" ? selectedForCycle.yesTokenId : chosenSide === "NO" ? selectedForCycle.noTokenId : null;
     this.logger.warn(
       {
         action: finalAction,
@@ -698,32 +919,43 @@ export class Btc5mLiveRunner {
         tokenId: dispatchTokenId,
         blocker: finalBlocker,
         edge: Number.isFinite(decision.edge) ? decision.edge : null,
-        remainingSec: decision.remainingSec
+        remainingSec: decision.remainingSec,
+        selectionVersion: this.selectionVersion,
+        dispatchValidationBucket: this.state.dispatchValidationBucket,
+        dispatchValidationRemainingSec: this.state.dispatchValidationRemainingSec,
+        dispatchEligibilityReason: this.state.dispatchEligibilityReason,
+        reselectionTriggered: this.state.reselectionTriggered,
+        handoffWaitTriggered: this.state.handoffWaitTriggered
       },
       "POLY_V2_ACTION_DISPATCH"
     );
     this.logDecisionBreakdown({
       intelligence,
       decision,
-      selected,
-      tick,
+      selected: selectedForCycle,
+      tick: tickForCycle,
       finalChosenSide: chosenSide,
       finalAction
     });
     const selectedTokenId =
-      chosenSide === "YES" ? selected.yesTokenId : chosenSide === "NO" ? selected.noTokenId : null;
-    const windowState = this.getWindowEntryState(selected.slug);
-    this.state.selectedSlug = selected.slug;
+      chosenSide === "YES" ? selectedForCycle.yesTokenId : chosenSide === "NO" ? selectedForCycle.noTokenId : null;
+    const windowState = this.getWindowEntryState(selectedForCycle.slug);
+    this.commitSelectionVersion(selectedForCycle.slug, tickForCycle.currentBucketStartSec);
+    this.state.selectedSlug = selectedForCycle.slug;
     this.state.selectedTokenId = selectedTokenId;
     this.state.chosenSide = chosenSide;
     this.state.chosenDirection = chosenSide ? chosenDirectionForSide(chosenSide) : null;
     this.state.entriesInWindow = windowState.entries;
     this.state.realizedPnlUsd = windowState.realizedPnlUsd;
+    this.state.pUpModel = Number.isFinite(Number(decision.pUpModel)) ? Number(decision.pUpModel) : null;
+    this.state.bestEdge = Number.isFinite(decision.edge) ? decision.edge : null;
+    this.state.yesEdge = Number.isFinite(decision.yesEdge) ? decision.yesEdge : null;
+    this.state.noEdge = Number.isFinite(decision.noEdge) ? decision.noEdge : null;
     if (finalAction === "HOLD") {
       this.applyHoldReason({
         reason: finalBlocker || "HOLD",
-        tick,
-        selectedSlug: selected.slug
+        tick: tickForCycle,
+        selectedSlug: selectedForCycle.slug
       });
     } else {
       this.state.action = finalAction;
@@ -731,7 +963,7 @@ export class Btc5mLiveRunner {
       this.state.blockedBy = null;
     }
     this.state.warningState = finalAction === "HOLD" ? finalBlocker : decision.warning;
-    this.state.lastDecisionTs = tick.tickNowMs;
+    this.state.lastDecisionTs = tickForCycle.tickNowMs;
 
     this.logDecision({
       edge: decision.edge,
@@ -756,14 +988,14 @@ export class Btc5mLiveRunner {
       action: finalAction
     });
     this.pushRecentTick({
-      tickNowSec: tick.tickNowSec,
-      selectedSlug: selected.slug,
+      tickNowSec: tickForCycle.tickNowSec,
+      selectedSlug: selectedForCycle.slug,
       selectedTokenId,
       side: chosenSide,
       action: finalAction,
       blocker: finalBlocker
     });
-    this.refreshExecutionState(selected);
+    this.refreshExecutionState(selectedForCycle);
   }
 
   private async dispatchExecutionAttempt(input: {
@@ -780,6 +1012,12 @@ export class Btc5mLiveRunner {
     }
     if (!this.canMutateVenueState()) {
       return { action: "HOLD", blocker: "LIVE_EXECUTION_DISABLED" };
+    }
+    if (!this.isSelectedBookExecutable(input.selected)) {
+      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
+    }
+    if (input.tick.remainingSec <= 0) {
+      return { action: "HOLD", blocker: "PREORDER_STALE_MARKET_SELECTION" };
     }
     if (Date.now() < this.executionCooldownUntilTs) {
       return { action: "HOLD", blocker: "EXECUTION_COOLDOWN" };
@@ -1637,6 +1875,12 @@ export class Btc5mLiveRunner {
     return Math.max(0, Math.min(30_000, Math.floor(envValue)));
   }
 
+  private getNextBucketHandoffWaitSec(): number {
+    const envValue = Number(process.env.POLY_V2_NEXT_BUCKET_HANDOFF_WAIT_SEC || 12);
+    if (!Number.isFinite(envValue)) return 12;
+    return Math.max(0, Math.min(120, Math.floor(envValue)));
+  }
+
   private getWindowEntryState(slug: string): WindowEntryState {
     const existing = this.windowEntryStateBySlug.get(slug);
     if (existing) return existing;
@@ -2103,6 +2347,126 @@ export class Btc5mLiveRunner {
       return { ok: false, reason: "SELECTED_TOKEN_NOT_EXECUTABLE" };
     }
     return { ok: true };
+  }
+
+  private async validateSelectionForDispatch(input: {
+    selected: Btc5mSelectedMarket;
+    tick: Btc5mTick;
+    expectedSelectionVersion: number;
+  }): Promise<DispatchSelectionValidation> {
+    const dispatchTick = deriveBtc5mTickContext(Date.now());
+    let selected: Btc5mSelectedMarket | null = input.selected;
+    let reselectionTriggered = false;
+    let dispatchEligibilityReason = this.computeDispatchEligibilityReason(selected, dispatchTick);
+    if (this.selectionVersion !== input.expectedSelectionVersion) {
+      dispatchEligibilityReason = "SELECTION_VERSION_MISMATCH";
+    }
+    const shouldReselect =
+      this.state.warningState === "DISCOVERY_STALE" ||
+      dispatchEligibilityReason === "PREORDER_STALE_MARKET_SELECTION" ||
+      dispatchEligibilityReason === "EXPIRED_WINDOW" ||
+      dispatchEligibilityReason === "SELECTED_TOKEN_NOT_EXECUTABLE" ||
+      dispatchEligibilityReason === "SELECTION_VERSION_MISMATCH";
+
+    if (shouldReselect) {
+      reselectionTriggered = true;
+      const reselection = await this.selector.select({ tick: dispatchTick });
+      selected = reselection.selected;
+      dispatchEligibilityReason = selected
+        ? this.computeDispatchEligibilityReason(selected, dispatchTick)
+        : String(reselection.reason || BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS);
+      this.logger.warn(
+        {
+          previousSelectedSlug: input.selected.slug,
+          reselectedSlug: selected?.slug ?? null,
+          dispatchValidationBucket: dispatchTick.currentSlug,
+          dispatchValidationRemainingSec: dispatchTick.remainingSec,
+          dispatchEligibilityReason,
+          reselectionTriggered: true
+        },
+        "POLY_V2_DISPATCH_RESELECTION"
+      );
+    }
+
+    if (this.selectionVersion !== input.expectedSelectionVersion && dispatchEligibilityReason === "ELIGIBLE_CURRENT") {
+      dispatchEligibilityReason = "SELECTION_VERSION_MISMATCH";
+    }
+    dispatchEligibilityReason = this.normalizeDispatchHoldReason(dispatchEligibilityReason);
+
+    const handoffWaitTriggered = dispatchEligibilityReason === "NEXT_BUCKET_HANDOFF_WAIT";
+    return {
+      tick: dispatchTick,
+      selected,
+      dispatchEligibilityReason,
+      reselectionTriggered,
+      handoffWaitTriggered
+    };
+  }
+
+  private computeDispatchEligibilityReason(selected: Btc5mSelectedMarket | null, tick: Btc5mTick): string {
+    if (!selected) return BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS;
+    if (!this.isSelectedBookExecutable(selected)) return "SELECTED_TOKEN_NOT_EXECUTABLE";
+    if (selected.slug === tick.currentSlug) {
+      if (tick.remainingSec <= 0 || selected.remainingSec <= 0) return "EXPIRED_WINDOW";
+      return "ELIGIBLE_CURRENT";
+    }
+    if (selected.slug === tick.nextSlug) {
+      if (tick.remainingSec <= this.getNextBucketHandoffWaitSec()) return "NEXT_BUCKET_HANDOFF_WAIT";
+      return "PREORDER_STALE_MARKET_SELECTION";
+    }
+    return "PREORDER_STALE_MARKET_SELECTION";
+  }
+
+  private normalizeDispatchHoldReason(reason: string): string {
+    if (
+      reason === "PREORDER_STALE_MARKET_SELECTION" ||
+      reason === "EXPIRED_WINDOW" ||
+      reason === "SELECTION_VERSION_MISMATCH" ||
+      reason === "SELECTED_TOKEN_NOT_EXECUTABLE"
+    ) {
+      return "NEXT_BUCKET_HANDOFF_WAIT";
+    }
+    return reason;
+  }
+
+  private isSelectedBookExecutable(selected: Btc5mSelectedMarket): boolean {
+    if (
+      !selected.orderbookOk ||
+      !selected.yesTokenId ||
+      !selected.noTokenId ||
+      !selected.yesBook.bookable ||
+      !selected.noBook.bookable
+    ) {
+      return false;
+    }
+    const yesAsk = Number(selected.yesBook.bestAsk);
+    const noAsk = Number(selected.noBook.bestAsk);
+    if (!Number.isFinite(yesAsk) || yesAsk <= 0) return false;
+    if (!Number.isFinite(noAsk) || noAsk <= 0) return false;
+    return true;
+  }
+
+  private invalidateSelectionCommit(reason: string): void {
+    this.selectionCommitEpochSec = null;
+    this.selectionVersion += 1;
+    this.state.selectionVersion = this.selectionVersion;
+    this.state.selectionCommitEpoch = null;
+    this.logger.warn(
+      {
+        reason,
+        selectionVersion: this.selectionVersion
+      },
+      "POLY_V2_SELECTION_INVALIDATED"
+    );
+  }
+
+  private commitSelectionVersion(selectedSlug: string, commitEpochSec: number): void {
+    if (this.selectionCommitEpochSec !== commitEpochSec || this.state.selectedSlug !== selectedSlug) {
+      this.selectionVersion += 1;
+    }
+    this.selectionCommitEpochSec = commitEpochSec;
+    this.state.selectionVersion = this.selectionVersion;
+    this.state.selectionCommitEpoch = commitEpochSec;
   }
 
   private logDecision(input: {

@@ -512,6 +512,273 @@ async function testProfitTakeInflightGating(): Promise<void> {
   );
 }
 
+async function testNextBucketHandoffWaitPreventsDispatch(): Promise<void> {
+  const { runner, logs } = createHarness();
+  const nowMs = 1_773_318_895_000; // 5s remaining in current bucket
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const tick = makeTick(nowMs);
+    const nextSelected = makeSelected(tick, {
+      slug: tick.nextSlug,
+      selectionSource: "next_slug"
+    });
+    (runner as any).selector = {
+      select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => ({
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: nextSelected,
+        reason: "OK"
+      }),
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+    (runner as any).getReferencePrice = () => ({ price: 100_000, ageMs: 100, ts: nowMs, source: "TEST" });
+    (runner as any).resolveDirectionalIntelligence = () => ({
+      source: "TEST",
+      posture: "TEST",
+      score: 0.5,
+      pUpModel: 0.55,
+      fallbackUsed: false
+    });
+    (runner as any).gate = {
+      evaluate: () => makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" })
+    };
+    (runner as any).maybeDispatchProfitTake = async () => null;
+    let dispatchCalls = 0;
+    (runner as any).dispatchExecutionAttempt = async () => {
+      dispatchCalls += 1;
+      return { action: "BUY_YES", blocker: null };
+    };
+
+    await (runner as any).processCycle(true);
+
+    assert(dispatchCalls === 0, "next-handoff: dispatchExecutionAttempt should not be called");
+    assert((runner as any).state.blockedBy === "NEXT_BUCKET_HANDOFF_WAIT", "next-handoff: expected NEXT_BUCKET_HANDOFF_WAIT");
+    assert((runner as any).state.handoffWaitTriggered === true, "next-handoff: expected handoffWaitTriggered=true");
+    assert((runner as any).state.dispatchEligibilityReason === "NEXT_BUCKET_HANDOFF_WAIT", "next-handoff: dispatch eligibility mismatch");
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testStaleSelectionTriggersReselection(): Promise<void> {
+  const { runner } = createHarness();
+  const staleMs = 1_773_318_890_000;
+  const freshMs = staleMs + 20_000;
+  const staleTick = makeTick(staleMs);
+  const staleSelected = makeSelected(staleTick, { slug: staleTick.currentSlug });
+  const freshTick = makeTick(freshMs);
+  let selectorCalls = 0;
+  (runner as any).selector = {
+    select: async ({ tick }: { tick: Btc5mTick }) => {
+      selectorCalls += 1;
+      return {
+        tick,
+        attemptedSlugs: [tick.currentSlug, tick.nextSlug, tick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: makeSelected(tick, { slug: tick.currentSlug }),
+        reason: "OK"
+      };
+    },
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  const originalDateNow = Date.now;
+  Date.now = () => freshMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected: staleSelected,
+      tick: staleTick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(selectorCalls === 1, `stale-reselection: expected selector reselection call once, got ${selectorCalls}`);
+    assert(result.reselectionTriggered === true, "stale-reselection: expected reselectionTriggered=true");
+    assert(result.selected?.slug === freshTick.currentSlug, "stale-reselection: expected fresh current slug after reselection");
+    assert(result.dispatchEligibilityReason === "ELIGIBLE_CURRENT", "stale-reselection: expected ELIGIBLE_CURRENT after reselection");
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testValidatedPathAvoidsExpiredWindowAbortReason(): Promise<void> {
+  const { runner } = createHarness();
+  const staleMs = 1_773_318_890_000;
+  const freshMs = staleMs + 20_000;
+  const staleTick = makeTick(staleMs);
+  const staleSelected = makeSelected(staleTick, { slug: staleTick.currentSlug });
+  (runner as any).selector = {
+    select: async ({ tick }: { tick: Btc5mTick }) => ({
+      tick,
+      attemptedSlugs: [tick.currentSlug, tick.nextSlug, tick.prevSlug],
+      candidatesBeforeFilter: 1,
+      candidatesAfterFilter: 1,
+      droppedExtreme: 0,
+      droppedWideSpread: 0,
+      droppedInvalid: 0,
+      selected: makeSelected(tick, { slug: tick.currentSlug }),
+      reason: "OK"
+    }),
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  const originalDateNow = Date.now;
+  Date.now = () => freshMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected: staleSelected,
+      tick: staleTick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(
+      result.dispatchEligibilityReason !== "EXPIRED_WINDOW",
+      "validated-path: should not return EXPIRED_WINDOW for stale selection race path"
+    );
+    assert(
+      result.dispatchEligibilityReason !== "ORDER_ABORT",
+      "validated-path: should not return ORDER_ABORT in validated selection path"
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testAllCandidatesFilteredEmitsNoViableHold(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_900_000;
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const tick = makeTick(nowMs);
+    (runner as any).selector = {
+      select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => ({
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 3,
+        candidatesAfterFilter: 0,
+        droppedExtreme: 2,
+        droppedWideSpread: 1,
+        droppedInvalid: 0,
+        selected: null,
+        reason: "NO_VIABLE_CANDIDATE_AFTER_FILTER"
+      }),
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+    (runner as any).getReferencePrice = () => ({ price: 100_000, ageMs: 100, ts: nowMs, source: "TEST" });
+    await (runner as any).processCycle(true);
+
+    assert((runner as any).state.selectedSlug === null, "no-viable: selectedSlug should be null");
+    assert((runner as any).state.selectedTokenId === null, "no-viable: selectedTokenId should be null");
+    assert((runner as any).state.action === "HOLD", "no-viable: action should be HOLD");
+    assert(
+      (runner as any).state.blockedBy === "NO_VIABLE_CANDIDATE_AFTER_FILTER",
+      "no-viable: blockedBy should be NO_VIABLE_CANDIDATE_AFTER_FILTER"
+    );
+    assert(
+      (runner as any).state.holdReason === "NO_VIABLE_CANDIDATE_AFTER_FILTER",
+      "no-viable: holdReason should be NO_VIABLE_CANDIDATE_AFTER_FILTER"
+    );
+    assert((runner as any).state.candidatesBeforeFilter === 3, "no-viable: candidatesBeforeFilter mismatch");
+    assert((runner as any).state.candidatesAfterFilter === 0, "no-viable: candidatesAfterFilter mismatch");
+    assert((runner as any).state.droppedExtreme === 2, "no-viable: droppedExtreme mismatch");
+    assert((runner as any).state.droppedWideSpread === 1, "no-viable: droppedWideSpread mismatch");
+    assert((runner as any).state.droppedInvalid === 0, "no-viable: droppedInvalid mismatch");
+    assert(
+      (runner as any).state.dispatchEligibilityReason === null,
+      "no-viable: dispatchEligibilityReason should remain null on pre-dispatch selection failure"
+    );
+    assert(
+      (runner as any).state.selectionVersion > 0,
+      "no-viable: selectionVersion should advance on invalidation path"
+    );
+    assert(
+      (runner as any).state.selectionCommitEpoch === null,
+      "no-viable: selectionCommitEpoch should be null when no candidate committed"
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testSelectionVersionMismatchBlocksDispatch(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_905_000;
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const tick = makeTick(nowMs);
+    const selected = makeSelected(tick);
+    (runner as any).selector = {
+      select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => ({
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected,
+        reason: "OK"
+      }),
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+    (runner as any).getReferencePrice = () => ({ price: 100_000, ageMs: 100, ts: nowMs, source: "TEST" });
+    (runner as any).resolveDirectionalIntelligence = () => ({
+      source: "TEST",
+      posture: "TEST",
+      score: 0.5,
+      pUpModel: 0.55,
+      fallbackUsed: false
+    });
+    (runner as any).gate = {
+      evaluate: () => makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" })
+    };
+    (runner as any).maybeDispatchProfitTake = async () => null;
+    let dispatchCalls = 0;
+    (runner as any).dispatchExecutionAttempt = async () => {
+      dispatchCalls += 1;
+      return { action: "BUY_YES", blocker: null };
+    };
+    (runner as any).validateSelectionForDispatch = async () => {
+      (runner as any).selectionVersion += 1; // introduce mismatch after start version capture
+      return {
+        tick,
+        selected,
+        dispatchEligibilityReason: "ELIGIBLE_CURRENT",
+        reselectionTriggered: false,
+        handoffWaitTriggered: false
+      };
+    };
+
+    await (runner as any).processCycle(true);
+
+    assert(dispatchCalls === 0, "selection-version-mismatch: dispatch should not be called");
+    assert((runner as any).state.action === "HOLD", "selection-version-mismatch: action should be HOLD");
+    assert(
+      (runner as any).state.blockedBy === "NEXT_BUCKET_HANDOFF_WAIT",
+      "selection-version-mismatch: blockedBy should normalize to NEXT_BUCKET_HANDOFF_WAIT"
+    );
+    assert(
+      (runner as any).state.dispatchEligibilityReason === "SELECTION_VERSION_MISMATCH",
+      "selection-version-mismatch: dispatchEligibilityReason should indicate mismatch"
+    );
+    assert((runner as any).state.handoffWaitTriggered === true, "selection-version-mismatch: handoffWaitTriggered should be true");
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
 async function testBlockerNormalizationSnapshot(): Promise<void> {
   const originalMaxEntries = process.env.POLY_V2_MAX_ENTRIES_PER_WINDOW;
   const originalMaxOpenEntry = process.env.POLY_MAX_OPEN_ENTRY_ORDERS_PER_WINDOW;
@@ -649,6 +916,11 @@ export async function runBtc5mLiveRunnerStateMachineTests(): Promise<void> {
     { name: "live placed no fill path", fn: testLivePlacedNoFillPath },
     { name: "manual stop path", fn: testManualStopPath },
     { name: "profit take in-flight gating", fn: testProfitTakeInflightGating },
+    { name: "next-bucket handoff wait prevents dispatch", fn: testNextBucketHandoffWaitPreventsDispatch },
+    { name: "stale selection triggers reselection", fn: testStaleSelectionTriggersReselection },
+    { name: "validated path avoids expired window abort", fn: testValidatedPathAvoidsExpiredWindowAbortReason },
+    { name: "all candidates filtered emits no-viable hold", fn: testAllCandidatesFilteredEmitsNoViableHold },
+    { name: "selection version mismatch blocks dispatch", fn: testSelectionVersionMismatchBlocksDispatch },
     { name: "blocker normalization snapshot", fn: testBlockerNormalizationSnapshot }
   ];
 

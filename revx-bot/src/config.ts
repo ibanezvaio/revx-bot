@@ -48,6 +48,7 @@ export type PolymarketConfig = {
     maxDailyLoss: number;
     maxConcurrentWindows: number;
     minOrderNotional: number;
+    minSharesRequired: number;
   };
   risk: {
     staleMs: number;
@@ -1150,6 +1151,11 @@ export function loadConfig(): BotConfig {
     0.01,
     10_000
   );
+  const polymarketMinSharesRequired = clampInt(
+    numberWithFallback(["POLYMARKET_MIN_SHARES_REQUIRED", "POLYMARKET_LIVE_MIN_VENUE_SHARES"], 5),
+    1,
+    10_000
+  );
 
   const polymarketStaleMs = clampInt(numberWithDefault("POLYMARKET_STALE_MS", 15000), 250, 120_000);
   const polymarketStaleKillAfterMs = clampInt(
@@ -1251,18 +1257,18 @@ export function loadConfig(): BotConfig {
   const polymarketLiveMinEdgeThreshold = clampNumber(
     numberWithFallback(
       [
-        "POLYMARKET_LIVE_MIN_EDGE",
         "POLYMARKET_LIVE_MIN_EDGE_THRESHOLD",
-        "POLY_LIVE_MIN_EDGE",
+        "POLYMARKET_LIVE_MIN_EDGE",
         "POLY_LIVE_MIN_EDGE_THRESHOLD",
+        "POLY_LIVE_MIN_EDGE",
         "POLY_V2_MIN_EDGE_THRESHOLD",
-        "POLYMARKET_MIN_EDGE",
-        "POLYMARKET_MIN_EDGE_THRESHOLD"
+        "POLYMARKET_MIN_EDGE_THRESHOLD",
+        "POLYMARKET_MIN_EDGE"
       ],
-      0.0005
+      0.02
     ),
     0,
-    0.5
+    0.25
   );
   const polymarketLiveEnableNoSide = boolWithDefault("POLYMARKET_LIVE_ENABLE_NO_SIDE", true);
   const polymarketLiveMaxSpread = clampNumber(
@@ -1922,7 +1928,8 @@ export function loadConfig(): BotConfig {
         maxNotionalPerWindow: polymarketEffectiveMaxNotionalPerWindow,
         maxDailyLoss: polymarketEffectiveMaxDailyLoss,
         maxConcurrentWindows: polymarketMaxConcurrentWindows,
-        minOrderNotional: polymarketMinOrderNotional
+        minOrderNotional: polymarketMinOrderNotional,
+        minSharesRequired: polymarketMinSharesRequired
       },
       risk: {
         staleMs: polymarketStaleMs,
