@@ -30,6 +30,7 @@ import { BtcWindowMarket, DecisionLogLine, SpotFeed, SpotVenueTick, StrategyDeci
 import { VolEstimator } from "./VolEstimator";
 import { PaperLedger, getPaperTradeStatus } from "./paper/PaperLedger";
 import { getTradingTruthReporter } from "../logging/truth";
+import { computePolymarketEffectiveSizingBasis, getPolymarketSizingFeeBufferBps } from "./sizingMinimums";
 import {
   applySellSlippage,
   applyTakerSlippage,
@@ -153,7 +154,7 @@ type YesBookSnapshot = {
   topAskSize: number;
   bookTs: number;
 };
-type BookLookupSource = "live" | "cached" | "inferred" | "missing";
+type BookLookupSource = "live" | "cached" | "inferred" | "missing" | "decision";
 type YesBookLookup = YesBookSnapshot & {
   source: BookLookupSource;
   bookable: boolean;
@@ -279,6 +280,20 @@ type PersistedPolymarketSnapshot = {
   finalNotional: number | null;
   sizeBumped: boolean | null;
   lastNormalizedError: string | null;
+  selectionVersion: number;
+  reselectionTriggered: boolean;
+  handoffWaitTriggered: boolean;
+  dispatchEligibilityReason: string | null;
+  candidatesBeforeFilter: number;
+  candidatesAfterFilter: number;
+  droppedExtreme: number;
+  droppedWideSpread: number;
+  droppedInvalid: number;
+  consecutiveExtremeTicks: number;
+  extremeReselectThreshold: number;
+  extremeReselectTriggered: boolean;
+  extremeReselectCooldownSecRemaining: number;
+  extremeReselectTokenId: string | null;
   statusLine: string | null;
 };
 
@@ -435,6 +450,20 @@ function createPersistedPolymarketSnapshot(): PersistedPolymarketSnapshot {
     finalNotional: null,
     sizeBumped: null,
     lastNormalizedError: null,
+    selectionVersion: 0,
+    reselectionTriggered: false,
+    handoffWaitTriggered: false,
+    dispatchEligibilityReason: null,
+    candidatesBeforeFilter: 0,
+    candidatesAfterFilter: 0,
+    droppedExtreme: 0,
+    droppedWideSpread: 0,
+    droppedInvalid: 0,
+    consecutiveExtremeTicks: 0,
+    extremeReselectThreshold: 0,
+    extremeReselectTriggered: false,
+    extremeReselectCooldownSecRemaining: 0,
+    extremeReselectTokenId: null,
     statusLine: null
   };
 }
@@ -564,6 +593,7 @@ export class PolymarketEngine {
   private lastBookFallbackWarningLogTs = 0;
   private lastIntentionalHoldSignature = "";
   private lastIntentionalHoldLogTs = 0;
+  private lastPolyBlockerSummarySignature = "";
   private lastPolyStatusSignature = "";
   private lastPolyRolloverSignature = "";
   private lastUiStatusSignature = "";
@@ -598,6 +628,26 @@ export class PolymarketEngine {
     remainingSec: null
   };
   private selectedTokenIds: string[] = [];
+  private extremeReselectCounter: {
+    slug: string | null;
+    tokenId: string | null;
+    selectionVersion: number;
+    consecutiveTicks: number;
+  } = {
+    slug: null,
+    tokenId: null,
+    selectionVersion: 0,
+    consecutiveTicks: 0
+  };
+  private extremeReselectCooldown: {
+    slug: string | null;
+    tokenId: string | null;
+    untilTs: number;
+  } = {
+    slug: null,
+    tokenId: null,
+    untilTs: 0
+  };
   private truthDataHealth: {
     oracleSource: string | null;
     oracleState: string | null;
@@ -2415,6 +2465,12 @@ export class PolymarketEngine {
     return Math.max(1, Math.floor(envValue));
   }
 
+  private getConfiguredMinSharesRequired(): number {
+    const raw = Number(this.config.polymarket.sizing.minSharesRequired);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    return Math.max(1, Math.floor(raw));
+  }
+
   private evaluateOrderSizingCheck(params: {
     selectedSlug: string | null;
     selectedTokenId: string | null;
@@ -2422,11 +2478,23 @@ export class PolymarketEngine {
     orderPrice: number | null;
     requestedBudget: number | null;
     computedShares: number | null;
+    maxAllowedNotionalForThisDecision?: number | null;
   }): {
     orderPrice: number;
     requestedBudget: number;
     baseTargetNotional: number;
+    originalTargetNotional: number;
+    adjustedTargetNotional: number;
     cappedNotional: number;
+    minValidPriceBasis: number;
+    minValidSizeEffective: number;
+    minValidCostUsdEffective: number;
+    minValidSize: number;
+    minValidCostUsd: number;
+    requiredNotionalForMinValidSize: number;
+    maxAllowedNotionalForThisDecision: number;
+    affordabilityGapNotional: number;
+    notionalAutoStepped: boolean;
     desiredShares: number;
     finalShares: number;
     desiredNotional: number;
@@ -2435,7 +2503,12 @@ export class PolymarketEngine {
     minOrderNotional: number;
     minVenueShares: number;
     sizingCapApplied: boolean;
-    sizingRejectReason: "NONE" | "BELOW_MIN_NOTIONAL" | "BELOW_MIN_SHARES" | "OVER_CAP_ADJUSTED";
+    sizingRejectReason:
+      | "NONE"
+      | "BELOW_MIN_NOTIONAL"
+      | "BELOW_MIN_SHARES"
+      | "OVER_CAP_ADJUSTED"
+      | "MIN_VALID_SIZE_UNAFFORDABLE";
     sizeBumped: boolean;
     clampedToMin: boolean;
     passes: boolean;
@@ -2445,7 +2518,18 @@ export class PolymarketEngine {
         orderPrice: 0,
         requestedBudget: 0,
         baseTargetNotional: 0,
+        originalTargetNotional: 0,
+        adjustedTargetNotional: 0,
         cappedNotional: 0,
+        minValidPriceBasis: 0,
+        minValidSizeEffective: 0,
+        minValidCostUsdEffective: 0,
+        minValidSize: 0,
+        minValidCostUsd: 0,
+        requiredNotionalForMinValidSize: 0,
+        maxAllowedNotionalForThisDecision: 0,
+        affordabilityGapNotional: 0,
+        notionalAutoStepped: false,
         desiredShares: 0,
         finalShares: 0,
         desiredNotional: 0,
@@ -2474,26 +2558,76 @@ export class PolymarketEngine {
         : 0;
     const baseTargetNotionalFromShares = orderPrice > 0 && baseShares > 0 ? baseShares * orderPrice : 0;
     const baseTargetNotional = requestedBudget > 0 ? requestedBudget : baseTargetNotionalFromShares;
+    const originalTargetNotional = baseTargetNotional;
     const maxNotionalPerWindow = Math.max(0, Number(this.config.polymarket.sizing.maxNotionalPerWindow || 0));
-    const cappedNotional = Math.max(0, Math.min(baseTargetNotional, maxNotionalPerWindow));
-    const sizingCapApplied = baseTargetNotional > 0 && cappedNotional + 1e-9 < baseTargetNotional;
+    const maxAllowedNotionalForThisDecision = Math.max(
+      0,
+      Math.min(
+        maxNotionalPerWindow,
+        Number.isFinite(Number(params.maxAllowedNotionalForThisDecision)) && Number(params.maxAllowedNotionalForThisDecision) > 0
+          ? Number(params.maxAllowedNotionalForThisDecision)
+          : maxNotionalPerWindow
+      )
+    );
+    const minOrderNotional = Math.max(0, Number(this.config.polymarket.sizing.minOrderNotional || 0));
+    const minVenueShares = this.config.polymarket.mode === "live" ? this.getLiveMinVenueShares() : 0;
+    const effectiveVenueMinimums = computePolymarketEffectiveSizingBasis({
+      enabled: this.config.polymarket.mode === "live",
+      orderPrice,
+      minVenueShares,
+      minVenueNotionalUsd: minOrderNotional,
+      feeBufferBps: getPolymarketSizingFeeBufferBps()
+    });
+    const minValidSize = effectiveVenueMinimums.minValidSizeEffective;
+    const minValidCostUsd = effectiveVenueMinimums.minValidCostUsdEffective;
+    const shareCostBasis =
+      this.config.polymarket.mode === "live" && effectiveVenueMinimums.minValidPriceBasis > 0
+        ? effectiveVenueMinimums.minValidPriceBasis
+        : orderPrice;
+    const requiredNotionalForMinValidSize =
+      this.config.polymarket.mode === "live"
+        ? effectiveVenueMinimums.minValidCostUsdEffective
+        : minOrderNotional;
+    let adjustedTargetNotional = baseTargetNotional;
+    let notionalAutoStepped = false;
+    if (
+      this.config.polymarket.mode === "live" &&
+      orderPrice > 0 &&
+      adjustedTargetNotional + 1e-9 < requiredNotionalForMinValidSize &&
+      maxAllowedNotionalForThisDecision + 1e-9 >= requiredNotionalForMinValidSize
+    ) {
+      adjustedTargetNotional = requiredNotionalForMinValidSize;
+      notionalAutoStepped = true;
+    }
+    const cappedNotional = Math.max(0, Math.min(adjustedTargetNotional, maxAllowedNotionalForThisDecision));
+    const sizingCapApplied = adjustedTargetNotional > 0 && cappedNotional + 1e-9 < adjustedTargetNotional;
+    const affordabilityGapNotional = Math.max(0, requiredNotionalForMinValidSize - maxAllowedNotionalForThisDecision);
     const desiredShares =
       baseShares > 0
         ? baseShares
-        : orderPrice > 0 && baseTargetNotional > 0
-          ? baseTargetNotional / orderPrice
+        : shareCostBasis > 0 && adjustedTargetNotional > 0
+          ? adjustedTargetNotional / shareCostBasis
           : 0;
-    const desiredNotional = baseTargetNotional;
-    const minOrderNotional = Math.max(0, Number(this.config.polymarket.sizing.minOrderNotional || 0));
-    const minVenueShares = this.config.polymarket.mode === "live" ? this.getLiveMinVenueShares() : 0;
-    const finalShares = orderPrice > 0 && cappedNotional > 0 ? cappedNotional / orderPrice : 0;
+    const desiredNotional = adjustedTargetNotional;
+    const finalShares = shareCostBasis > 0 && cappedNotional > 0 ? cappedNotional / shareCostBasis : 0;
     const finalNotional = cappedNotional;
-    let sizingRejectReason: "NONE" | "BELOW_MIN_NOTIONAL" | "BELOW_MIN_SHARES" | "OVER_CAP_ADJUSTED" = "NONE";
+    let sizingRejectReason:
+      | "NONE"
+      | "BELOW_MIN_NOTIONAL"
+      | "BELOW_MIN_SHARES"
+      | "OVER_CAP_ADJUSTED"
+      | "MIN_VALID_SIZE_UNAFFORDABLE" = "NONE";
     if (!(orderPrice > 0) || !(finalNotional > 0) || !(finalShares > 0)) {
       sizingRejectReason = "BELOW_MIN_NOTIONAL";
+    } else if (
+      this.config.polymarket.mode === "live" &&
+      requiredNotionalForMinValidSize > 0 &&
+      maxAllowedNotionalForThisDecision + 1e-9 < requiredNotionalForMinValidSize
+    ) {
+      sizingRejectReason = "MIN_VALID_SIZE_UNAFFORDABLE";
     } else if (finalNotional + 1e-9 < minOrderNotional) {
       sizingRejectReason = "BELOW_MIN_NOTIONAL";
-    } else if (this.config.polymarket.mode === "live" && finalShares + 1e-9 < minVenueShares) {
+    } else if (this.config.polymarket.mode === "live" && finalShares + 1e-9 < minValidSize) {
       sizingRejectReason = "BELOW_MIN_SHARES";
     } else if (sizingCapApplied) {
       sizingRejectReason = "OVER_CAP_ADJUSTED";
@@ -2508,6 +2642,18 @@ export class PolymarketEngine {
         orderPrice > 0 ? orderPrice.toFixed(4) : "-"
       } requestedBudget=${requestedBudget.toFixed(4)} baseTargetNotional=${baseTargetNotional.toFixed(
         4
+      )} originalTargetNotional=${originalTargetNotional.toFixed(4)} adjustedTargetNotional=${adjustedTargetNotional.toFixed(
+        4
+      )} minValidPriceBasis=${effectiveVenueMinimums.minValidPriceBasis.toFixed(4)} minValidSizeEffective=${effectiveVenueMinimums.minValidSizeEffective.toFixed(
+        6
+      )} minValidCostUsdEffective=${effectiveVenueMinimums.minValidCostUsdEffective.toFixed(
+        4
+      )} minValidSize=${effectiveVenueMinimums.minValidSizeEffective.toFixed(6)} minValidCostUsd=${effectiveVenueMinimums.minValidCostUsdEffective.toFixed(
+        4
+      )} requiredNotionalForMinValidSize=${requiredNotionalForMinValidSize.toFixed(4)} maxAllowedNotionalForThisDecision=${maxAllowedNotionalForThisDecision.toFixed(
+        4
+      )} affordabilityGapNotional=${affordabilityGapNotional.toFixed(4)} notionalAutoStepped=${String(
+        notionalAutoStepped
       )} cappedNotional=${cappedNotional.toFixed(4)} desiredShares=${desiredShares.toFixed(6)} minVenueShares=${String(
         minVenueShares || "-"
       )} finalShares=${finalShares.toFixed(6)} desiredNotional=${desiredNotional.toFixed(
@@ -2518,12 +2664,48 @@ export class PolymarketEngine {
         sizingCapApplied
       )} sizingRejectReason=${sizingRejectReason} passes=${String(passes)}`
     );
+    if (sizingRejectReason !== "NONE") {
+      this.logger.info(
+        `POLY_ORDER_SIZING_REJECT selectedSlug=${String(params.selectedSlug || "-")} selectedTokenId=${String(
+          params.selectedTokenId || "-"
+        )} chosenSide=${String(params.chosenSide || "-")} orderPrice=${
+          orderPrice > 0 ? orderPrice.toFixed(4) : "-"
+        } minValidPriceBasis=${effectiveVenueMinimums.minValidPriceBasis.toFixed(4)} minValidSizeEffective=${effectiveVenueMinimums.minValidSizeEffective.toFixed(
+          6
+        )} minValidCostUsdEffective=${effectiveVenueMinimums.minValidCostUsdEffective.toFixed(
+          4
+        )} minValidSize=${effectiveVenueMinimums.minValidSize.toFixed(6)} minValidCostUsd=${effectiveVenueMinimums.minValidCostUsd.toFixed(
+          4
+        )} requiredNotionalForMinValidSize=${requiredNotionalForMinValidSize.toFixed(
+          4
+        )} maxAllowedNotionalForThisDecision=${maxAllowedNotionalForThisDecision.toFixed(
+          4
+        )} requestedBudget=${requestedBudget.toFixed(4)} originalTargetNotional=${originalTargetNotional.toFixed(
+          4
+        )} adjustedTargetNotional=${adjustedTargetNotional.toFixed(4)} computedOrderNotional=${finalNotional.toFixed(
+          4
+        )} affordableShares=${finalShares.toFixed(6)} finalSize=${finalShares.toFixed(
+          6
+        )} sizingRejectReason=${sizingRejectReason}`
+      );
+    }
 
     return {
       orderPrice,
       requestedBudget,
       baseTargetNotional,
+      originalTargetNotional,
+      adjustedTargetNotional,
       cappedNotional,
+      minValidPriceBasis: effectiveVenueMinimums.minValidPriceBasis,
+      minValidSizeEffective: effectiveVenueMinimums.minValidSizeEffective,
+      minValidCostUsdEffective: effectiveVenueMinimums.minValidCostUsdEffective,
+      minValidSize: effectiveVenueMinimums.minValidSizeEffective,
+      minValidCostUsd: effectiveVenueMinimums.minValidCostUsdEffective,
+      requiredNotionalForMinValidSize,
+      maxAllowedNotionalForThisDecision,
+      affordabilityGapNotional,
+      notionalAutoStepped,
       desiredShares,
       finalShares,
       desiredNotional,
@@ -3210,6 +3392,14 @@ export class PolymarketEngine {
       this.getLiveSelectionCadenceStartSec(previous) === Math.floor(expected.windowStartTs / 1000)
         ? previous
         : null;
+    const selectionChanged =
+      !previous ||
+      previous.selectedSlug !== expected.slug ||
+      previous.selectedMarketId !== matchingExpectedSelection?.selectedMarketId ||
+      previous.windowEndTs !== expected.windowEndTs;
+    if (selectionChanged) {
+      this.incrementSelectionVersion("PROMOTE_EXPECTED_CURRENT_BUCKET");
+    }
     this.liveCommittedSelection = {
       selectedSlug: expected.slug,
       selectedMarketId: matchingExpectedSelection?.selectedMarketId ?? null,
@@ -3273,6 +3463,139 @@ export class PolymarketEngine {
       selectedWindowStart: expected.windowStartTs,
       selectedWindowEnd: expected.windowEndTs,
       remainingSec: expected.remainingSec
+    };
+  }
+
+  private getSelectionVersionValue(): number {
+    const raw = Number(this.persistedPolymarketSnapshot.selectionVersion);
+    if (!Number.isFinite(raw) || raw < 0) return 0;
+    return Math.floor(raw);
+  }
+
+  private incrementSelectionVersion(reason: string): number {
+    const next = this.getSelectionVersionValue() + 1;
+    this.persistedPolymarketSnapshot = {
+      ...this.persistedPolymarketSnapshot,
+      selectionVersion: next
+    };
+    if (this.debugPoly) {
+      this.logger.info({ reason, selectionVersion: next }, "POLY_SELECTION_VERSION_BUMP");
+    }
+    return next;
+  }
+
+  private getExtremeReselectThreshold(): number {
+    const raw = Number(process.env.POLYMARKET_EXTREME_RESELECT_TICKS || 3);
+    if (!Number.isFinite(raw)) return 3;
+    return Math.max(1, Math.floor(raw));
+  }
+
+  private getExtremeReselectCooldownMs(): number {
+    const raw = Number(process.env.POLYMARKET_EXTREME_RESELECT_COOLDOWN_SEC || 20);
+    if (!Number.isFinite(raw)) return 20_000;
+    return Math.max(0, Math.floor(raw)) * 1000;
+  }
+
+  private isExtremeReselectCooldownActiveForSlug(slug: string | null, nowTs: number): boolean {
+    const normalizedSlug = String(slug || "").trim() || null;
+    return Boolean(
+      normalizedSlug &&
+        normalizedSlug === this.extremeReselectCooldown.slug &&
+        this.extremeReselectCooldown.untilTs > nowTs
+    );
+  }
+
+  private getExtremeReselectCooldownSecRemaining(slug: string | null, nowTs: number): number {
+    return this.isExtremeReselectCooldownActiveForSlug(slug, nowTs)
+      ? Math.max(0, Math.ceil((this.extremeReselectCooldown.untilTs - nowTs) / 1000))
+      : 0;
+  }
+
+  private evaluateExtremeReselectState(params: {
+    nowTs: number;
+    selectedSlug: string | null;
+    selectedTokenId: string | null;
+    selectionVersion: number;
+    extremeCondition: boolean;
+    handoffWaitActive: boolean;
+  }): {
+    consecutiveExtremeTicks: number;
+    extremeReselectThreshold: number;
+    extremeReselectTriggered: boolean;
+    extremeReselectCooldownSecRemaining: number;
+    extremeReselectTokenId: string | null;
+    shouldClearSelection: boolean;
+  } {
+    const selectedSlug = String(params.selectedSlug || "").trim() || null;
+    const selectedTokenId = String(params.selectedTokenId || "").trim() || null;
+    const threshold = this.getExtremeReselectThreshold();
+    if (params.handoffWaitActive || !selectedSlug || !selectedTokenId) {
+      this.extremeReselectCounter = {
+        slug: selectedSlug,
+        tokenId: selectedTokenId,
+        selectionVersion: params.selectionVersion,
+        consecutiveTicks: 0
+      };
+      return {
+        consecutiveExtremeTicks: 0,
+        extremeReselectThreshold: threshold,
+        extremeReselectTriggered: false,
+        extremeReselectCooldownSecRemaining: this.getExtremeReselectCooldownSecRemaining(selectedSlug, params.nowTs),
+        extremeReselectTokenId: selectedTokenId ?? selectedSlug,
+        shouldClearSelection: false
+      };
+    }
+    const sameSelectionCycle =
+      this.extremeReselectCounter.slug === selectedSlug &&
+      this.extremeReselectCounter.tokenId === selectedTokenId &&
+      this.extremeReselectCounter.selectionVersion === params.selectionVersion;
+    if (!sameSelectionCycle) {
+      this.extremeReselectCounter = {
+        slug: selectedSlug,
+        tokenId: selectedTokenId,
+        selectionVersion: params.selectionVersion,
+        consecutiveTicks: 0
+      };
+    }
+    if (!params.extremeCondition) {
+      this.extremeReselectCounter = {
+        slug: selectedSlug,
+        tokenId: selectedTokenId,
+        selectionVersion: params.selectionVersion,
+        consecutiveTicks: 0
+      };
+      return {
+        consecutiveExtremeTicks: 0,
+        extremeReselectThreshold: threshold,
+        extremeReselectTriggered: false,
+        extremeReselectCooldownSecRemaining: this.getExtremeReselectCooldownSecRemaining(selectedSlug, params.nowTs),
+        extremeReselectTokenId: selectedTokenId,
+        shouldClearSelection: false
+      };
+    }
+    this.extremeReselectCounter = {
+      slug: selectedSlug,
+      tokenId: selectedTokenId,
+      selectionVersion: params.selectionVersion,
+      consecutiveTicks: this.extremeReselectCounter.consecutiveTicks + 1
+    };
+    const cooldownActive = this.isExtremeReselectCooldownActiveForSlug(selectedSlug, params.nowTs);
+    let triggered = false;
+    if (this.extremeReselectCounter.consecutiveTicks >= threshold && !cooldownActive) {
+      triggered = true;
+      this.extremeReselectCooldown = {
+        slug: selectedSlug,
+        tokenId: selectedTokenId,
+        untilTs: params.nowTs + this.getExtremeReselectCooldownMs()
+      };
+    }
+    return {
+      consecutiveExtremeTicks: this.extremeReselectCounter.consecutiveTicks,
+      extremeReselectThreshold: threshold,
+      extremeReselectTriggered: triggered,
+      extremeReselectCooldownSecRemaining: this.getExtremeReselectCooldownSecRemaining(selectedSlug, params.nowTs),
+      extremeReselectTokenId: selectedTokenId,
+      shouldClearSelection: triggered
     };
   }
 
@@ -3385,6 +3708,9 @@ export class PolymarketEngine {
       previous.selectedSlug !== next.selectedSlug ||
       previous.selectedMarketId !== next.selectedMarketId ||
       previous.windowEndTs !== next.windowEndTs;
+    if (selectionChanged) {
+      this.incrementSelectionVersion("SELECTION_COMMIT");
+    }
     if (selectionChanged) {
       if (this.debugPoly) {
         const currentBucket = this.getExpectedCurrentBtc5mBucket();
@@ -3684,6 +4010,7 @@ export class PolymarketEngine {
     if (this.config.polymarket.mode !== "live" || !this.liveCommittedSelection) {
       return;
     }
+    this.incrementSelectionVersion(`CLEAR_${String(reason || "UNKNOWN").toUpperCase()}`);
     if (this.debugPoly) {
       this.logger.info(
         {
@@ -3725,6 +4052,13 @@ export class PolymarketEngine {
   }
 
   private demoteLiveSelection(reason: string, nowTs: number): void {
+    if (
+      this.liveCommittedSelection ||
+      this.persistedPolymarketSnapshot.selectedSlug ||
+      this.persistedPolymarketSnapshot.selectedMarketId
+    ) {
+      this.incrementSelectionVersion(`DEMOTE_${String(reason || "UNKNOWN").toUpperCase()}`);
+    }
     this.liveCommittedSelection = null;
     this.lastUsableLiveSelectedMarket = null;
     this.selectedTokenIds = [];
@@ -4482,6 +4816,62 @@ export class PolymarketEngine {
         line.afterWindowCount !== undefined
           ? Math.max(0, Math.floor(Number(line.afterWindowCount || 0)))
           : this.persistedPolymarketSnapshot.windowsCount,
+      selectionVersion:
+        line.selectionVersion !== undefined && Number.isFinite(Number(line.selectionVersion))
+          ? Math.max(0, Math.floor(Number(line.selectionVersion)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.selectionVersion || 0))),
+      reselectionTriggered:
+        line.reselectionTriggered !== undefined
+          ? Boolean(line.reselectionTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.reselectionTriggered),
+      handoffWaitTriggered:
+        line.handoffWaitTriggered !== undefined
+          ? Boolean(line.handoffWaitTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.handoffWaitTriggered),
+      dispatchEligibilityReason:
+        line.dispatchEligibilityReason !== undefined
+          ? String(line.dispatchEligibilityReason || "").trim() || null
+          : this.persistedPolymarketSnapshot.dispatchEligibilityReason,
+      candidatesBeforeFilter:
+        line.candidatesBeforeFilter !== undefined
+          ? Math.max(0, Math.floor(Number(line.candidatesBeforeFilter || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesBeforeFilter || 0))),
+      candidatesAfterFilter:
+        line.candidatesAfterFilter !== undefined
+          ? Math.max(0, Math.floor(Number(line.candidatesAfterFilter || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesAfterFilter || 0))),
+      droppedExtreme:
+        line.droppedExtreme !== undefined
+          ? Math.max(0, Math.floor(Number(line.droppedExtreme || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedExtreme || 0))),
+      droppedWideSpread:
+        line.droppedWideSpread !== undefined
+          ? Math.max(0, Math.floor(Number(line.droppedWideSpread || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedWideSpread || 0))),
+      droppedInvalid:
+        line.droppedInvalid !== undefined
+          ? Math.max(0, Math.floor(Number(line.droppedInvalid || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedInvalid || 0))),
+      consecutiveExtremeTicks:
+        line.consecutiveExtremeTicks !== undefined
+          ? Math.max(0, Math.floor(Number(line.consecutiveExtremeTicks || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.consecutiveExtremeTicks || 0))),
+      extremeReselectThreshold:
+        line.extremeReselectThreshold !== undefined
+          ? Math.max(0, Math.floor(Number(line.extremeReselectThreshold || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectThreshold || 0))),
+      extremeReselectTriggered:
+        line.extremeReselectTriggered !== undefined
+          ? Boolean(line.extremeReselectTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.extremeReselectTriggered),
+      extremeReselectCooldownSecRemaining:
+        line.extremeReselectCooldownSecRemaining !== undefined
+          ? Math.max(0, Math.floor(Number(line.extremeReselectCooldownSecRemaining || 0)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectCooldownSecRemaining || 0))),
+      extremeReselectTokenId:
+        line.extremeReselectTokenId !== undefined
+          ? String(line.extremeReselectTokenId || "").trim() || null
+          : this.persistedPolymarketSnapshot.extremeReselectTokenId,
       discoveredAtTs:
         hasActiveSelection
           ? nextDiscoveredAtTs ?? tickTs
@@ -5828,6 +6218,11 @@ export class PolymarketEngine {
     currentBucketStartSec: number;
     selectedReason: string | null;
     dominantReject: string | null;
+    candidatesBeforeFilter: number;
+    candidatesAfterFilter: number;
+    droppedExtreme: number;
+    droppedWideSpread: number;
+    droppedInvalid: number;
     stageCounts: {
       fetchedCount: number;
       afterActiveCount: number;
@@ -5883,6 +6278,15 @@ export class PolymarketEngine {
     const cycleUnbookableTokenIds = new Set<string>();
     let discoveredCurrent = false;
     let discoveredNext = false;
+    let candidatesBeforeFilter = 0;
+    let candidatesAfterFilter = 0;
+    let droppedExtreme = 0;
+    let droppedWideSpread = 0;
+    let droppedInvalid = 0;
+    let skippedExtremeCooldown = 0;
+    const extremePriceMin = getLiveExtremePriceMinConfigFromEnv();
+    const extremePriceMax = getLiveExtremePriceMaxConfigFromEnv(extremePriceMin);
+    const spreadMaxFilter = getLiveSelectorWideSpreadMaxFromEnv();
     const addCandidateRow = (
       row: Record<string, unknown> | null | undefined,
       source: string,
@@ -6053,6 +6457,86 @@ export class PolymarketEngine {
         : [...nextCandidates, ...currentCandidates];
     };
 
+    const applyHardCandidatePrefilter = async (
+      parsed: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }>
+    ): Promise<Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }>> => {
+      const filtered: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }> = [];
+      candidatesBeforeFilter = parsed.length;
+      candidatesAfterFilter = 0;
+      droppedExtreme = 0;
+      droppedWideSpread = 0;
+      droppedInvalid = 0;
+      for (const candidate of parsed) {
+        const remainingSec = getCandidateRemainingSec(candidate);
+        const yesBook = await this.getImpliedYesBook(candidate.market, {
+          isSelectedMarket: false,
+          remainingSec
+        });
+        const yesAsk = Number(yesBook.yesAsk);
+        const yesSpread = Number(yesBook.spread);
+        const fallbackNoAsk = yesBook.yesBid > 0 ? estimateNoAskFromYesBook(yesBook.yesBid) : Number.NaN;
+        const noTokenId = String(candidate.market.noTokenId || "").trim();
+        if (!noTokenId) {
+          droppedInvalid += 1;
+          continue;
+        }
+        const noQuote = await this.getNoAskAndDepthFromTokenId(noTokenId, fallbackNoAsk);
+        const noAsk = Number(noQuote.noAsk);
+        const noBid = Number.isFinite(yesAsk) && yesAsk > 0 ? estimateNoBidFromYesBook(yesAsk) : Number.NaN;
+        const noSpread =
+          Number.isFinite(noAsk) && noAsk > 0 && Number.isFinite(noBid) && noBid >= 0
+            ? Math.max(0, noAsk - noBid)
+            : Number.NaN;
+        const invalidQuote =
+          !Number.isFinite(yesAsk) ||
+          yesAsk <= 0 ||
+          !Number.isFinite(noAsk) ||
+          noAsk <= 0 ||
+          !Number.isFinite(yesSpread) ||
+          yesSpread < 0 ||
+          !Number.isFinite(noSpread) ||
+          noSpread < 0;
+        if (invalidQuote) {
+          droppedInvalid += 1;
+          continue;
+        }
+        const extremeQuote =
+          yesAsk >= extremePriceMax ||
+          yesAsk <= extremePriceMin ||
+          noAsk >= extremePriceMax ||
+          noAsk <= extremePriceMin;
+        if (extremeQuote) {
+          droppedExtreme += 1;
+          continue;
+        }
+        const wideSpread = yesSpread >= spreadMaxFilter || noSpread >= spreadMaxFilter;
+        if (wideSpread) {
+          droppedWideSpread += 1;
+          continue;
+        }
+        filtered.push(candidate);
+      }
+      candidatesAfterFilter = filtered.length;
+      return filtered;
+    };
+
+    const applyExtremeCooldownSkip = (
+      parsed: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }>
+    ): Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }> => {
+      const filtered: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }> = [];
+      for (const candidate of parsed) {
+        const candidateSlug = String(
+          candidate.slug || this.getMarketDeterministicSlug(candidate.market) || ""
+        ).trim() || null;
+        if (this.isExtremeReselectCooldownActiveForSlug(candidateSlug, nowTs)) {
+          skippedExtremeCooldown += 1;
+          continue;
+        }
+        filtered.push(candidate);
+      }
+      return filtered;
+    };
+
     const pickTradableCandidate = async (
       parsed: Array<{ market: BtcWindowMarket; source: string; slug: string | null; startSec: number | null }>,
       sourceLabel: "current_slug" | "next_slug" | "fallback_discovery"
@@ -6161,7 +6645,14 @@ export class PolymarketEngine {
           ).filter((candidate) => candidate.startSec === activeStartSec || candidate.startSec === nextStartSec);
           updateDiscoveredBucketFlags(parsedActiveCandidates);
           if (parsedActiveCandidates.length > 0) {
-            const activeSelection = await pickTradableCandidate(parsedActiveCandidates, "current_slug");
+            const prefilteredActiveCandidates = applyExtremeCooldownSkip(
+              await applyHardCandidatePrefilter(parsedActiveCandidates)
+            );
+            if (prefilteredActiveCandidates.length <= 0) {
+              dominantReject =
+                skippedExtremeCooldown > 0 ? "EXTREME_STUCK_RESELECT" : "NO_VIABLE_CANDIDATE_AFTER_FILTER";
+            }
+            const activeSelection = await pickTradableCandidate(prefilteredActiveCandidates, "current_slug");
             if (
               activeSelection &&
               activeSelection.selectionSource !== "fallback_discovery" &&
@@ -6192,12 +6683,16 @@ export class PolymarketEngine {
               activeRefreshedSelection = activeSelection;
             }
           }
-          dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
-          this.persistedPolymarketSnapshot = {
-            ...this.persistedPolymarketSnapshot,
-            staleState: "ACTIVE_MARKET_REFRESH_FAILED",
-            liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
-          };
+          if (!activeRefreshedSelection) {
+            if (dominantReject !== "EXTREME_STUCK_RESELECT") {
+              dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
+              this.persistedPolymarketSnapshot = {
+                ...this.persistedPolymarketSnapshot,
+                staleState: "ACTIVE_MARKET_REFRESH_FAILED",
+                liveValidationReason: "REFRESH_FAILED_ACTIVE_MARKET"
+              };
+            }
+          }
         } else {
           dominantReject = "REFRESH_FAILED_ACTIVE_MARKET";
           this.persistedPolymarketSnapshot = {
@@ -6248,6 +6743,11 @@ export class PolymarketEngine {
         currentBucketStartSec: currentBucket.currentBucketStartSec,
         selectedReason: "btc5m_network_error",
         dominantReject: "NETWORK_ERROR",
+        candidatesBeforeFilter,
+        candidatesAfterFilter,
+        droppedExtreme,
+        droppedWideSpread,
+        droppedInvalid,
         stageCounts: {
           fetchedCount: discoveredRows.length,
           afterActiveCount: discoveredRows.length,
@@ -6268,7 +6768,10 @@ export class PolymarketEngine {
     const directEligibility = filterEligibleCandidates(parsedDirectCandidates);
     const eligibleDirectCandidates = directEligibility.eligible;
     updateDiscoveredBucketFlags(eligibleDirectCandidates);
-    const finalCandidates = buildPrioritizedCandidates(eligibleDirectCandidates);
+    const prefilteredDirectCandidates = applyExtremeCooldownSkip(
+      await applyHardCandidatePrefilter(eligibleDirectCandidates)
+    );
+    const finalCandidates = buildPrioritizedCandidates(prefilteredDirectCandidates);
     let directSelection: Awaited<ReturnType<typeof pickTradableCandidate>> | null = null;
 
     if (finalCandidates.length === 1) {
@@ -6311,6 +6814,11 @@ export class PolymarketEngine {
             currentBucketStartSec: currentBucket.currentBucketStartSec,
             selectedReason: promotedSingle.selectedReason,
             dominantReject: promotedSingle.selectedTradable ? "OK" : promotedSingle.liveValidationReason,
+            candidatesBeforeFilter,
+            candidatesAfterFilter,
+            droppedExtreme,
+            droppedWideSpread,
+            droppedInvalid,
             stageCounts: {
               fetchedCount: discoveredRows.length,
               afterActiveCount: discoveredRows.length,
@@ -6371,6 +6879,11 @@ export class PolymarketEngine {
         currentBucketStartSec: currentBucket.currentBucketStartSec,
         selectedReason: directSelection.selectedReason,
         dominantReject: "OK",
+        candidatesBeforeFilter,
+        candidatesAfterFilter,
+        droppedExtreme,
+        droppedWideSpread,
+        droppedInvalid,
         stageCounts: {
           fetchedCount: discoveredRows.length,
           afterActiveCount: discoveredRows.length,
@@ -6404,7 +6917,7 @@ export class PolymarketEngine {
       }
       const parsedFallbackCandidates = parseCandidates(candidateRows);
       const fallbackEligibility = filterEligibleCandidates(parsedFallbackCandidates);
-      const eligibleFallbackCandidates = fallbackEligibility.eligible;
+      const eligibleFallbackCandidates = applyExtremeCooldownSkip(fallbackEligibility.eligible);
       updateDiscoveredBucketFlags(eligibleFallbackCandidates);
       const fallbackReason =
         fallbackEligibility.rejectReasons.length > 0
@@ -6413,16 +6926,22 @@ export class PolymarketEngine {
             ? "NETWORK_ERROR"
             : "NO_DIRECT_MARKET";
       dominantReject =
-        fallbackReason === "EXPIRED_WINDOW" || fallbackReason === "NETWORK_ERROR" || fallbackReason === "NO_DIRECT_MARKET"
+        skippedExtremeCooldown > 0 && eligibleFallbackCandidates.length === 0
+          ? "EXTREME_STUCK_RESELECT"
+          : fallbackReason === "EXPIRED_WINDOW" || fallbackReason === "NETWORK_ERROR" || fallbackReason === "NO_DIRECT_MARKET"
           ? fallbackReason
           : "NO_DIRECT_MARKET";
     } else if (finalCandidates.length === 0) {
       dominantReject =
-        directLookup.hadNetworkError
-          ? "NETWORK_ERROR"
-          : directEligibility.rejectReasons.includes("EXPIRED_WINDOW")
-            ? "EXPIRED_WINDOW"
-            : "NO_DIRECT_MARKET";
+        skippedExtremeCooldown > 0
+          ? "EXTREME_STUCK_RESELECT"
+          : candidatesBeforeFilter > 0 && candidatesAfterFilter === 0
+          ? "NO_VIABLE_CANDIDATE_AFTER_FILTER"
+          : directLookup.hadNetworkError
+            ? "NETWORK_ERROR"
+            : directEligibility.rejectReasons.includes("EXPIRED_WINDOW")
+              ? "EXPIRED_WINDOW"
+              : "NO_DIRECT_MARKET";
     }
 
     if (activeRefreshedSelection) {
@@ -6451,6 +6970,11 @@ export class PolymarketEngine {
         currentBucketStartSec: currentBucket.currentBucketStartSec,
         selectedReason: "btc5m_active_selected_refresh",
         dominantReject: activeRefreshedSelection.selectedTradable ? "OK" : activeRefreshedSelection.liveValidationReason,
+        candidatesBeforeFilter,
+        candidatesAfterFilter,
+        droppedExtreme,
+        droppedWideSpread,
+        droppedInvalid,
         stageCounts: {
           fetchedCount: discoveredRows.length,
           afterActiveCount: discoveredRows.length,
@@ -6487,6 +7011,11 @@ export class PolymarketEngine {
       currentBucketStartSec: currentBucket.currentBucketStartSec,
       selectedReason: "btc5m_not_found",
       dominantReject,
+      candidatesBeforeFilter,
+      candidatesAfterFilter,
+      droppedExtreme,
+      droppedWideSpread,
+      droppedInvalid,
       stageCounts: {
         fetchedCount: discoveredRows.length,
         afterActiveCount: discoveredRows.length,
@@ -7089,6 +7618,9 @@ export class PolymarketEngine {
     const bucketChangedThisTick =
       previousTickBucketSlug !== null && previousTickBucketSlug !== tickBucket.currentSlug;
     const openTradeMarketIds = deterministicBtc5mMode ? this.getAwaitingResolutionMarketIds() : new Set<string>();
+    if (!paperMode && deterministicBtc5mMode && bucketChangedThisTick) {
+      this.incrementSelectionVersion("BUCKET_ROLLOVER");
+    }
     const sniperMinRemainingSec = Math.max(1, this.config.polymarket.paper.entryMinRemainingSec);
     const sniperMaxRemainingSec = Math.max(
       sniperMinRemainingSec,
@@ -7120,6 +7652,20 @@ export class PolymarketEngine {
     let selectedChosenSide: "YES" | "NO" | null = null;
     let selectedChosenDirection: string | null = null;
     let selectedExecutionBlockedReason: string | null = null;
+    let selectionVersion = this.getSelectionVersionValue();
+    let reselectionTriggered = false;
+    let handoffWaitTriggered = false;
+    let dispatchEligibilityReason = "-";
+    let consecutiveExtremeTicks = 0;
+    let extremeReselectThreshold = this.getExtremeReselectThreshold();
+    let extremeReselectTriggered = false;
+    let extremeReselectCooldownSecRemaining = 0;
+    let extremeReselectTokenId: string | null = null;
+    let candidatesBeforeFilter = 0;
+    let candidatesAfterFilter = 0;
+    let droppedExtreme = 0;
+    let droppedWideSpread = 0;
+    let droppedInvalid = 0;
     let validatedLiveMarket: BtcWindowMarket | null = null;
     let validatedLiveTokenId: string | null = null;
     let validatedLiveChosenSide: "YES" | "NO" | null = null;
@@ -7218,6 +7764,25 @@ export class PolymarketEngine {
       selectedReason = deterministicSelection.selectedReason;
       dominantReject = deterministicSelection.dominantReject;
       stageCounts = deterministicSelection.stageCounts;
+      candidatesBeforeFilter = Math.max(0, Math.floor(Number(deterministicSelection.candidatesBeforeFilter || 0)));
+      candidatesAfterFilter = Math.max(0, Math.floor(Number(deterministicSelection.candidatesAfterFilter || 0)));
+      droppedExtreme = Math.max(0, Math.floor(Number(deterministicSelection.droppedExtreme || 0)));
+      droppedWideSpread = Math.max(0, Math.floor(Number(deterministicSelection.droppedWideSpread || 0)));
+      droppedInvalid = Math.max(0, Math.floor(Number(deterministicSelection.droppedInvalid || 0)));
+      if (
+        !selectedMarket &&
+        !selectedSlug &&
+        dominantReject === "NO_VIABLE_CANDIDATE_AFTER_FILTER"
+      ) {
+        this.clearLiveCommittedSelection(nowTs, "NO_VIABLE_CANDIDATE_AFTER_FILTER");
+        selectedCommittedTokenId = null;
+        selectedBookable = false;
+        selectedTradable = false;
+        selectedChosenSide = null;
+        selectedChosenDirection = null;
+        selectionSource = null;
+        selectedFrom = null;
+      }
       const activeCommittedBeforeReconcile = this.getActiveLiveCommittedSelection(nowTs);
       const selectedSlugForReconcile =
         activeCommittedBeforeReconcile?.selectedSlug ?? selectedSlug ?? this.persistedPolymarketSnapshot.selectedSlug ?? null;
@@ -7689,6 +8254,7 @@ export class PolymarketEngine {
       activeCommittedSelection = null;
     }
     this.syncSelectedMarketFeed(activeCommittedSelection, selectedMarket);
+    selectionVersion = this.getSelectionVersionValue();
     this.polyState.selectedSlug = selectedSlug ?? null;
     this.polyState.selectedMarketId =
       activeCommittedSelection?.selectedMarketId ?? selectedMarket?.marketId ?? null;
@@ -7700,6 +8266,20 @@ export class PolymarketEngine {
       afterWindowCount: stageCounts.afterWindowCount,
       afterPatternCount: stageCounts.afterPatternCount,
       finalCandidatesCount: stageCounts.finalCandidatesCount,
+      candidatesBeforeFilter,
+      candidatesAfterFilter,
+      droppedExtreme,
+      droppedWideSpread,
+      droppedInvalid,
+      selectionVersion,
+      reselectionTriggered,
+      handoffWaitTriggered,
+      dispatchEligibilityReason,
+      consecutiveExtremeTicks,
+      extremeReselectThreshold,
+      extremeReselectTriggered,
+      extremeReselectCooldownSecRemaining,
+      extremeReselectTokenId,
       fallbackUsed,
       selectedReason,
       selectedScore,
@@ -7915,6 +8495,8 @@ export class PolymarketEngine {
                 ? "AWAITING_RESOLUTION"
                 : dominantReject === "SELECTION_NOT_COMMITTED"
                   ? "SELECTION_NOT_COMMITTED"
+                  : dominantReject === "NO_VIABLE_CANDIDATE_AFTER_FILTER"
+                    ? "NO_VIABLE_CANDIDATE_AFTER_FILTER"
                   : dominantReject === "NO_ACTIVE_WINDOWS"
                     ? "NO_ACTIVE_WINDOWS"
                 : dominantReject === "EXPIRED_WINDOW"
@@ -8304,6 +8886,9 @@ export class PolymarketEngine {
               ? Number(noAsk)
               : null
             : null;
+      const entryPriceGate = evaluateEntryPriceGate({
+        chosenSidePriceUsed: chosenSidePriceUsedTelemetry
+      });
       const minDislocationConfigTelemetry = getLiveMinDislocationConfigFromEnv();
       const extremePriceMinConfigTelemetry = getLiveExtremePriceMinConfigFromEnv();
       const extremePriceMaxConfigTelemetry = getLiveExtremePriceMaxConfigFromEnv(extremePriceMinConfigTelemetry);
@@ -8331,6 +8916,10 @@ export class PolymarketEngine {
         chosenSidePriceUsedTelemetry !== null &&
         (chosenSidePriceUsedTelemetry > extremePriceMaxConfigTelemetry ||
           chosenSidePriceUsedTelemetry < extremePriceMinConfigTelemetry);
+      const maxEntryPriceConfigTelemetry = entryPriceGate.maxEntryPriceConfig;
+      const entryPriceGateHitTelemetry = entryPriceGate.entryPriceGateHit;
+      const entryPriceGateValueTelemetry = entryPriceGate.entryPriceGateValue;
+      const entryPriceGateDeltaTelemetry = entryPriceGate.entryPriceGateDelta;
       const feeBpsUsedTelemetry = Number.isFinite(Number(this.config.polymarket.paper.feeBps))
         ? Number(this.config.polymarket.paper.feeBps)
         : null;
@@ -8422,6 +9011,7 @@ export class PolymarketEngine {
         ? Math.min(liveWindowBudget, paperWindowBudget)
         : liveWindowBudget;
       const remainingExposureBudget = Math.max(0, this.config.polymarket.risk.maxExposure - totalExposureUsd);
+      const remainingDailyLossBudget = Math.max(0, this.risk.getRemainingDailyLossBudget());
       const desiredSide = chosenSide;
       const sidePrice = desiredSide === "NO" ? noAsk : decision.yesAsk;
       const sideProb = desiredSide === "NO" ? 1 - prob.pUpModel : prob.pUpModel;
@@ -8430,7 +9020,7 @@ export class PolymarketEngine {
         desiredSide && topAskDepthShares > 0
           ? topAskDepthShares * Math.max(0.0001, sidePrice) * 0.35
           : 0;
-      const size = desiredSide
+      const size = desiredSide && !entryPriceGate.entryPriceGateHit
         ? this.sizing.compute({
             edge: Math.max(0, netEdgeAfterCosts),
             pUpModel: sideProb,
@@ -8441,7 +9031,7 @@ export class PolymarketEngine {
             depthCapNotionalUsd,
             remainingWindowBudget,
             remainingExposureBudget,
-            remainingDailyLossBudget: this.risk.getRemainingDailyLossBudget()
+            remainingDailyLossBudget
           })
         : { notionalUsd: 0, shares: 0, kellyFraction: 0 };
       const sizingCheck = this.evaluateOrderSizingCheck({
@@ -8450,9 +9040,13 @@ export class PolymarketEngine {
         chosenSide: desiredSide,
         orderPrice: desiredSide ? sidePrice : null,
         requestedBudget: size.notionalUsd,
-        computedShares: size.shares
+        computedShares: size.shares,
+        maxAllowedNotionalForThisDecision: Math.max(
+          0,
+          Math.min(remainingWindowBudget, remainingExposureBudget, remainingDailyLossBudget)
+        )
       });
-      const minSharesRequiredConfig = sizingCheck.minVenueShares;
+      const minSharesRequiredConfig = this.getConfiguredMinSharesRequired();
       const minSharesFeasibility = evaluateMinSharesConfigFeasibility({
         maxNotionalPerWindow: sizingCheck.maxNotionalPerWindow,
         chosenSidePriceUsed:
@@ -8465,6 +9059,22 @@ export class PolymarketEngine {
       const configFeasible = minSharesFeasibility.configFeasible;
       const finalOrderNotionalUsd = sizingCheck.finalNotional;
       const finalOrderShares = sizingCheck.finalShares;
+      let orderPriceSourceTelemetry: string | null = desiredSide ? "SIDE_BOOK_LIVE" : null;
+      const preClampSizeTelemetry =
+        Number.isFinite(Number(size.shares)) && Number(size.shares) > 0 ? Number(size.shares) : null;
+      const budgetCapNotionalUsedTelemetry =
+        Number.isFinite(Number(finalOrderNotionalUsd)) && Number(finalOrderNotionalUsd) > 0
+          ? Number(finalOrderNotionalUsd)
+          : null;
+      const affordableSharesTelemetry =
+        Number.isFinite(Number(sizingCheck.finalShares)) && Number(sizingCheck.finalShares) > 0
+          ? Number(sizingCheck.finalShares)
+          : null;
+      let finalSizeTelemetry =
+        Number.isFinite(Number(finalOrderShares)) && Number(finalOrderShares) > 0
+          ? Number(finalOrderShares)
+          : null;
+      let priceSourceMismatchTelemetry: string | null = null;
       if (!paperMode) {
         this.persistedPolymarketSnapshot = {
           ...this.persistedPolymarketSnapshot,
@@ -8492,6 +9102,11 @@ export class PolymarketEngine {
       let selectedSideBookable: boolean | null = null;
       let selectedSideBookabilityReason: string | null = null;
       const setBlocked = (reason: string, category: HoldCategory): void => {
+        const existingBlocked = normalizeHoldReason(blockReason);
+        const nextBlocked = normalizeHoldReason(reason);
+        if (existingBlocked === "ENTRY_PRICE_TOO_HIGH" && nextBlocked !== "ENTRY_PRICE_TOO_HIGH") {
+          return;
+        }
         action = "HOLD";
         executedSize = 0;
         canAttemptTrade = false;
@@ -8539,6 +9154,8 @@ export class PolymarketEngine {
       const sizingRejectBlockReason =
         !configFeasible
           ? "CONFIG_INFEASIBLE_MIN_SHARES"
+          : sizingCheck.sizingRejectReason === "MIN_VALID_SIZE_UNAFFORDABLE"
+          ? "MIN_VALID_SIZE_UNAFFORDABLE"
           : sizingCheck.sizingRejectReason === "BELOW_MIN_SHARES"
           ? "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED"
           : sizingCheck.sizingRejectReason === "BELOW_MIN_NOTIONAL"
@@ -8584,9 +9201,14 @@ export class PolymarketEngine {
         setBlocked("EDGE_BELOW_THRESHOLD_EXECUTION_BUFFER", "STRATEGY");
       }
 
+      if (!paperMode && entryPriceGateHitTelemetry) {
+        setBlocked("ENTRY_PRICE_TOO_HIGH", "STRATEGY");
+      }
+
       if (
         !paperMode &&
         sharedDecision.paperWouldTrade &&
+        !entryPriceGateHitTelemetry &&
         ((sizingRejectBlockReason === "CONFIG_INFEASIBLE_MIN_SHARES" && !configFeasible) ||
           (!sizingCheck.passes && sizingRejectBlockReason))
       ) {
@@ -8787,10 +9409,123 @@ export class PolymarketEngine {
         } else if (chosenSide === "NO" && !liveNoSideEnabled) {
           setBlocked("LIVE_NO_SIDE_DISABLED", "STRATEGY");
         } else {
+            const dispatchSelectionVersionStart = this.getSelectionVersionValue();
+            let dispatchGateTick = this.createBtc5mTickContext(Date.now());
+            let dispatchCandidateSlug = selectedSlug;
+            let dispatchCandidateBookable = selectedBookable;
+            let dispatchCandidateTradable = selectedTradable;
+            const classifyDispatchEligibility = (input: {
+              selectedSlug: string | null;
+              selectedBookable: boolean;
+              selectedTradable: boolean;
+              tick: Btc5mTickContext;
+            }): string => {
+              if (!input.selectedSlug || !input.selectedBookable || !input.selectedTradable) {
+                return "NEXT_BUCKET_HANDOFF_WAIT";
+              }
+              if (input.selectedSlug === input.tick.currentBucketSlug) {
+                return input.tick.remainingSec >= this.getLiveEntryMinRemainingSec()
+                  ? "ELIGIBLE_CURRENT"
+                  : "NEXT_BUCKET_HANDOFF_WAIT";
+              }
+              if (input.selectedSlug === input.tick.nextBucketSlug) {
+                return "NEXT_BUCKET_HANDOFF_WAIT";
+              }
+              return "NEXT_BUCKET_HANDOFF_WAIT";
+            };
+            let dispatchGateReason = classifyDispatchEligibility({
+              selectedSlug: dispatchCandidateSlug,
+              selectedBookable: dispatchCandidateBookable,
+              selectedTradable: dispatchCandidateTradable,
+              tick: dispatchGateTick
+            });
+            let dispatchGateReselectionTriggered = false;
+            let dispatchGateHandoffTriggered = dispatchGateReason !== "ELIGIBLE_CURRENT";
+            if (dispatchGateReason !== "ELIGIBLE_CURRENT" && deterministicBtc5mMode) {
+              dispatchGateReselectionTriggered = true;
+              const reselectionTick = this.createBtc5mTickContext(Date.now());
+              dispatchGateTick = reselectionTick;
+              const reselection = await this.resolveDeterministicBtc5mLiveMarket(reselectionTick.tickNowMs, reselectionTick);
+              dispatchCandidateSlug = reselection.selectedSlug;
+              dispatchCandidateBookable = reselection.selectedBookable;
+              dispatchCandidateTradable = reselection.selectedTradable;
+              candidatesBeforeFilter = Math.max(0, Math.floor(Number(reselection.candidatesBeforeFilter || candidatesBeforeFilter)));
+              candidatesAfterFilter = Math.max(0, Math.floor(Number(reselection.candidatesAfterFilter || candidatesAfterFilter)));
+              droppedExtreme = Math.max(0, Math.floor(Number(reselection.droppedExtreme || droppedExtreme)));
+              droppedWideSpread = Math.max(0, Math.floor(Number(reselection.droppedWideSpread || droppedWideSpread)));
+              droppedInvalid = Math.max(0, Math.floor(Number(reselection.droppedInvalid || droppedInvalid)));
+              dispatchGateReason = classifyDispatchEligibility({
+                selectedSlug: dispatchCandidateSlug,
+                selectedBookable: dispatchCandidateBookable,
+                selectedTradable: dispatchCandidateTradable,
+                tick: reselectionTick
+              });
+              if (
+                dispatchGateReason === "ELIGIBLE_CURRENT" &&
+                (!reselection.selectedMarket || reselection.selectedMarket.marketId !== market.marketId)
+              ) {
+                dispatchGateReason = "NEXT_BUCKET_HANDOFF_WAIT";
+              }
+              if (dispatchGateReason === "ELIGIBLE_CURRENT" && reselection.selectedMarket) {
+                selectedMarket = reselection.selectedMarket;
+                selectedSlug = reselection.selectedSlug;
+                selectedWindowStart = reselection.selectedWindowStart;
+                selectedWindowEnd = reselection.selectedWindowEnd;
+                selectedAcceptingOrders = reselection.selectedAcceptingOrders;
+                selectedEnableOrderBook = reselection.selectedEnableOrderBook;
+                selectedCommittedTokenId = reselection.selectedTokenId;
+                selectedBookable = reselection.selectedBookable;
+                selectedTradable = reselection.selectedTradable;
+                selectedChosenSide = reselection.chosenSide;
+                selectedChosenDirection = reselection.chosenDirection;
+                selectionSource = reselection.selectionSource;
+                selectedFrom = reselection.selectionSource;
+                liveValidationReason = reselection.liveValidationReason;
+                lastBookTs = reselection.lastBookTs;
+                lastQuoteTs = reselection.lastQuoteTs;
+              }
+              dispatchGateHandoffTriggered = dispatchGateReason !== "ELIGIBLE_CURRENT";
+            }
+            const dispatchSelectionVersionEnd = this.getSelectionVersionValue();
+            if (dispatchSelectionVersionEnd !== dispatchSelectionVersionStart) {
+              dispatchGateReason = "SELECTION_VERSION_MISMATCH";
+              dispatchGateHandoffTriggered = true;
+            }
+            selectionVersion = dispatchSelectionVersionEnd;
+            dispatchEligibilityReason = dispatchGateReason;
+            reselectionTriggered = reselectionTriggered || dispatchGateReselectionTriggered;
+            handoffWaitTriggered = handoffWaitTriggered || dispatchGateHandoffTriggered;
+            this.logger.warn(
+              {
+                canonicalTickMs: dispatchGateTick.tickNowMs,
+                canonicalTickSec: dispatchGateTick.tickNowSec,
+                selectedSlug,
+                currentBucketSlug: dispatchGateTick.currentBucketSlug,
+                nextBucketSlug: dispatchGateTick.nextBucketSlug,
+                remainingSec: dispatchGateTick.remainingSec,
+                selectionVersion,
+                dispatchEligibilityReason,
+                reselectionTriggered,
+                handoffWaitTriggered
+              },
+              "POLY_DISPATCH_GATE"
+            );
+            if (dispatchGateReason !== "ELIGIBLE_CURRENT") {
+              setBlocked("NEXT_BUCKET_HANDOFF_WAIT", "STRATEGY");
+              selectedExecutionBlockedReason = "NEXT_BUCKET_HANDOFF_WAIT";
+              if (selectedMarket?.marketId === market.marketId) {
+                this.persistLiveCommittedSelectionStatus(nowTs, {
+                  chosenSide,
+                  chosenDirection,
+                  holdReason: "NEXT_BUCKET_HANDOFF_WAIT",
+                  warningState: this.runtimeWarningState ?? null
+                });
+              }
+            } else {
             const executionSide: "YES" | "NO" = chosenSide === "NO" ? "NO" : "YES";
             const preorder = await this.validateLiveExecutionCandidate({
-              nowTs,
-              tickContext,
+              nowTs: dispatchGateTick.tickNowMs,
+              tickContext: dispatchGateTick,
               market,
               chosenSide: executionSide
             });
@@ -8919,10 +9654,33 @@ export class PolymarketEngine {
                 selectedChosenDirection = recoveredSelection.chosenDirection;
               }
               if (executionSide === "YES") {
-                const executionYesBook = await this.getImpliedYesBook(freshMarket, {
-                  isSelectedMarket: true,
-                  remainingSec: preorder.remainingSec ?? remainingSec
-                });
+                const decisionYesAsk =
+                  Number.isFinite(Number(decision.yesAsk)) && Number(decision.yesAsk) > 0
+                    ? clamp(Number(decision.yesAsk), 0.0001, 0.9999)
+                    : null;
+                const executionYesBook =
+                  decisionYesAsk !== null
+                    ? {
+                        yesAsk: decisionYesAsk,
+                        source: "decision" as const,
+                        bookable: true
+                      }
+                    : await this.getImpliedYesBook(freshMarket, {
+                        isSelectedMarket: true,
+                        remainingSec: preorder.remainingSec ?? remainingSec
+                      });
+                orderPriceSourceTelemetry =
+                  executionYesBook.source === "decision"
+                    ? "SIDE_BOOK_DECISION"
+                    : executionYesBook.source === "live"
+                      ? "SIDE_BOOK_LIVE"
+                      : executionYesBook.source === "cached"
+                        ? "FALLBACK_CACHED_BOOK"
+                        : executionYesBook.source === "inferred"
+                          ? "FALLBACK_INFERRED_BOOK"
+                          : executionYesBook.source === "missing"
+                            ? "FALLBACK_MISSING_BOOK"
+                            : "SIDE_BOOK_UNKNOWN";
                 const executableYesAsk =
                   executionYesBook.bookable && Number.isFinite(Number(executionYesBook.yesAsk)) && Number(executionYesBook.yesAsk) > 0
                     ? clamp(Number(executionYesBook.yesAsk), 0.0001, 0.9999)
@@ -8940,6 +9698,21 @@ export class PolymarketEngine {
                   });
                   action = "HOLD";
                   executedSize = 0;
+                } else if (
+                  executionYesBook.source !== "decision" &&
+                  Number.isFinite(Number(decision.yesAsk)) &&
+                  Number(decision.yesAsk) > 0 &&
+                  Math.abs(executableYesAsk - Number(decision.yesAsk)) >
+                    Math.max(
+                      0.02,
+                      this.config.polymarket.execution.takerPriceBuffer + Number(freshMarket.tickSize || "0.01")
+                    )
+                ) {
+                  priceSourceMismatchTelemetry = `YES_DECISION_${Number(decision.yesAsk).toFixed(4)}_EXEC_${executableYesAsk.toFixed(4)}`;
+                  setBlocked("PRICE_SOURCE_MISMATCH", "DATA_HEALTH");
+                  selectedExecutionBlockedReason = "PRICE_SOURCE_MISMATCH";
+                  action = "HOLD";
+                  executedSize = 0;
                 } else {
                   const result = await this.execution.executeBuyYes({
                     marketId: freshMarket.marketId,
@@ -8947,19 +9720,41 @@ export class PolymarketEngine {
                     yesAsk: executableYesAsk,
                     notionalUsd: finalOrderNotionalUsd,
                     tickSize: freshMarket.tickSize,
-                    negRisk: freshMarket.negRisk
+                    negRisk: freshMarket.negRisk,
+                    priceSource: orderPriceSourceTelemetry || undefined
                   });
                   action = result.accepted ? "BUY_YES" : "HOLD";
                   executedSize = result.accepted ? finalOrderNotionalUsd : 0;
+                  if (result.accepted && Number.isFinite(Number(result.filledShares)) && Number(result.filledShares) > 0) {
+                    finalSizeTelemetry = Number(result.filledShares);
+                  }
                   if (!result.accepted) {
                     applyResultBlockReason(result.reason || "LIVE_REJECTED");
                   }
                 }
               } else {
-                const executionNoBook = await this.getNoAskAndDepthFromTokenId(
-                  preorder.selectedTokenId,
-                  noAsk
-                );
+                const decisionNoAsk =
+                  Number.isFinite(Number(noAsk)) && Number(noAsk) > 0 ? clamp(Number(noAsk), 0.0001, 0.9999) : null;
+                const executionNoBook =
+                  decisionNoAsk !== null
+                    ? {
+                        noAsk: decisionNoAsk,
+                        source: "decision" as const,
+                        bookable: true
+                      }
+                    : await this.getNoAskAndDepthFromTokenId(preorder.selectedTokenId, noAsk);
+                orderPriceSourceTelemetry =
+                  executionNoBook.source === "decision"
+                    ? "SIDE_BOOK_DECISION"
+                    : executionNoBook.source === "live"
+                      ? "SIDE_BOOK_LIVE"
+                      : executionNoBook.source === "cached"
+                        ? "FALLBACK_CACHED_BOOK"
+                        : executionNoBook.source === "inferred"
+                          ? "FALLBACK_INFERRED_BOOK"
+                          : executionNoBook.source === "missing"
+                            ? "FALLBACK_MISSING_BOOK"
+                            : "SIDE_BOOK_UNKNOWN";
                 const executableNoAsk =
                   executionNoBook.bookable && Number.isFinite(Number(executionNoBook.noAsk)) && Number(executionNoBook.noAsk) > 0
                     ? clamp(Number(executionNoBook.noAsk), 0.0001, 0.9999)
@@ -8977,6 +9772,21 @@ export class PolymarketEngine {
                   });
                   action = "HOLD";
                   executedSize = 0;
+                } else if (
+                  executionNoBook.source !== "decision" &&
+                  Number.isFinite(Number(noAsk)) &&
+                  Number(noAsk) > 0 &&
+                  Math.abs(executableNoAsk - Number(noAsk)) >
+                    Math.max(
+                      0.02,
+                      this.config.polymarket.execution.takerPriceBuffer + Number(freshMarket.tickSize || "0.01")
+                    )
+                ) {
+                  priceSourceMismatchTelemetry = `NO_DECISION_${Number(noAsk).toFixed(4)}_EXEC_${executableNoAsk.toFixed(4)}`;
+                  setBlocked("PRICE_SOURCE_MISMATCH", "DATA_HEALTH");
+                  selectedExecutionBlockedReason = "PRICE_SOURCE_MISMATCH";
+                  action = "HOLD";
+                  executedSize = 0;
                 } else {
                   const result = await this.execution.executeBuyNo({
                     marketId: freshMarket.marketId,
@@ -8984,15 +9794,20 @@ export class PolymarketEngine {
                     noAsk: executableNoAsk,
                     notionalUsd: finalOrderNotionalUsd,
                     tickSize: freshMarket.tickSize,
-                    negRisk: freshMarket.negRisk
+                    negRisk: freshMarket.negRisk,
+                    priceSource: orderPriceSourceTelemetry || undefined
                   });
                   action = result.accepted ? "BUY_NO" : "HOLD";
                   executedSize = result.accepted ? finalOrderNotionalUsd : 0;
+                  if (result.accepted && Number.isFinite(Number(result.filledShares)) && Number(result.filledShares) > 0) {
+                    finalSizeTelemetry = Number(result.filledShares);
+                  }
                   if (!result.accepted) {
                     applyResultBlockReason(result.reason || "LIVE_REJECTED");
                   }
                 }
               }
+            }
             }
           }
         }
@@ -9051,6 +9866,7 @@ export class PolymarketEngine {
             normalizedBlockReason === "PRICE_FETCH_FAILED"
               ? "DATA_HEALTH"
               : normalizedBlockReason === "SIZE_BELOW_MIN_NOTIONAL" ||
+                  normalizedBlockReason === "MIN_VALID_SIZE_UNAFFORDABLE" ||
                   normalizedBlockReason === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED"
                 ? "RISK"
                 : "STRATEGY";
@@ -9120,6 +9936,50 @@ export class PolymarketEngine {
         extremePriceFilterHitCandidate ||
         normalizeHoldReason(blockReason || "") === "EXTREME_PRICE_FILTER";
       const blockerPriorityAppliedTelemetry = isPriorityBlockerReason(normalizeHoldReason(blockReason || ""));
+      if (!paperMode) {
+        const extremeReselectState = this.evaluateExtremeReselectState({
+          nowTs,
+          selectedSlug,
+          selectedTokenId:
+            selectedMarket?.marketId === market.marketId
+              ? selectedTokenId ?? selectedCommittedTokenId
+              : selectedCommittedTokenId,
+          selectionVersion,
+          extremeCondition:
+            Boolean(selectedMarket?.marketId === market.marketId) && Boolean(extremePriceFilterHitTelemetry),
+          handoffWaitActive:
+            handoffWaitTriggered ||
+            normalizeHoldReason(dispatchEligibilityReason) === "NEXT_BUCKET_HANDOFF_WAIT" ||
+            normalizeHoldReason(blockReason) === "NEXT_BUCKET_HANDOFF_WAIT"
+        });
+        consecutiveExtremeTicks = extremeReselectState.consecutiveExtremeTicks;
+        extremeReselectThreshold = extremeReselectState.extremeReselectThreshold;
+        extremeReselectTriggered = extremeReselectState.extremeReselectTriggered;
+        extremeReselectCooldownSecRemaining = extremeReselectState.extremeReselectCooldownSecRemaining;
+        extremeReselectTokenId = extremeReselectState.extremeReselectTokenId;
+        if (extremeReselectState.shouldClearSelection) {
+          setBlocked("EXTREME_STUCK_RESELECT", "STRATEGY");
+          selectedExecutionBlockedReason = "EXTREME_STUCK_RESELECT";
+          dispatchEligibilityReason = "EXTREME_STUCK_RESELECT";
+          reselectionTriggered = true;
+          this.clearLiveCommittedSelection(nowTs, "EXTREME_STUCK_RESELECT");
+          selectionVersion = this.getSelectionVersionValue();
+          selectedSlug = null;
+          selectedWindowStart = null;
+          selectedWindowEnd = null;
+          selectedAcceptingOrders = null;
+          selectedEnableOrderBook = null;
+          selectedTokenId = null;
+          selectedCommittedTokenId = null;
+          selectedBookable = false;
+          selectedTradable = false;
+          selectionSource = null;
+          selectedFrom = null;
+          liveValidationReason = "EXTREME_STUCK_RESELECT";
+          selectedChosenSide = null;
+          selectedChosenDirection = null;
+        }
+      }
       processedEvaluatedMarket = true;
       tickLog = {
         marketsSeen: discoveredCandidates,
@@ -9129,8 +9989,11 @@ export class PolymarketEngine {
         sampleRejected: sampleRejected.slice(0, 5),
         activeWindows: hydratedMarkets.length,
         now: new Date(nowTs).toISOString(),
+        canonicalTickMs: tickContext.tickNowMs,
+        canonicalTickSec: tickContext.tickNowSec,
         currentMarketId: market.marketId,
         tauSec,
+        remainingSecSource: "MARKET_WINDOW",
         priceToBeat: market.priceToBeat,
         oracleEst,
         sigma: sigmaPricePerSqrtSec,
@@ -9146,15 +10009,36 @@ export class PolymarketEngine {
         fairPriceSource: fairPriceSourceTelemetry,
         fairPriceModelOrigin: fairPriceModelOriginTelemetry,
         chosenSidePriceUsed: chosenSidePriceUsedTelemetry,
+        maxEntryPriceConfig: maxEntryPriceConfigTelemetry,
+        entryPriceGateHit: entryPriceGateHitTelemetry,
+        entryPriceGateValue: entryPriceGateValueTelemetry,
+        entryPriceGateDelta: entryPriceGateDeltaTelemetry,
         dislocationAbs: dislocationAbsTelemetry,
         minDislocationConfig: minDislocationConfigTelemetry,
         extremePriceFilterHit: extremePriceFilterHitTelemetry,
         blockerPriorityApplied: blockerPriorityAppliedTelemetry,
+        orderPriceSource: orderPriceSourceTelemetry,
+        preClampSize: preClampSizeTelemetry,
+        budgetCapNotionalUsed: budgetCapNotionalUsedTelemetry,
+        affordableShares: affordableSharesTelemetry,
+        finalSize: finalSizeTelemetry,
+        priceSourceMismatch: priceSourceMismatchTelemetry,
         feeBpsUsed: feeBpsUsedTelemetry,
         slippageBpsUsed: slippageBpsUsedTelemetry,
         safetyBpsUsed: safetyBpsUsedTelemetry,
+        minValidPriceBasis: sizingCheck.minValidPriceBasis,
+        minValidSizeEffective: sizingCheck.minValidSizeEffective,
+        minValidCostUsdEffective: sizingCheck.minValidCostUsdEffective,
+        requiredNotionalForMinValidSize: sizingCheck.requiredNotionalForMinValidSize,
+        notionalAutoStepped: sizingCheck.notionalAutoStepped,
+        originalTargetNotional: sizingCheck.originalTargetNotional,
+        adjustedTargetNotional: sizingCheck.adjustedTargetNotional,
+        affordabilityGapNotional: sizingCheck.affordabilityGapNotional,
+        maxAllowedNotionalForThisDecision: sizingCheck.maxAllowedNotionalForThisDecision,
         baseTargetNotional: sizingCheck.baseTargetNotional,
         cappedNotional: sizingCheck.cappedNotional,
+        minValidSize: sizingCheck.minValidSize,
+        minValidCostUsd: sizingCheck.minValidCostUsd,
         computedOrderNotional: finalOrderNotionalUsd,
         computedShares: finalOrderShares,
         maxAchievableShares,
@@ -9273,9 +10157,33 @@ export class PolymarketEngine {
         currentBucketSlug,
         nextBucketSlug,
         currentBucketStartSec,
+        selectionVersion,
+        reselectionTriggered,
+        handoffWaitTriggered,
+        dispatchEligibilityReason,
+        consecutiveExtremeTicks,
+        extremeReselectThreshold,
+        extremeReselectTriggered,
+        extremeReselectCooldownSecRemaining,
+        extremeReselectTokenId,
         candidateRefreshed,
         size: executedSize,
         openTrades: openTradesCount,
+        scalpModeActive: this.config.polymarket.mode === "live" ? Boolean(this.config.polymarket.live.scalpMode) : false,
+        entriesInWindow: Number.isFinite(Number(this.truthEntriesInWindow))
+          ? Math.max(0, Math.floor(Number(this.truthEntriesInWindow)))
+          : 0,
+        exitsInWindow: 0,
+        reentryCooldownSec:
+          this.config.polymarket.mode === "live" && this.config.polymarket.live.scalpMode
+            ? Math.max(0, Math.floor(Number(this.config.polymarket.live.reentryCooldownSec || 0)))
+            : 0,
+        reentryEligibleNow: blockReason !== "REENTRY_COOLDOWN",
+        lastExitReason: "-",
+        timeInPositionSec: 0,
+        windowRealizedPnlUsd: Number.isFinite(Number(this.truthWindowRealizedPnlUsd))
+          ? Number(this.truthWindowRealizedPnlUsd)
+          : 0,
         resolvedTrades: resolvedTradesCount,
         oracleSource,
         oracleTs,
@@ -12147,13 +13055,30 @@ export class PolymarketEngine {
   }
 
   private maybeLogClockDriftBug(emittedTs: number, input: TickLogLine): void {
+    const canonicalTickMs =
+      Number.isFinite(Number(input.canonicalTickMs)) && Number(input.canonicalTickMs) > 0
+        ? Math.floor(Number(input.canonicalTickMs))
+        : emittedTs;
+    const canonicalTickSec =
+      Number.isFinite(Number(input.canonicalTickSec)) && Number(input.canonicalTickSec) > 0
+        ? Math.floor(Number(input.canonicalTickSec))
+        : Math.floor(canonicalTickMs / 1000);
     const emittedSec = Math.floor(emittedTs / 1000);
-    const internalBucket = deriveBtc5mBuckets(Date.now());
-    const driftSec = Math.abs(internalBucket.nowSec - emittedSec);
-    if (driftSec <= 5) {
+    const driftSec = Math.abs(canonicalTickSec - emittedSec);
+    const canonicalBucket = deriveBtc5mBuckets(canonicalTickMs);
+    const observedCurrentBucketSlug = String(
+      input.currentBucketSlug || this.persistedPolymarketSnapshot.currentBucketSlug || ""
+    ).trim();
+    const observedNextBucketSlug = String(
+      input.nextBucketSlug || this.persistedPolymarketSnapshot.nextBucketSlug || ""
+    ).trim();
+    const bucketMismatch =
+      (observedCurrentBucketSlug.length > 0 && observedCurrentBucketSlug !== canonicalBucket.currentSlug) ||
+      (observedNextBucketSlug.length > 0 && observedNextBucketSlug !== canonicalBucket.nextSlug);
+    if (driftSec <= 5 && !bucketMismatch) {
       return;
     }
-    const emittedBucket = deriveBtc5mBuckets(emittedTs);
+    const emittedBucket = deriveBtc5mBuckets(canonicalTickMs);
     const snapshot = this.getPersistedPolymarketSnapshot(emittedTs);
     const remainingSec =
       Number.isFinite(Number(input.tauSec)) && Number(input.tauSec) >= 0
@@ -12164,9 +13089,13 @@ export class PolymarketEngine {
     this.logger.error(
       {
         emittedTs,
-        tickNowSec: internalBucket.nowSec,
+        canonicalTickMs,
+        tickNowSec: canonicalTickSec,
         currentBucketSlug: emittedBucket.currentSlug,
         nextBucketSlug: emittedBucket.nextSlug,
+        observedCurrentBucketSlug: observedCurrentBucketSlug || null,
+        observedNextBucketSlug: observedNextBucketSlug || null,
+        bucketMismatch,
         selectionCommitTs: snapshot.selectionCommitTs ?? null,
         remainingSec
       },
@@ -12182,6 +13111,38 @@ export class PolymarketEngine {
       this.running || this.polyState.lastFetchAttemptTs > 0 || this.runtimeStartupState !== "STARTING";
     const defaultWindowCfg = this.scanner.getPrimaryWindowConfig();
     const selectionRollover = this.isSelectionRollover(input);
+    const applyTickConsistency = (line: TickLogLine): void => {
+      line.canonicalTickMs = tickTs;
+      line.canonicalTickSec = Math.floor(tickTs / 1000);
+      if (!line.remainingSecSource) {
+        line.remainingSecSource =
+          Number.isFinite(Number(line.tauSec)) && Number(line.tauSec) >= 0 ? "TICK_LINE" : "-";
+      }
+      const lineBucketSlug = String(line.currentBucketSlug || this.persistedPolymarketSnapshot.currentBucketSlug || "").trim();
+      const snapshotBucketSlug = String(this.persistedPolymarketSnapshot.currentBucketSlug || "").trim();
+      const lineRemainingSecRaw = Number(line.tauSec);
+      const snapshotRemainingSecRaw = Number(this.persistedPolymarketSnapshot.remainingSec);
+      if (
+        lineBucketSlug &&
+        snapshotBucketSlug &&
+        lineBucketSlug === snapshotBucketSlug &&
+        Number.isFinite(lineRemainingSecRaw) &&
+        lineRemainingSecRaw >= 0 &&
+        Number.isFinite(snapshotRemainingSecRaw) &&
+        snapshotRemainingSecRaw >= 0
+      ) {
+        const nextRemainingSec = Math.max(0, Math.floor(lineRemainingSecRaw));
+        const prevRemainingSec = Math.max(0, Math.floor(snapshotRemainingSecRaw));
+        if (nextRemainingSec > prevRemainingSec + 1) {
+          line.tauSec = prevRemainingSec;
+          line.remainingSecSource = "MONOTONIC_CLAMP";
+        } else {
+          line.tauSec = nextRemainingSec;
+        }
+      } else if (Number.isFinite(lineRemainingSecRaw) && lineRemainingSecRaw >= 0) {
+        line.tauSec = Math.max(0, Math.floor(lineRemainingSecRaw));
+      }
+    };
     if (tickTs - this.lastTickLogTs < 30_000) {
     const line: TickLogLine = {
       ...input,
@@ -12220,8 +13181,67 @@ export class PolymarketEngine {
       acceptedSampleCount: Math.max(0, Math.floor(Number(input.acceptedSampleCount || 0))),
       forceTradeFired: Boolean(input.forceTradeFired),
       forceTradeMode: input.forceTradeMode ?? "none",
-      holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason)
+      holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason),
+      candidatesBeforeFilter:
+        Number.isFinite(Number(input.candidatesBeforeFilter))
+          ? Math.max(0, Math.floor(Number(input.candidatesBeforeFilter)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesBeforeFilter || 0))),
+      candidatesAfterFilter:
+        Number.isFinite(Number(input.candidatesAfterFilter))
+          ? Math.max(0, Math.floor(Number(input.candidatesAfterFilter)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesAfterFilter || 0))),
+      droppedExtreme:
+        Number.isFinite(Number(input.droppedExtreme))
+          ? Math.max(0, Math.floor(Number(input.droppedExtreme)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedExtreme || 0))),
+      droppedWideSpread:
+        Number.isFinite(Number(input.droppedWideSpread))
+          ? Math.max(0, Math.floor(Number(input.droppedWideSpread)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedWideSpread || 0))),
+      droppedInvalid:
+        Number.isFinite(Number(input.droppedInvalid))
+          ? Math.max(0, Math.floor(Number(input.droppedInvalid)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedInvalid || 0))),
+      consecutiveExtremeTicks:
+        Number.isFinite(Number(input.consecutiveExtremeTicks))
+          ? Math.max(0, Math.floor(Number(input.consecutiveExtremeTicks)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.consecutiveExtremeTicks || 0))),
+      extremeReselectThreshold:
+        Number.isFinite(Number(input.extremeReselectThreshold))
+          ? Math.max(0, Math.floor(Number(input.extremeReselectThreshold)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectThreshold || 0))),
+      extremeReselectTriggered:
+        input.extremeReselectTriggered !== undefined
+          ? Boolean(input.extremeReselectTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.extremeReselectTriggered),
+      extremeReselectCooldownSecRemaining:
+        Number.isFinite(Number(input.extremeReselectCooldownSecRemaining))
+          ? Math.max(0, Math.floor(Number(input.extremeReselectCooldownSecRemaining)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectCooldownSecRemaining || 0))),
+      extremeReselectTokenId:
+        String(
+          input.extremeReselectTokenId ?? this.persistedPolymarketSnapshot.extremeReselectTokenId ?? ""
+        ).trim() || null,
+      selectionVersion:
+        Number.isFinite(Number(input.selectionVersion))
+          ? Math.max(0, Math.floor(Number(input.selectionVersion)))
+          : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.selectionVersion || 0))),
+      reselectionTriggered:
+        input.reselectionTriggered !== undefined
+          ? Boolean(input.reselectionTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.reselectionTriggered),
+      handoffWaitTriggered:
+        input.handoffWaitTriggered !== undefined
+          ? Boolean(input.handoffWaitTriggered)
+          : Boolean(this.persistedPolymarketSnapshot.handoffWaitTriggered),
+      dispatchEligibilityReason:
+        String(
+          input.dispatchEligibilityReason ??
+            this.persistedPolymarketSnapshot.dispatchEligibilityReason ??
+            "-"
+        ).trim() || "-"
     };
+      applyTickConsistency(line);
       const pausePresentation = this.getStatusPausePresentation(line.tradingPaused, line.pauseReason ?? null);
       line.tradingPaused = pausePresentation.tradingPaused;
       line.pauseReason = pausePresentation.pauseReason;
@@ -12303,8 +13323,67 @@ export class PolymarketEngine {
         acceptedSampleCount: Math.max(0, Math.floor(Number(input.acceptedSampleCount || 0))),
         forceTradeFired: Boolean(input.forceTradeFired),
         forceTradeMode: input.forceTradeMode ?? "none",
-        holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason)
+        holdDetailReason: input.holdDetailReason ?? (selectionRollover ? null : this.polyState.holdDetailReason),
+        candidatesBeforeFilter:
+          Number.isFinite(Number(input.candidatesBeforeFilter))
+            ? Math.max(0, Math.floor(Number(input.candidatesBeforeFilter)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesBeforeFilter || 0))),
+        candidatesAfterFilter:
+          Number.isFinite(Number(input.candidatesAfterFilter))
+            ? Math.max(0, Math.floor(Number(input.candidatesAfterFilter)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.candidatesAfterFilter || 0))),
+        droppedExtreme:
+          Number.isFinite(Number(input.droppedExtreme))
+            ? Math.max(0, Math.floor(Number(input.droppedExtreme)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedExtreme || 0))),
+        droppedWideSpread:
+          Number.isFinite(Number(input.droppedWideSpread))
+            ? Math.max(0, Math.floor(Number(input.droppedWideSpread)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedWideSpread || 0))),
+        droppedInvalid:
+          Number.isFinite(Number(input.droppedInvalid))
+            ? Math.max(0, Math.floor(Number(input.droppedInvalid)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.droppedInvalid || 0))),
+        consecutiveExtremeTicks:
+          Number.isFinite(Number(input.consecutiveExtremeTicks))
+            ? Math.max(0, Math.floor(Number(input.consecutiveExtremeTicks)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.consecutiveExtremeTicks || 0))),
+        extremeReselectThreshold:
+          Number.isFinite(Number(input.extremeReselectThreshold))
+            ? Math.max(0, Math.floor(Number(input.extremeReselectThreshold)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectThreshold || 0))),
+        extremeReselectTriggered:
+          input.extremeReselectTriggered !== undefined
+            ? Boolean(input.extremeReselectTriggered)
+            : Boolean(this.persistedPolymarketSnapshot.extremeReselectTriggered),
+        extremeReselectCooldownSecRemaining:
+          Number.isFinite(Number(input.extremeReselectCooldownSecRemaining))
+            ? Math.max(0, Math.floor(Number(input.extremeReselectCooldownSecRemaining)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.extremeReselectCooldownSecRemaining || 0))),
+        extremeReselectTokenId:
+          String(
+            input.extremeReselectTokenId ?? this.persistedPolymarketSnapshot.extremeReselectTokenId ?? ""
+          ).trim() || null,
+        selectionVersion:
+          Number.isFinite(Number(input.selectionVersion))
+            ? Math.max(0, Math.floor(Number(input.selectionVersion)))
+            : Math.max(0, Math.floor(Number(this.persistedPolymarketSnapshot.selectionVersion || 0))),
+        reselectionTriggered:
+          input.reselectionTriggered !== undefined
+            ? Boolean(input.reselectionTriggered)
+            : Boolean(this.persistedPolymarketSnapshot.reselectionTriggered),
+        handoffWaitTriggered:
+          input.handoffWaitTriggered !== undefined
+            ? Boolean(input.handoffWaitTriggered)
+            : Boolean(this.persistedPolymarketSnapshot.handoffWaitTriggered),
+        dispatchEligibilityReason:
+          String(
+            input.dispatchEligibilityReason ??
+              this.persistedPolymarketSnapshot.dispatchEligibilityReason ??
+              "-"
+          ).trim() || "-"
       };
+    applyTickConsistency(line);
     const pausePresentation = this.getStatusPausePresentation(line.tradingPaused, line.pauseReason ?? null);
     line.tradingPaused = pausePresentation.tradingPaused;
     line.pauseReason = pausePresentation.pauseReason;
@@ -12357,6 +13436,15 @@ export class PolymarketEngine {
       `${JSON.stringify({
         ts: new Date(truthTs).toISOString(),
         type: "tick",
+        canonicalTickMs:
+          Number.isFinite(Number(line.canonicalTickMs)) && Number(line.canonicalTickMs) > 0
+            ? Math.floor(Number(line.canonicalTickMs))
+            : truthTs,
+        canonicalTickSec:
+          Number.isFinite(Number(line.canonicalTickSec)) && Number(line.canonicalTickSec) > 0
+            ? Math.floor(Number(line.canonicalTickSec))
+            : Math.floor(truthTs / 1000),
+        remainingSecSource: String(line.remainingSecSource || "-"),
         marketsSeen: line.marketsSeen,
         discoveredCandidates: line.discoveredCandidates ?? null,
         fetchedCount: line.fetchedCount ?? null,
@@ -12380,6 +13468,45 @@ export class PolymarketEngine {
         forceTradeFired: Boolean(line.forceTradeFired),
         forceTradeMode: line.forceTradeMode ?? "none",
         windowRejectCounters: line.windowRejectCounters ?? createWindowRejectCounters(),
+        candidatesBeforeFilter:
+          Number.isFinite(Number(line.candidatesBeforeFilter)) ? Math.max(0, Math.floor(Number(line.candidatesBeforeFilter))) : 0,
+        candidatesAfterFilter:
+          Number.isFinite(Number(line.candidatesAfterFilter)) ? Math.max(0, Math.floor(Number(line.candidatesAfterFilter))) : 0,
+        droppedExtreme:
+          Number.isFinite(Number(line.droppedExtreme)) ? Math.max(0, Math.floor(Number(line.droppedExtreme))) : 0,
+        droppedWideSpread:
+          Number.isFinite(Number(line.droppedWideSpread)) ? Math.max(0, Math.floor(Number(line.droppedWideSpread))) : 0,
+        droppedInvalid:
+          Number.isFinite(Number(line.droppedInvalid)) ? Math.max(0, Math.floor(Number(line.droppedInvalid))) : 0,
+        selectionVersion:
+          Number.isFinite(Number(line.selectionVersion)) ? Math.max(0, Math.floor(Number(line.selectionVersion))) : 0,
+        reselectionTriggered: Boolean(line.reselectionTriggered),
+        handoffWaitTriggered: Boolean(line.handoffWaitTriggered),
+        dispatchEligibilityReason: String(line.dispatchEligibilityReason || "-"),
+        orderPriceSource: String(line.orderPriceSource || "-"),
+        preClampSize:
+          Number.isFinite(Number(line.preClampSize)) ? Number(line.preClampSize) : null,
+        budgetCapNotionalUsed:
+          Number.isFinite(Number(line.budgetCapNotionalUsed)) ? Number(line.budgetCapNotionalUsed) : null,
+        affordableShares:
+          Number.isFinite(Number(line.affordableShares)) ? Number(line.affordableShares) : null,
+        finalSize: Number.isFinite(Number(line.finalSize)) ? Number(line.finalSize) : null,
+        requiredNotionalForMinValidSize:
+          Number.isFinite(Number(line.requiredNotionalForMinValidSize))
+            ? Number(line.requiredNotionalForMinValidSize)
+            : null,
+        notionalAutoStepped: line.notionalAutoStepped ?? false,
+        originalTargetNotional:
+          Number.isFinite(Number(line.originalTargetNotional)) ? Number(line.originalTargetNotional) : null,
+        adjustedTargetNotional:
+          Number.isFinite(Number(line.adjustedTargetNotional)) ? Number(line.adjustedTargetNotional) : null,
+        affordabilityGapNotional:
+          Number.isFinite(Number(line.affordabilityGapNotional)) ? Number(line.affordabilityGapNotional) : null,
+        maxAllowedNotionalForThisDecision:
+          Number.isFinite(Number(line.maxAllowedNotionalForThisDecision))
+            ? Number(line.maxAllowedNotionalForThisDecision)
+            : null,
+        priceSourceMismatch: line.priceSourceMismatch ?? null,
         rejectCountsByStage: line.rejectCountsByStage ?? createRejectCountsByStage(),
         sampleRejected: line.sampleRejected ?? [],
         activeWindows: line.activeWindows,
@@ -12419,6 +13546,12 @@ export class PolymarketEngine {
         resolutionQueueCount: line.resolutionQueueCount ?? line.awaitingResolutionCount ?? 0,
         resolvedTrades: line.resolvedTrades ?? 0,
         entriesInWindow: line.entriesInWindow ?? null,
+        exitsInWindow: line.exitsInWindow ?? null,
+        scalpModeActive: line.scalpModeActive ?? false,
+        reentryCooldownSec: line.reentryCooldownSec ?? null,
+        reentryEligibleNow: line.reentryEligibleNow ?? false,
+        lastExitReason: line.lastExitReason ?? null,
+        timeInPositionSec: line.timeInPositionSec ?? null,
         windowRealizedPnlUsd: line.windowRealizedPnlUsd ?? null,
         resolutionSource: line.resolutionSource ?? null,
         oracleSource: line.oracleSource ?? "none",
@@ -12468,6 +13601,7 @@ export class PolymarketEngine {
       explicitHoldReason === "CONFIG_INFEASIBLE_MIN_SHARES" ||
       explicitHoldReason === "FAIR_PRICE_UNAVAILABLE" ||
       explicitHoldReason === "EXTREME_PRICE_FILTER" ||
+      explicitHoldReason === "EXTREME_STUCK_RESELECT" ||
       explicitHoldReason === "INSUFFICIENT_DISLOCATION" ||
       explicitHoldReason === "NON_CURRENT_OR_NEXT_WINDOW" ||
       explicitHoldReason === "AWAITING_NEXT_MARKET_DISCOVERY"
@@ -12515,6 +13649,7 @@ export class PolymarketEngine {
       detailReason === "CONFIG_INFEASIBLE_MIN_SHARES" ||
       detailReason === "FAIR_PRICE_UNAVAILABLE" ||
       detailReason === "EXTREME_PRICE_FILTER" ||
+      detailReason === "EXTREME_STUCK_RESELECT" ||
       detailReason === "INSUFFICIENT_DISLOCATION" ||
       detailReason === "NON_CURRENT_OR_NEXT_WINDOW" ||
       detailReason === "AWAITING_NEXT_MARKET_DISCOVERY"
@@ -13261,12 +14396,70 @@ export class PolymarketEngine {
     );
   }
 
+  private emitBlockerSummaryLine(line: TickLogLine, nowTs: number): void {
+    const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
+    const selectedSlug = line.selectedSlug || persistedSnapshot.selectedSlug || persistedSnapshot.selectedMarketId || "-";
+    const tokenId = line.selectedTokenId || persistedSnapshot.selectedTokenId || "-";
+    const action = this.getTickActionRoot(line.action);
+    const blockedBy =
+      normalizeHoldReason(line.blockedBy || line.dataHealthBlock || line.strategyBlock || line.holdReason || "") || "-";
+    const chosenSidePrice =
+      Number.isFinite(Number(line.chosenSidePriceUsed)) ? Number(line.chosenSidePriceUsed).toFixed(4) : "-";
+    const maxEntryPrice =
+      Number.isFinite(Number(line.maxEntryPriceConfig))
+        ? Number(line.maxEntryPriceConfig).toFixed(4)
+        : getLiveMaxEntryPriceConfigFromEnv().toFixed(4);
+    const minValidSizeEffective =
+      Number.isFinite(Number(line.minValidSizeEffective))
+        ? Number(line.minValidSizeEffective).toFixed(6)
+        : Number.isFinite(Number(line.minValidSize))
+          ? Number(line.minValidSize).toFixed(6)
+          : "0.000000";
+    const minValidCostUsdEffective =
+      Number.isFinite(Number(line.minValidCostUsdEffective))
+        ? Number(line.minValidCostUsdEffective).toFixed(4)
+        : Number.isFinite(Number(line.minValidCostUsd))
+          ? Number(line.minValidCostUsd).toFixed(4)
+          : "0.0000";
+    const targetNotional =
+      Number.isFinite(Number(line.adjustedTargetNotional))
+        ? Number(line.adjustedTargetNotional).toFixed(4)
+        : Number.isFinite(Number(line.originalTargetNotional))
+          ? Number(line.originalTargetNotional).toFixed(4)
+          : "0.0000";
+    const affordableShares =
+      Number.isFinite(Number(line.affordableShares)) ? Number(line.affordableShares).toFixed(6) : "-";
+    const sizingRejectReason = String(line.sizingRejectReason || "NONE");
+    const signature = JSON.stringify({
+      ts: nowTs,
+      selectedSlug,
+      tokenId,
+      action,
+      blockedBy,
+      chosenSidePrice,
+      maxEntryPrice,
+      minValidSizeEffective,
+      minValidCostUsdEffective,
+      targetNotional,
+      affordableShares,
+      sizingRejectReason
+    });
+    if (signature === this.lastPolyBlockerSummarySignature) {
+      return;
+    }
+    this.lastPolyBlockerSummarySignature = signature;
+    this.logger.info(
+      `POLY_BLOCKER_SUMMARY ts=${nowTs} slug=${selectedSlug} tokenId=${tokenId} action=${action} blockedBy=${blockedBy} chosenSidePrice=${chosenSidePrice} maxEntryPrice=${maxEntryPrice} minValidSizeEff=${minValidSizeEffective} minValidCostEff=${minValidCostUsdEffective} targetNotional=${targetNotional} affordableShares=${affordableShares} sizingRejectReason=${sizingRejectReason}`
+    );
+  }
+
   private emitPolyStatusLine(line: TickLogLine, nowTs: number): void {
     const persistedSnapshot = this.getPersistedPolymarketSnapshot(nowTs);
     this.emitRolloverLine(line, nowTs);
     this.emitDecisionParityLine(line, nowTs);
     this.emitIntentionalHoldDecisionLine(line, nowTs);
     this.emitPolyDebugLine(line, nowTs);
+    this.emitBlockerSummaryLine(line, nowTs);
     this.emitUiStatusLine(line, nowTs);
     const actionRoot = this.getTickActionRoot(line.action);
     const candidatesCount = Math.max(
@@ -13298,6 +14491,95 @@ export class PolymarketEngine {
       Number.isFinite(Number(line.maxWindowSec)) && Number(line.maxWindowSec) > 0
         ? Math.floor(Number(line.maxWindowSec))
         : this.scanner.getPrimaryWindowConfig().maxWindowSec;
+    const selectionVersionValue =
+      Number.isFinite(Number(line.selectionVersion))
+        ? Math.max(0, Math.floor(Number(line.selectionVersion)))
+        : Number.isFinite(Number(persistedSnapshot.selectionVersion))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.selectionVersion)))
+          : 0;
+    const reselectionTriggeredValue =
+      line.reselectionTriggered !== undefined
+        ? Boolean(line.reselectionTriggered)
+        : typeof persistedSnapshot.reselectionTriggered === "boolean"
+          ? persistedSnapshot.reselectionTriggered
+          : false;
+    const handoffWaitTriggeredValue =
+      line.handoffWaitTriggered !== undefined
+        ? Boolean(line.handoffWaitTriggered)
+        : typeof persistedSnapshot.handoffWaitTriggered === "boolean"
+          ? persistedSnapshot.handoffWaitTriggered
+          : false;
+    const dispatchEligibilityReasonValue =
+      String(line.dispatchEligibilityReason ?? persistedSnapshot.dispatchEligibilityReason ?? "-").trim() || "-";
+    const candidatesBeforeFilterValue =
+      Number.isFinite(Number(line.candidatesBeforeFilter))
+        ? Math.max(0, Math.floor(Number(line.candidatesBeforeFilter)))
+        : Number.isFinite(Number(persistedSnapshot.candidatesBeforeFilter))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.candidatesBeforeFilter)))
+          : 0;
+    const candidatesAfterFilterValue =
+      Number.isFinite(Number(line.candidatesAfterFilter))
+        ? Math.max(0, Math.floor(Number(line.candidatesAfterFilter)))
+        : Number.isFinite(Number(persistedSnapshot.candidatesAfterFilter))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.candidatesAfterFilter)))
+          : 0;
+    const droppedExtremeValue =
+      Number.isFinite(Number(line.droppedExtreme))
+        ? Math.max(0, Math.floor(Number(line.droppedExtreme)))
+        : Number.isFinite(Number(persistedSnapshot.droppedExtreme))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.droppedExtreme)))
+          : 0;
+    const droppedWideSpreadValue =
+      Number.isFinite(Number(line.droppedWideSpread))
+        ? Math.max(0, Math.floor(Number(line.droppedWideSpread)))
+        : Number.isFinite(Number(persistedSnapshot.droppedWideSpread))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.droppedWideSpread)))
+          : 0;
+    const droppedInvalidValue =
+      Number.isFinite(Number(line.droppedInvalid))
+        ? Math.max(0, Math.floor(Number(line.droppedInvalid)))
+        : Number.isFinite(Number(persistedSnapshot.droppedInvalid))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.droppedInvalid)))
+          : 0;
+    const consecutiveExtremeTicksValue =
+      Number.isFinite(Number(line.consecutiveExtremeTicks))
+        ? Math.max(0, Math.floor(Number(line.consecutiveExtremeTicks)))
+        : Number.isFinite(Number(persistedSnapshot.consecutiveExtremeTicks))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.consecutiveExtremeTicks)))
+          : 0;
+    const extremeReselectThresholdValue =
+      Number.isFinite(Number(line.extremeReselectThreshold))
+        ? Math.max(0, Math.floor(Number(line.extremeReselectThreshold)))
+        : Number.isFinite(Number(persistedSnapshot.extremeReselectThreshold))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.extremeReselectThreshold)))
+          : 0;
+    const extremeReselectTriggeredValue =
+      line.extremeReselectTriggered !== undefined
+        ? Boolean(line.extremeReselectTriggered)
+        : typeof persistedSnapshot.extremeReselectTriggered === "boolean"
+          ? persistedSnapshot.extremeReselectTriggered
+          : false;
+    const extremeReselectCooldownSecRemainingValue =
+      Number.isFinite(Number(line.extremeReselectCooldownSecRemaining))
+        ? Math.max(0, Math.floor(Number(line.extremeReselectCooldownSecRemaining)))
+        : Number.isFinite(Number(persistedSnapshot.extremeReselectCooldownSecRemaining))
+          ? Math.max(0, Math.floor(Number(persistedSnapshot.extremeReselectCooldownSecRemaining)))
+          : 0;
+    const extremeReselectTokenIdValue =
+      String(line.extremeReselectTokenId ?? persistedSnapshot.extremeReselectTokenId ?? "-").trim() || "-";
+    const canonicalTickMsValue =
+      Number.isFinite(Number(line.canonicalTickMs)) && Number(line.canonicalTickMs) > 0
+        ? Math.floor(Number(line.canonicalTickMs))
+        : nowTs;
+    const canonicalTickSecValue =
+      Number.isFinite(Number(line.canonicalTickSec)) && Number(line.canonicalTickSec) > 0
+        ? Math.floor(Number(line.canonicalTickSec))
+        : Math.floor(canonicalTickMsValue / 1000);
+    const remainingSecSourceText =
+      String(
+        line.remainingSecSource ??
+          (Number.isFinite(Number(line.tauSec)) ? "TICK_LINE" : Number.isFinite(Number(persistedSnapshot.remainingSec)) ? "PERSISTED_SELECTION" : "-")
+      ).trim() || "-";
     const dynamicThresholdMetricText = Number.isFinite(Number(line.threshold))
       ? Number(line.threshold).toFixed(4)
       : Number.isFinite(Number(persistedSnapshot.dynamicThresholdMetric))
@@ -13343,6 +14625,71 @@ export class PolymarketEngine {
     const maxNotionalPerWindowConfigText = formatOrDash(line.maxNotionalPerWindowConfig);
     const sizingCapAppliedText = String(Boolean(line.sizingCapApplied));
     const sizingRejectReasonText = String(line.sizingRejectReason || "NONE");
+    const orderPriceSourceText = String(line.orderPriceSource || "-");
+    const preClampSizeText = formatOrDash(line.preClampSize, 6);
+    const budgetCapNotionalUsedText = formatOrDash(line.budgetCapNotionalUsed);
+    const affordableSharesText = formatOrDash(line.affordableShares, 6);
+    const finalSizeText = formatOrDash(line.finalSize, 6);
+    const priceSourceMismatchText = String(line.priceSourceMismatch || "-");
+    const minValidPriceBasisValue = Number.isFinite(Number(line.minValidPriceBasis))
+      ? Math.max(0, Number(line.minValidPriceBasis))
+      : Number.isFinite(Number(line.chosenSidePriceUsed))
+        ? Math.max(0, Number(line.chosenSidePriceUsed))
+        : 0;
+    const minValidPriceBasisText = minValidPriceBasisValue.toFixed(4);
+    const minValidSizeEffectiveValue = Number.isFinite(Number(line.minValidSizeEffective))
+      ? Math.max(0, Number(line.minValidSizeEffective))
+      : Number.isFinite(Number(line.minValidSize))
+        ? Math.max(0, Number(line.minValidSize))
+        : 0;
+    const minValidSizeEffectiveText = minValidSizeEffectiveValue.toFixed(6);
+    const minValidCostUsdEffectiveValue = Number.isFinite(Number(line.minValidCostUsdEffective))
+      ? Math.max(0, Number(line.minValidCostUsdEffective))
+      : Number.isFinite(Number(line.minValidCostUsd))
+        ? Math.max(0, Number(line.minValidCostUsd))
+        : 0;
+    const minValidCostUsdEffectiveText = minValidCostUsdEffectiveValue.toFixed(4);
+    const minValidSizeValue = minValidSizeEffectiveValue;
+    const minValidSizeText = minValidSizeEffectiveText;
+    const minValidCostUsdValue = minValidCostUsdEffectiveValue;
+    const minValidCostUsdText = minValidCostUsdEffectiveText;
+    const requiredNotionalForMinValidSizeValue = Number.isFinite(Number(line.requiredNotionalForMinValidSize))
+      ? Math.max(0, Number(line.requiredNotionalForMinValidSize))
+      : 0;
+    const requiredNotionalForMinValidSizeText = requiredNotionalForMinValidSizeValue.toFixed(4);
+    const notionalAutoSteppedValue = Boolean(line.notionalAutoStepped);
+    const notionalAutoSteppedText = String(notionalAutoSteppedValue);
+    const originalTargetNotionalValue = Number.isFinite(Number(line.originalTargetNotional))
+      ? Math.max(0, Number(line.originalTargetNotional))
+      : 0;
+    const originalTargetNotionalText = originalTargetNotionalValue.toFixed(4);
+    const adjustedTargetNotionalValue = Number.isFinite(Number(line.adjustedTargetNotional))
+      ? Math.max(0, Number(line.adjustedTargetNotional))
+      : 0;
+    const adjustedTargetNotionalText = adjustedTargetNotionalValue.toFixed(4);
+    const affordabilityGapNotionalValue = Number.isFinite(Number(line.affordabilityGapNotional))
+      ? Math.max(0, Number(line.affordabilityGapNotional))
+      : 0;
+    const affordabilityGapNotionalText = affordabilityGapNotionalValue.toFixed(4);
+    const scalpModeActiveValue = line.scalpModeActive !== undefined ? Boolean(line.scalpModeActive) : false;
+    const scalpModeActiveText = String(scalpModeActiveValue);
+    const entriesInWindowValue = Number.isFinite(Number(line.entriesInWindow))
+      ? Math.max(0, Math.floor(Number(line.entriesInWindow)))
+      : Number.isFinite(Number(this.truthEntriesInWindow))
+        ? Math.max(0, Math.floor(Number(this.truthEntriesInWindow)))
+        : 0;
+    const exitsInWindowValue = Number.isFinite(Number(line.exitsInWindow))
+      ? Math.max(0, Math.floor(Number(line.exitsInWindow)))
+      : 0;
+    const reentryCooldownSecValue = Number.isFinite(Number(line.reentryCooldownSec))
+      ? Math.max(0, Math.floor(Number(line.reentryCooldownSec)))
+      : 0;
+    const reentryEligibleNowValue = line.reentryEligibleNow !== undefined ? Boolean(line.reentryEligibleNow) : false;
+    const reentryEligibleNowText = String(reentryEligibleNowValue);
+    const lastExitReasonText = String(line.lastExitReason || "-");
+    const timeInPositionSecValue = Number.isFinite(Number(line.timeInPositionSec))
+      ? Math.max(0, Math.floor(Number(line.timeInPositionSec)))
+      : 0;
     const bookabilityFailReasonText = String(line.bookabilityFailReason || "NONE");
     const tradabilityFailReasonText = String(line.tradabilityFailReason || "NONE");
     const blockerSourceText = String(
@@ -13390,6 +14737,29 @@ export class PolymarketEngine {
               : "NONE";
     const fairPriceSourceText = fairPriceSourceValue;
     const fairPriceModelOriginText = String(line.fairPriceModelOrigin || "-");
+    const maxEntryPriceConfigValue = Number.isFinite(Number(line.maxEntryPriceConfig))
+      ? clamp(Number(line.maxEntryPriceConfig), 0.0001, 0.9999)
+      : getLiveMaxEntryPriceConfigFromEnv();
+    const maxEntryPriceConfigText = maxEntryPriceConfigValue.toFixed(4);
+    const entryPriceGateValueValue = Number.isFinite(Number(line.entryPriceGateValue))
+      ? clamp(Number(line.entryPriceGateValue), 0.0001, 0.9999)
+      : Number.isFinite(Number(line.chosenSidePriceUsed))
+        ? clamp(Number(line.chosenSidePriceUsed), 0.0001, 0.9999)
+        : null;
+    const entryPriceGateValueText = entryPriceGateValueValue !== null ? entryPriceGateValueValue.toFixed(4) : "-";
+    const entryPriceGateDeltaValue =
+      Number.isFinite(Number(line.entryPriceGateDelta))
+        ? Number(line.entryPriceGateDelta)
+        : entryPriceGateValueValue !== null
+          ? entryPriceGateValueValue - maxEntryPriceConfigValue
+          : 0;
+    const entryPriceGateDeltaText = entryPriceGateDeltaValue.toFixed(4);
+    const entryPriceGateHitValue =
+      typeof line.entryPriceGateHit === "boolean"
+        ? line.entryPriceGateHit
+        : normalizeHoldReason(line.blockedBy || line.holdReason || "") === "ENTRY_PRICE_TOO_HIGH" ||
+          (entryPriceGateValueValue !== null && entryPriceGateValueValue > maxEntryPriceConfigValue);
+    const entryPriceGateHitText = String(entryPriceGateHitValue);
     const minDislocationConfigValue =
       Number.isFinite(Number(line.minDislocationConfig))
         ? Math.max(0, Number(line.minDislocationConfig))
@@ -13476,6 +14846,23 @@ export class PolymarketEngine {
       currentBucketSlug: persistedSnapshot.currentBucketSlug,
       nextBucketSlug: persistedSnapshot.nextBucketSlug,
       remainingBucket: this.getLogRemainingSecBucket(remainingSecValue),
+      selectionVersion: selectionVersionValue,
+      reselectionTriggered: reselectionTriggeredValue,
+      handoffWaitTriggered: handoffWaitTriggeredValue,
+      dispatchEligibilityReason: dispatchEligibilityReasonValue,
+      canonicalTickMs: canonicalTickMsValue,
+      canonicalTickSec: canonicalTickSecValue,
+      remainingSecSource: remainingSecSourceText,
+      candidatesBeforeFilter: candidatesBeforeFilterValue,
+      candidatesAfterFilter: candidatesAfterFilterValue,
+      droppedExtreme: droppedExtremeValue,
+      droppedWideSpread: droppedWideSpreadValue,
+      droppedInvalid: droppedInvalidValue,
+      consecutiveExtremeTicks: consecutiveExtremeTicksValue,
+      extremeReselectThreshold: extremeReselectThresholdValue,
+      extremeReselectTriggered: extremeReselectTriggeredValue,
+      extremeReselectCooldownSecRemaining: extremeReselectCooldownSecRemainingValue,
+      extremeReselectTokenId: extremeReselectTokenIdValue,
       chosenSide: chosenSideText,
       chosenDirection: chosenDirectionText,
       action: actionRoot,
@@ -13498,6 +14885,10 @@ export class PolymarketEngine {
       fairPriceSource: fairPriceSourceText,
       fairPriceModelOrigin: fairPriceModelOriginText,
       chosenSidePriceUsed: chosenSidePriceUsedText,
+      maxEntryPriceConfig: maxEntryPriceConfigText,
+      entryPriceGateHit: entryPriceGateHitText,
+      entryPriceGateValue: entryPriceGateValueText,
+      entryPriceGateDelta: entryPriceGateDeltaText,
       dislocationAbs: dislocationAbsText,
       minDislocationConfig: minDislocationConfigText,
       extremePriceFilterHit: extremePriceFilterHitText,
@@ -13505,6 +14896,9 @@ export class PolymarketEngine {
       feeBpsUsed: feeBpsUsedText,
       slippageBpsUsed: slippageBpsUsedText,
       safetyBpsUsed: safetyBpsUsedText,
+      minValidPriceBasis: minValidPriceBasisText,
+      minValidSizeEffective: minValidSizeEffectiveText,
+      minValidCostUsdEffective: minValidCostUsdEffectiveText,
       rawYesEdgeBeforeCosts: rawYesEdgeBeforeCostsText,
       rawNoEdgeBeforeCosts: rawNoEdgeBeforeCostsText,
       yesEdgeAfterCosts: yesEdgeAfterCostsText,
@@ -13516,6 +14910,8 @@ export class PolymarketEngine {
       riskBlockReasonInternal: riskBlockReasonInternalText,
       baseTargetNotional: baseTargetNotionalText,
       cappedNotional: cappedNotionalText,
+      minValidSize: minValidSizeText,
+      minValidCostUsd: minValidCostUsdText,
       computedOrderNotional: computedOrderNotionalText,
       computedShares: computedSharesText,
       maxAchievableShares: maxAchievableSharesText,
@@ -13526,6 +14922,24 @@ export class PolymarketEngine {
       maxNotionalPerWindowConfig: maxNotionalPerWindowConfigText,
       sizingCapApplied: sizingCapAppliedText,
       sizingRejectReason: sizingRejectReasonText,
+      orderPriceSource: orderPriceSourceText,
+      preClampSize: preClampSizeText,
+      budgetCapNotionalUsed: budgetCapNotionalUsedText,
+      affordableShares: affordableSharesText,
+      finalSize: finalSizeText,
+      priceSourceMismatch: priceSourceMismatchText,
+      requiredNotionalForMinValidSize: requiredNotionalForMinValidSizeText,
+      notionalAutoStepped: notionalAutoSteppedText,
+      originalTargetNotional: originalTargetNotionalText,
+      adjustedTargetNotional: adjustedTargetNotionalText,
+      affordabilityGapNotional: affordabilityGapNotionalText,
+      scalpModeActive: scalpModeActiveText,
+      entriesInWindow: entriesInWindowValue,
+      exitsInWindow: exitsInWindowValue,
+      reentryCooldownSec: reentryCooldownSecValue,
+      reentryEligibleNow: reentryEligibleNowText,
+      lastExitReason: lastExitReasonText,
+      timeInPositionSec: timeInPositionSecValue,
       bookabilityFailReason: bookabilityFailReasonText,
       tradabilityFailReason: tradabilityFailReasonText,
       tokenLiquiditySnapshot: tokenLiquiditySnapshotText
@@ -13543,15 +14957,17 @@ export class PolymarketEngine {
         persistedSnapshot.selectionSource || "-"
       )} selectedFrom=${String(persistedSnapshot.selectedFrom || persistedSnapshot.selectionSource || "-")} selectionCommitTs=${String(
         persistedSnapshot.selectionCommitTs || "-"
-      )} liveValidationReason=${String(persistedSnapshot.liveValidationReason || "-")} remainingSec=${remaining} chosenSide=${chosenSideText} chosenDirection=${chosenDirectionText} action=${actionRoot} holdReason=${holdReasonText} blockedBy=${blockedByText} holdCategory=${holdCategoryText} dataHealthBlock=${dataHealthBlockText} strategyBlock=${strategyBlockText} warningState=${warningStateText} staleState=${staleStateText} pollMode=${pollModeText} openTradesCount=${openTradesText} candidatesCount=${Math.max(candidatesCount, Number(persistedSnapshot.discoveredCandidatesCount || 0))} windowsCount=${Math.max(Number(line.afterWindowCount ?? 0), Number(persistedSnapshot.windowsCount || 0))} minEdgeThresholdConfig=${Number(
+      )} liveValidationReason=${String(persistedSnapshot.liveValidationReason || "-")} remainingSec=${remaining} remainingSecSource=${remainingSecSourceText} canonicalTickMs=${canonicalTickMsValue} canonicalTickSec=${canonicalTickSecValue} chosenSide=${chosenSideText} chosenDirection=${chosenDirectionText} action=${actionRoot} holdReason=${holdReasonText} blockedBy=${blockedByText} holdCategory=${holdCategoryText} dataHealthBlock=${dataHealthBlockText} strategyBlock=${strategyBlockText} warningState=${warningStateText} staleState=${staleStateText} pollMode=${pollModeText} openTradesCount=${openTradesText} candidatesCount=${Math.max(candidatesCount, Number(persistedSnapshot.discoveredCandidatesCount || 0))} windowsCount=${Math.max(Number(line.afterWindowCount ?? 0), Number(persistedSnapshot.windowsCount || 0))} minEdgeThresholdConfig=${Number(
         this.config.polymarket.live.minEdgeThreshold
-      ).toFixed(4)} dynamicThresholdMetric=${dynamicThresholdMetricText} bestEdge=${bestEdgeText} modelEdge=${bestEdgeText} pUpModel=${pUpModelText} yesBid=${yesBidText} yesAsk=${yesAskText} noBid=${noBidText} noAsk=${noAskText} yesSpread=${yesSpreadText} noSpread=${noSpreadText} outcomePricesHint=${outcomePricesHintText} fairYes=${fairYesText} fairPriceSource=${fairPriceSourceText} fairPriceModelOrigin=${fairPriceModelOriginText} chosenSidePriceUsed=${chosenSidePriceUsedText} dislocationAbs=${dislocationAbsText} minDislocationConfig=${minDislocationConfigText} extremePriceFilterHit=${extremePriceFilterHitText} blockerPriorityApplied=${blockerPriorityAppliedText} feeBpsUsed=${feeBpsUsedText} slippageBpsUsed=${slippageBpsUsedText} safetyBpsUsed=${safetyBpsUsedText} rawYesEdgeBeforeCosts=${rawYesEdgeBeforeCostsText} rawNoEdgeBeforeCosts=${rawNoEdgeBeforeCostsText} yesEdgeAfterCosts=${yesEdgeAfterCostsText} noEdgeAfterCosts=${noEdgeAfterCostsText} chosenEdgeBeforeClamp=${chosenEdgeBeforeClampText} chosenEdgeAfterClamp=${chosenEdgeAfterClampText} edgeClampReason=${edgeClampReasonText} blockerSource=${blockerSourceText} riskBlockReasonInternal=${riskBlockReasonInternalText} baseTargetNotional=${baseTargetNotionalText} cappedNotional=${cappedNotionalText} computedOrderNotional=${computedOrderNotionalText} computedShares=${computedSharesText} maxAchievableShares=${maxAchievableSharesText} configFeasible=${configFeasibleText} minOrderNotionalConfig=${minOrderNotionalConfigText} minSharesRequired=${minSharesRequiredText} minSharesRequiredConfig=${minSharesRequiredConfigText} maxNotionalPerWindowConfig=${maxNotionalPerWindowConfigText} sizingCapApplied=${sizingCapAppliedText} sizingRejectReason=${sizingRejectReasonText} bookabilityFailReason=${bookabilityFailReasonText} tradabilityFailReason=${tradabilityFailReasonText} tokenLiquiditySnapshot=${tokenLiquiditySnapshotText} btcMid=${
+      ).toFixed(4)} dynamicThresholdMetric=${dynamicThresholdMetricText} bestEdge=${bestEdgeText} modelEdge=${bestEdgeText} pUpModel=${pUpModelText} yesBid=${yesBidText} yesAsk=${yesAskText} noBid=${noBidText} noAsk=${noAskText} yesSpread=${yesSpreadText} noSpread=${noSpreadText} outcomePricesHint=${outcomePricesHintText} fairYes=${fairYesText} fairPriceSource=${fairPriceSourceText} fairPriceModelOrigin=${fairPriceModelOriginText} chosenSidePriceUsed=${chosenSidePriceUsedText} maxEntryPriceConfig=${maxEntryPriceConfigText} entryPriceGateHit=${entryPriceGateHitText} entryPriceGateValue=${entryPriceGateValueText} entryPriceGateDelta=${entryPriceGateDeltaText} dislocationAbs=${dislocationAbsText} minDislocationConfig=${minDislocationConfigText} extremePriceFilterHit=${extremePriceFilterHitText} blockerPriorityApplied=${blockerPriorityAppliedText} feeBpsUsed=${feeBpsUsedText} slippageBpsUsed=${slippageBpsUsedText} safetyBpsUsed=${safetyBpsUsedText} minValidPriceBasis=${minValidPriceBasisText} minValidSizeEffective=${minValidSizeEffectiveText} minValidCostUsdEffective=${minValidCostUsdEffectiveText} rawYesEdgeBeforeCosts=${rawYesEdgeBeforeCostsText} rawNoEdgeBeforeCosts=${rawNoEdgeBeforeCostsText} yesEdgeAfterCosts=${yesEdgeAfterCostsText} noEdgeAfterCosts=${noEdgeAfterCostsText} chosenEdgeBeforeClamp=${chosenEdgeBeforeClampText} chosenEdgeAfterClamp=${chosenEdgeAfterClampText} edgeClampReason=${edgeClampReasonText} blockerSource=${blockerSourceText} riskBlockReasonInternal=${riskBlockReasonInternalText} baseTargetNotional=${baseTargetNotionalText} cappedNotional=${cappedNotionalText} minValidSize=${minValidSizeText} minValidCostUsd=${minValidCostUsdText} computedOrderNotional=${computedOrderNotionalText} computedShares=${computedSharesText} maxAchievableShares=${maxAchievableSharesText} configFeasible=${configFeasibleText} minOrderNotionalConfig=${minOrderNotionalConfigText} minSharesRequired=${minSharesRequiredText} minSharesRequiredConfig=${minSharesRequiredConfigText} maxNotionalPerWindowConfig=${maxNotionalPerWindowConfigText} sizingCapApplied=${sizingCapAppliedText} sizingRejectReason=${sizingRejectReasonText} requiredNotionalForMinValidSize=${requiredNotionalForMinValidSizeText} notionalAutoStepped=${notionalAutoSteppedText} originalTargetNotional=${originalTargetNotionalText} adjustedTargetNotional=${adjustedTargetNotionalText} affordabilityGapNotional=${affordabilityGapNotionalText} orderPriceSource=${orderPriceSourceText} preClampSize=${preClampSizeText} budgetCapNotionalUsed=${budgetCapNotionalUsedText} affordableShares=${affordableSharesText} finalSize=${finalSizeText} priceSourceMismatch=${priceSourceMismatchText} scalpModeActive=${scalpModeActiveText} entriesInWindow=${entriesInWindowValue} exitsInWindow=${exitsInWindowValue} reentryCooldownSec=${reentryCooldownSecValue} reentryEligibleNow=${reentryEligibleNowText} lastExitReason=${lastExitReasonText} timeInPositionSec=${timeInPositionSecValue} bookabilityFailReason=${bookabilityFailReasonText} tradabilityFailReason=${tradabilityFailReasonText} tokenLiquiditySnapshot=${tokenLiquiditySnapshotText} btcMid=${
         Number.isFinite(Number(persistedSnapshot.currentBtcMid)) && Number(persistedSnapshot.currentBtcMid) > 0
           ? Number(persistedSnapshot.currentBtcMid).toFixed(2)
           : "-"
       } currentBucketSlug=${String(persistedSnapshot.currentBucketSlug || "-")} nextBucketSlug=${String(
         persistedSnapshot.nextBucketSlug || "-"
-      )} minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec}`
+      )} minRemainingSec=${minRemainingSec} maxRemainingSec=${maxRemainingSec} selectionVersion=${selectionVersionValue} reselectionTriggered=${String(
+        reselectionTriggeredValue
+      )} handoffWaitTriggered=${String(handoffWaitTriggeredValue)} dispatchEligibilityReason=${dispatchEligibilityReasonValue} candidatesBeforeFilter=${candidatesBeforeFilterValue} candidatesAfterFilter=${candidatesAfterFilterValue} droppedExtreme=${droppedExtremeValue} droppedWideSpread=${droppedWideSpreadValue} droppedInvalid=${droppedInvalidValue} consecutiveExtremeTicks=${consecutiveExtremeTicksValue} extremeReselectThreshold=${extremeReselectThresholdValue} extremeReselectTriggered=${String(extremeReselectTriggeredValue)} extremeReselectCooldownSecRemaining=${extremeReselectCooldownSecRemainingValue} extremeReselectTokenId=${extremeReselectTokenIdValue}`
     );
   }
 
@@ -14927,6 +16343,29 @@ type TickLogLine = {
   afterWindowCount?: number | null;
   afterPatternCount?: number | null;
   finalCandidatesCount?: number | null;
+  candidatesBeforeFilter?: number | null;
+  candidatesAfterFilter?: number | null;
+  droppedExtreme?: number | null;
+  droppedWideSpread?: number | null;
+  droppedInvalid?: number | null;
+  selectionVersion?: number | null;
+  reselectionTriggered?: boolean | null;
+  handoffWaitTriggered?: boolean | null;
+  dispatchEligibilityReason?: string | null;
+  consecutiveExtremeTicks?: number | null;
+  extremeReselectThreshold?: number | null;
+  extremeReselectTriggered?: boolean | null;
+  extremeReselectCooldownSecRemaining?: number | null;
+  extremeReselectTokenId?: string | null;
+  canonicalTickMs?: number | null;
+  canonicalTickSec?: number | null;
+  remainingSecSource?: string | null;
+  orderPriceSource?: string | null;
+  preClampSize?: number | null;
+  budgetCapNotionalUsed?: number | null;
+  affordableShares?: number | null;
+  finalSize?: number | null;
+  priceSourceMismatch?: string | null;
   rejectCountsByStage?: RejectCountsByStage;
   dominantReject?: string | null;
   windowReject?: string | null;
@@ -14961,6 +16400,10 @@ type TickLogLine = {
   fairPriceSource?: "MODEL" | "OUTCOME_HINT" | "NONE";
   fairPriceModelOrigin?: string | null;
   chosenSidePriceUsed?: number | null;
+  maxEntryPriceConfig?: number | null;
+  entryPriceGateHit?: boolean | null;
+  entryPriceGateValue?: number | null;
+  entryPriceGateDelta?: number | null;
   dislocationAbs?: number | null;
   minDislocationConfig?: number | null;
   extremePriceFilterHit?: boolean | null;
@@ -14968,8 +16411,19 @@ type TickLogLine = {
   feeBpsUsed?: number | null;
   slippageBpsUsed?: number | null;
   safetyBpsUsed?: number | null;
+  minValidPriceBasis?: number | null;
+  minValidSizeEffective?: number | null;
+  minValidCostUsdEffective?: number | null;
+  requiredNotionalForMinValidSize?: number | null;
+  notionalAutoStepped?: boolean | null;
+  originalTargetNotional?: number | null;
+  adjustedTargetNotional?: number | null;
+  affordabilityGapNotional?: number | null;
+  maxAllowedNotionalForThisDecision?: number | null;
   baseTargetNotional?: number | null;
   cappedNotional?: number | null;
+  minValidSize?: number | null;
+  minValidCostUsd?: number | null;
   computedOrderNotional?: number | null;
   computedShares?: number | null;
   maxAchievableShares?: number | null;
@@ -14984,6 +16438,7 @@ type TickLogLine = {
     | "BELOW_MIN_NOTIONAL"
     | "BELOW_MIN_SHARES"
     | "OVER_CAP_ADJUSTED"
+    | "MIN_VALID_SIZE_UNAFFORDABLE"
     | "CONFIG_INFEASIBLE_MIN_SHARES"
     | null;
   blockerSource?: "RISK" | "BOOKABILITY" | "TRADABILITY" | "STRATEGY" | null;
@@ -15055,6 +16510,12 @@ type TickLogLine = {
   resolutionQueueCount?: number;
   resolvedTrades?: number;
   entriesInWindow?: number | null;
+  exitsInWindow?: number | null;
+  scalpModeActive?: boolean | null;
+  reentryCooldownSec?: number | null;
+  reentryEligibleNow?: boolean | null;
+  lastExitReason?: string | null;
+  timeInPositionSec?: number | null;
   windowRealizedPnlUsd?: number | null;
   resolutionSource?: string | null;
   oracleSource?: string;
@@ -15444,6 +16905,18 @@ function getLiveExtremePriceMaxConfigFromEnv(minValue: number): number {
   const raw = Number(process.env.POLYMARKET_LIVE_EXTREME_PRICE_MAX || 0.95);
   if (!Number.isFinite(raw)) return clamp(0.95, minValue, 0.9999);
   return clamp(raw, minValue, 0.9999);
+}
+
+function getLiveMaxEntryPriceConfigFromEnv(): number {
+  const raw = Number(process.env.POLYMARKET_MAX_ENTRY_PRICE || 0.7);
+  if (!Number.isFinite(raw)) return 0.7;
+  return clamp(raw, 0.0001, 0.9999);
+}
+
+function getLiveSelectorWideSpreadMaxFromEnv(): number {
+  const raw = Number(process.env.POLYMARKET_LIVE_SELECTOR_WIDE_SPREAD_MAX || 0.2);
+  if (!Number.isFinite(raw)) return 0.2;
+  return clamp(raw, 0.001, 1);
 }
 
 function toPositiveIntOrDefault(value: unknown, fallback: number): number {
@@ -16012,6 +17485,11 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function ceilToPrecision(value: number, decimals: number): number {
+  const factor = 10 ** Math.max(0, decimals);
+  return Math.ceil(value * factor - 1e-9) / factor;
+}
+
 function normalizeHoldReason(reason: string | null | undefined): string | null {
   const raw = String(reason || "").trim();
   if (!raw) return null;
@@ -16053,6 +17531,7 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
   if (upper.includes("PRICE_REFRESH_FAILED_ACTIVE_MARKET")) return "PRICE_REFRESH_FAILED_ACTIVE_MARKET";
   if (upper.includes("ACTIVE_MARKET_PRICE_STALE")) return "ACTIVE_MARKET_PRICE_STALE";
   if (upper.includes("SIZE_BELOW_MIN_NOTIONAL")) return "SIZE_BELOW_MIN_NOTIONAL";
+  if (upper.includes("MIN_VALID_SIZE_UNAFFORDABLE")) return "MIN_VALID_SIZE_UNAFFORDABLE";
   if (upper.includes("CONFIG_INFEASIBLE_MIN_SHARES")) return "CONFIG_INFEASIBLE_MIN_SHARES";
   if (upper.includes("FAIR_PRICE_UNAVAILABLE")) return "FAIR_PRICE_UNAVAILABLE";
   if (upper.includes("EXTREME_PRICE_FILTER")) return "EXTREME_PRICE_FILTER";
@@ -16084,6 +17563,7 @@ function isPriorityBlockerReason(reason: string | null | undefined): boolean {
     normalized === "FAIR_PRICE_UNAVAILABLE" ||
     normalized === "EXTREME_PRICE_FILTER" ||
     normalized === "INSUFFICIENT_DISLOCATION" ||
+    normalized === "MIN_VALID_SIZE_UNAFFORDABLE" ||
     normalized === "CONFIG_INFEASIBLE_MIN_SHARES" ||
     normalized === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED" ||
     normalized === "EDGE_BELOW_THRESHOLD"
@@ -16112,6 +17592,31 @@ export function evaluateMinSharesConfigFeasibility(input: {
   return { maxAchievableShares, configFeasible };
 }
 
+export function evaluateEntryPriceGate(input: {
+  chosenSidePriceUsed: number | null;
+  maxEntryPriceConfig?: number | null;
+}): {
+  maxEntryPriceConfig: number;
+  entryPriceGateHit: boolean;
+  entryPriceGateValue: number | null;
+  entryPriceGateDelta: number;
+} {
+  const maxEntryPriceConfig = Number.isFinite(Number(input.maxEntryPriceConfig))
+    ? clamp(Number(input.maxEntryPriceConfig), 0.0001, 0.9999)
+    : getLiveMaxEntryPriceConfigFromEnv();
+  const entryPriceGateValue =
+    Number.isFinite(Number(input.chosenSidePriceUsed)) && Number(input.chosenSidePriceUsed) > 0
+      ? clamp(Number(input.chosenSidePriceUsed), 0.0001, 0.9999)
+      : null;
+  const entryPriceGateDelta = entryPriceGateValue !== null ? entryPriceGateValue - maxEntryPriceConfig : 0;
+  return {
+    maxEntryPriceConfig,
+    entryPriceGateHit: entryPriceGateValue !== null && entryPriceGateValue > maxEntryPriceConfig,
+    entryPriceGateValue,
+    entryPriceGateDelta
+  };
+}
+
 export function resolvePriorityBlockedReason(input: {
   currentReason: string | null | undefined;
   fairPriceSource: "MODEL" | "OUTCOME_HINT" | "NONE";
@@ -16130,6 +17635,7 @@ export function resolvePriorityBlockedReason(input: {
     normalizedCurrent === "FAIR_PRICE_UNAVAILABLE" ||
     normalizedCurrent === "EXTREME_PRICE_FILTER" ||
     normalizedCurrent === "INSUFFICIENT_DISLOCATION" ||
+    normalizedCurrent === "MIN_VALID_SIZE_UNAFFORDABLE" ||
     normalizedCurrent === "CONFIG_INFEASIBLE_MIN_SHARES";
   if (!gateComparable) {
     return normalizedCurrent;
@@ -16147,6 +17653,12 @@ export function resolvePriorityBlockedReason(input: {
     return "INSUFFICIENT_DISLOCATION";
   }
   if (!input.configFeasible) return "CONFIG_INFEASIBLE_MIN_SHARES";
+  if (
+    input.sizingRejectReason === "MIN_VALID_SIZE_UNAFFORDABLE" ||
+    normalizedCurrent === "MIN_VALID_SIZE_UNAFFORDABLE"
+  ) {
+    return "MIN_VALID_SIZE_UNAFFORDABLE";
+  }
   if (
     input.sizingRejectReason === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED" ||
     normalizedCurrent === "ORDER_SIZE_BELOW_MIN_SHARES_RISK_BLOCKED"
@@ -16211,6 +17723,7 @@ function classifyHoldCategory(reason: string | null | undefined): HoldCategory {
     raw.includes("MAX_EXPOSURE") ||
     raw.includes("DAILY_LOSS") ||
     raw.includes("SIZE_BELOW_MIN_NOTIONAL") ||
+    raw.includes("MIN_VALID_SIZE_UNAFFORDABLE") ||
     raw.includes("ORDER_SIZE_BELOW_MIN_SHARES") ||
     raw.includes("CONFIG_INFEASIBLE_MIN_SHARES")
   ) {

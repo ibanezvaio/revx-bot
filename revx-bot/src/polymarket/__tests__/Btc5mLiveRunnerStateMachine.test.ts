@@ -73,7 +73,14 @@ function makeConfig(overrides?: Record<string, unknown>): Record<string, unknown
         minEdgeThreshold: 0.0005,
         maxSpread: 0.05,
         oracleWarnMs: 5_000,
-        oracleHardBlockMs: 30_000
+        oracleHardBlockMs: 30_000,
+        scalpMode: false,
+        maxEntriesPerWindow: 1,
+        reentryCooldownSec: 8,
+        scalpTp1Usd: 0.12,
+        scalpTp2Usd: 0.25,
+        scalpMaxHoldSec: 60,
+        scalpTrailRetraceFrac: 0.35
       },
       sizing: {
         maxNotionalPerWindow: 10,
@@ -255,7 +262,7 @@ function logEntries(logs: LogEntry[], msg: string): LogEntry[] {
 
 async function waitForRunnerTasksToDrain(runner: Btc5mLiveRunner, timeoutMs = 500): Promise<void> {
   const start = Date.now();
-  while ((runner as any).activeExecutionTask && Date.now() - start < timeoutMs) {
+  while (((runner as any).activeExecutionTask || (runner as any).activeProfitTakeTask) && Date.now() - start < timeoutMs) {
     await sleep(2);
   }
   await sleep(0);
@@ -458,6 +465,269 @@ async function testLivePlacedNoFillPath(): Promise<void> {
       process.env.POLY_REENTRY_AFTER_UNFILLED = original;
     }
   }
+}
+
+async function testScalpModeAllowsMultipleEntriesAfterCooldown(): Promise<void> {
+  const { runner, logs } = createHarness({
+    polymarket: {
+      live: {
+        scalpMode: true,
+        maxEntriesPerWindow: 3,
+        reentryCooldownSec: 1
+      }
+    }
+  });
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" });
+  const windowState = (runner as any).getWindowEntryState(selected.slug);
+  windowState.entries = 1;
+  windowState.clearedSinceLastEntry = true;
+  windowState.cooldownUntilTs = Date.now() - 1_000;
+  (runner as any).verifySideBookAvailableForExecution = async () => true;
+  let startCalls = 0;
+  (runner as any).startExecutionAttempt = () => {
+    startCalls += 1;
+  };
+
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+
+  assert(result.action === "BUY_YES", `scalp-multi-entry: expected BUY_YES, got ${result.action}`);
+  assert(result.blocker === null, `scalp-multi-entry: blocker should be null, got ${result.blocker}`);
+  assert(startCalls === 1, `scalp-multi-entry: expected one attempt start, got ${startCalls}`);
+  assert(logEntries(logs, "POLY_V2_EXECUTION_ATTEMPT_CREATED").length === 1, "scalp-multi-entry: missing created log");
+}
+
+async function testScalpModeReentryBlockedByCooldown(): Promise<void> {
+  const { runner, logs } = createHarness({
+    polymarket: {
+      live: {
+        scalpMode: true,
+        maxEntriesPerWindow: 3,
+        reentryCooldownSec: 8
+      }
+    }
+  });
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" });
+  const windowState = (runner as any).getWindowEntryState(selected.slug);
+  windowState.entries = 1;
+  windowState.clearedSinceLastEntry = true;
+  windowState.cooldownUntilTs = Date.now() + 10_000;
+  (runner as any).verifySideBookAvailableForExecution = async () => true;
+  let startCalls = 0;
+  (runner as any).startExecutionAttempt = () => {
+    startCalls += 1;
+  };
+
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+
+  assert(result.action === "HOLD", `scalp-reentry-cooldown: expected HOLD, got ${result.action}`);
+  assert(result.blocker === "REENTRY_COOLDOWN", `scalp-reentry-cooldown: expected REENTRY_COOLDOWN, got ${result.blocker}`);
+  assert(startCalls === 0, `scalp-reentry-cooldown: startExecutionAttempt should not run, got ${startCalls}`);
+  assert(
+    logEntries(logs, "POLY_V2_REENTRY_EVAL").some((row) => row.payload.reason === "REENTRY_COOLDOWN"),
+    "scalp-reentry-cooldown: expected REENTRY_COOLDOWN log"
+  );
+}
+
+async function testScalpEntriesCappedByMaxEntriesPerWindow(): Promise<void> {
+  const { runner, logs } = createHarness({
+    polymarket: {
+      live: {
+        scalpMode: true,
+        maxEntriesPerWindow: 2,
+        reentryCooldownSec: 1
+      }
+    }
+  });
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" });
+  const windowState = (runner as any).getWindowEntryState(selected.slug);
+  windowState.entries = 2;
+  windowState.clearedSinceLastEntry = true;
+  windowState.cooldownUntilTs = 0;
+  (runner as any).verifySideBookAvailableForExecution = async () => true;
+  let startCalls = 0;
+  (runner as any).startExecutionAttempt = () => {
+    startCalls += 1;
+  };
+
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+
+  assert(result.action === "HOLD", `scalp-max-entries: expected HOLD, got ${result.action}`);
+  assert(result.blocker === "MAX_ENTRIES_PER_WINDOW", `scalp-max-entries: expected MAX_ENTRIES_PER_WINDOW, got ${result.blocker}`);
+  assert(startCalls === 0, `scalp-max-entries: startExecutionAttempt should not run, got ${startCalls}`);
+  assert(
+    logEntries(logs, "POLY_V2_REENTRY_EVAL").some((row) => row.payload.reason === "MAX_ENTRIES_PER_WINDOW"),
+    "scalp-max-entries: expected max entries log"
+  );
+}
+
+async function testScalpProfitTakeTp1AndTp2RealizePnl(): Promise<void> {
+  const runCase = async (input: {
+    label: string;
+    shares: number;
+    avgPrice: number;
+    bidPrice: number;
+    expectedExitReason: "TP1" | "TP2";
+  }): Promise<void> => {
+    const { runner, logs } = createHarness({
+      polymarket: {
+        live: {
+          scalpMode: true,
+          scalpTp1Usd: 0.12,
+          scalpTp2Usd: 0.25,
+          scalpMaxHoldSec: 60
+        }
+      }
+    });
+    const tick = makeTick();
+    const selected = makeSelected(tick, {
+      yesBook: {
+        ...makeSelected(tick).yesBook,
+        bestBid: input.bidPrice,
+        bestAsk: input.bidPrice + 0.01,
+        mid: input.bidPrice + 0.005
+      }
+    });
+    (runner as any).execution = {
+      getPositions: () => [
+        {
+          marketId: selected.marketId,
+          tokenId: selected.yesTokenId,
+          side: "YES",
+          shares: input.shares,
+          avgPrice: input.avgPrice,
+          updatedTs: tick.tickNowMs - 10_000
+        }
+      ],
+      getOpenOrders: () => [],
+      executeExit: async () => ({
+        accepted: true,
+        filledShares: input.shares,
+        fillPrice: input.bidPrice,
+        reason: null
+      })
+    };
+    (runner as any).selector = {
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+
+    const blocker = await (runner as any).maybeDispatchProfitTake({
+      tick,
+      selected,
+      allowExecution: true
+    });
+    assert(blocker === "PROFIT_TAKE_IN_FLIGHT", `${input.label}: expected PROFIT_TAKE_IN_FLIGHT, got ${blocker}`);
+    await waitForRunnerTasksToDrain(runner);
+
+    const windowState = (runner as any).getWindowEntryState(selected.slug);
+    assert(windowState.exits === 1, `${input.label}: expected one exit, got ${windowState.exits}`);
+    assert(windowState.realizedPnlUsd > 0, `${input.label}: expected realized pnl > 0, got ${windowState.realizedPnlUsd}`);
+    assert(windowState.lastExitReason === input.expectedExitReason, `${input.label}: exit reason mismatch ${windowState.lastExitReason}`);
+    const resultLog = logEntries(logs, "POLY_V2_PROFIT_TAKE_RESULT").find(
+      (row) => row.payload.accepted === true
+    );
+    assert(Boolean(resultLog), `${input.label}: missing accepted profit-take result log`);
+    assert(
+      resultLog?.payload.exitReason === input.expectedExitReason,
+      `${input.label}: expected exitReason ${input.expectedExitReason}, got ${String(resultLog?.payload.exitReason)}`
+    );
+  };
+
+  await runCase({
+    label: "tp1",
+    shares: 1,
+    avgPrice: 0.4,
+    bidPrice: 0.55,
+    expectedExitReason: "TP1"
+  });
+  await runCase({
+    label: "tp2",
+    shares: 2,
+    avgPrice: 0.25,
+    bidPrice: 0.5,
+    expectedExitReason: "TP2"
+  });
+}
+
+async function testScalpProfitTakeMaxHoldExit(): Promise<void> {
+  const { runner, logs } = createHarness({
+    polymarket: {
+      live: {
+        scalpMode: true,
+        scalpTp1Usd: 1,
+        scalpTp2Usd: 2,
+        scalpMaxHoldSec: 20
+      }
+    }
+  });
+  const tick = makeTick();
+  const selected = makeSelected(tick, {
+    yesBook: {
+      ...makeSelected(tick).yesBook,
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      mid: 0.495
+    }
+  });
+  (runner as any).execution = {
+    getPositions: () => [
+      {
+        marketId: selected.marketId,
+        tokenId: selected.yesTokenId,
+        side: "YES",
+        shares: 1,
+        avgPrice: 0.5,
+        updatedTs: tick.tickNowMs - 40_000
+      }
+    ],
+    getOpenOrders: () => [],
+    executeExit: async () => ({
+      accepted: true,
+      filledShares: 1,
+      fillPrice: 0.49,
+      reason: null
+    })
+  };
+  (runner as any).selector = {
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+
+  const blocker = await (runner as any).maybeDispatchProfitTake({
+    tick,
+    selected,
+    allowExecution: true
+  });
+  assert(blocker === "PROFIT_TAKE_IN_FLIGHT", `max-hold: expected PROFIT_TAKE_IN_FLIGHT, got ${blocker}`);
+  await waitForRunnerTasksToDrain(runner);
+
+  const windowState = (runner as any).getWindowEntryState(selected.slug);
+  assert(windowState.exits === 1, `max-hold: expected one exit, got ${windowState.exits}`);
+  assert(windowState.lastExitReason === "MAX_HOLD", `max-hold: expected MAX_HOLD, got ${windowState.lastExitReason}`);
+  const resultLog = logEntries(logs, "POLY_V2_PROFIT_TAKE_RESULT").find((row) => row.payload.accepted === true);
+  assert(Boolean(resultLog), "max-hold: missing accepted result log");
+  assert(resultLog?.payload.exitReason === "MAX_HOLD", `max-hold: expected MAX_HOLD, got ${String(resultLog?.payload.exitReason)}`);
 }
 
 async function testManualStopPath(): Promise<void> {
@@ -908,6 +1178,11 @@ async function testBlockerNormalizationSnapshot(): Promise<void> {
 export async function runBtc5mLiveRunnerStateMachineTests(): Promise<void> {
   const tests: Array<{ name: string; fn: () => Promise<void> }> = [
     { name: "single active attempt invariant", fn: testSingleActiveAttemptInvariant },
+    { name: "scalp mode allows multiple entries after cooldown", fn: testScalpModeAllowsMultipleEntriesAfterCooldown },
+    { name: "scalp mode blocks re-entry during cooldown", fn: testScalpModeReentryBlockedByCooldown },
+    { name: "scalp entries capped by max entries per window", fn: testScalpEntriesCappedByMaxEntriesPerWindow },
+    { name: "scalp TP1/TP2 exits realize pnl", fn: testScalpProfitTakeTp1AndTp2RealizePnl },
+    { name: "scalp max-hold exit fires", fn: testScalpProfitTakeMaxHoldExit },
     { name: "rollover stale cleanup", fn: testRolloverStaleHandling },
     { name: "superseded selection cleanup", fn: testSupersededSelectionHandling },
     { name: "deadline exceeded before post", fn: testDeadlineExceededBeforePost },

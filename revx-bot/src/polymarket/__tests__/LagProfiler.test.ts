@@ -4,6 +4,9 @@ import { rmSync } from "node:fs";
 import { LagProfiler } from "../LagProfiler";
 import { runBtc5mSelectorV2Tests } from "./Btc5mSelectorV2.test";
 import { runBtc5mLiveRunnerStateMachineTests } from "./Btc5mLiveRunnerStateMachine.test";
+import { runPolymarketExecutionSizingTests } from "./PolymarketExecutionSizing.test";
+import { runPolymarketEngineTelemetryTests } from "./PolymarketEngineTelemetry.test";
+import { runPolymarketClientOrderBookTests } from "./PolymarketClientOrderBook.test";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -76,6 +79,9 @@ async function run(): Promise<void> {
   rmSync(`${logPath}.3`, { force: true });
   await runBtc5mSelectorV2Tests();
   await runBtc5mLiveRunnerStateMachineTests();
+  await runPolymarketExecutionSizingTests();
+  await runPolymarketEngineTelemetryTests();
+  await runPolymarketClientOrderBookTests();
   // eslint-disable-next-line no-console
   console.log("LagProfiler tests: PASS");
 }

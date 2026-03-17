@@ -120,6 +120,13 @@ export type PolymarketConfig = {
     fastPollMs: number;
     veryFastPollMs: number;
     discoveryStaleMs: number;
+    scalpMode: boolean;
+    maxEntriesPerWindow: number;
+    reentryCooldownSec: number;
+    scalpTp1Usd: number;
+    scalpTp2Usd: number;
+    scalpMaxHoldSec: number;
+    scalpTrailRetraceFrac: number;
   };
   paper: {
     ledgerPath: string;
@@ -1328,6 +1335,48 @@ export function loadConfig(): BotConfig {
     5_000,
     300_000
   );
+  const polymarketLiveScalpMode = boolWithDefault("POLYMARKET_SCALP_MODE", false);
+  const polymarketLiveMaxEntriesPerWindow = clampInt(
+    numberWithFallback(
+      ["POLYMARKET_MAX_ENTRIES_PER_WINDOW", "POLY_V2_MAX_ENTRIES_PER_WINDOW"],
+      polymarketLiveScalpMode ? 3 : 1
+    ),
+    1,
+    20
+  );
+  const polymarketLegacyReentryCooldownMs = optional("POLY_V2_REENTRY_COOLDOWN_MS");
+  const polymarketLiveReentryCooldownSec = clampInt(
+    numberWithFallback(
+      ["POLYMARKET_REENTRY_COOLDOWN_SEC"],
+      polymarketLegacyReentryCooldownMs
+        ? Math.floor(Math.max(0, Number(polymarketLegacyReentryCooldownMs)) / 1000)
+        : polymarketLiveScalpMode
+          ? 8
+          : 4
+    ),
+    1,
+    120
+  );
+  const polymarketLiveScalpTp1Usd = clampNumber(
+    numberWithDefault("POLYMARKET_SCALP_TP1_USD", 0.12),
+    0.01,
+    100
+  );
+  const polymarketLiveScalpTp2Usd = clampNumber(
+    numberWithDefault("POLYMARKET_SCALP_TP2_USD", 0.25),
+    0.01,
+    100
+  );
+  const polymarketLiveScalpMaxHoldSec = clampInt(
+    numberWithDefault("POLYMARKET_SCALP_MAX_HOLD_SEC", 60),
+    5,
+    600
+  );
+  const polymarketLiveScalpTrailRetraceFrac = clampNumber(
+    numberWithDefault("POLYMARKET_SCALP_TRAIL_RETRACE_FRAC", 0.35),
+    0.05,
+    0.95
+  );
   const polymarketPaperLedgerPath = withDefault(
     "POLYMARKET_PAPER_LEDGER_PATH",
     "data/polymarket-paper-ledger.jsonl"
@@ -1530,6 +1579,9 @@ export function loadConfig(): BotConfig {
   }
   if (polymarketLiveYesMidMin >= polymarketLiveYesMidMax) {
     throw new Error("POLYMARKET_LIVE_YES_MID_MAX must be > POLYMARKET_LIVE_YES_MID_MIN");
+  }
+  if (polymarketLiveScalpTp2Usd < polymarketLiveScalpTp1Usd) {
+    throw new Error("POLYMARKET_SCALP_TP2_USD must be >= POLYMARKET_SCALP_TP1_USD");
   }
   if (polymarketExtremeHighPrice <= polymarketExtremeLowPrice) {
     throw new Error("POLYMARKET_EXTREME_HIGH_PRICE must be > POLYMARKET_EXTREME_LOW_PRICE");
@@ -2000,7 +2052,14 @@ export function loadConfig(): BotConfig {
         veryFastPollRemainingSec: polymarketLiveVeryFastPollRemainingSec,
         fastPollMs: polymarketLiveFastPollMs,
         veryFastPollMs: polymarketLiveVeryFastPollMs,
-        discoveryStaleMs: polymarketLiveDiscoveryStaleMs
+        discoveryStaleMs: polymarketLiveDiscoveryStaleMs,
+        scalpMode: polymarketLiveScalpMode,
+        maxEntriesPerWindow: polymarketLiveMaxEntriesPerWindow,
+        reentryCooldownSec: polymarketLiveReentryCooldownSec,
+        scalpTp1Usd: polymarketLiveScalpTp1Usd,
+        scalpTp2Usd: polymarketLiveScalpTp2Usd,
+        scalpMaxHoldSec: polymarketLiveScalpMaxHoldSec,
+        scalpTrailRetraceFrac: polymarketLiveScalpTrailRetraceFrac
       },
       paper: {
         ledgerPath: polymarketPaperLedgerPath,

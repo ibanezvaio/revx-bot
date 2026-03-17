@@ -3,6 +3,7 @@ import { BotConfig } from "../config";
 import { Logger } from "../logger";
 import { sleep } from "../util/time";
 import { PolymarketClient } from "./PolymarketClient";
+import { computePolymarketEffectiveSizingBasis, getPolymarketSizingFeeBufferBps } from "./sizingMinimums";
 import { ExecutionResult, OpenOrderState, PositionState } from "./types";
 
 type SubmittedOrderMeta = {
@@ -53,6 +54,7 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    priceSource?: string;
     orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
     executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
@@ -66,6 +68,7 @@ export class PolymarketExecution {
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
+      priceSource: params.priceSource,
       orderMode: params.orderMode,
       executionGuard: params.executionGuard,
       executionLifecycle: params.executionLifecycle
@@ -80,6 +83,7 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    priceSource?: string;
     orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
     executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
@@ -93,6 +97,7 @@ export class PolymarketExecution {
       notionalUsd: params.notionalUsd,
       tickSize: params.tickSize,
       negRisk: params.negRisk,
+      priceSource: params.priceSource,
       orderMode: params.orderMode,
       executionGuard: params.executionGuard,
       executionLifecycle: params.executionLifecycle
@@ -108,6 +113,7 @@ export class PolymarketExecution {
     notionalUsd: number;
     tickSize?: "0.1" | "0.01" | "0.001" | "0.0001";
     negRisk?: boolean;
+    priceSource?: string;
     orderMode?: EntryOrderMode;
     executionGuard?: () => boolean;
     executionLifecycle?: (event: ExecutionLifecycleEvent, payload?: Record<string, unknown>) => void;
@@ -166,18 +172,21 @@ export class PolymarketExecution {
     const maxSharesPerEntry = getMaxSharesPerEntry();
     const intendedOrderMode = normalizeEntryOrderMode(params.orderMode);
     const marketabilityBufferBps = getMarketableBufferBps();
-    const feeBufferBps = getSizingFeeBufferBps();
+    const feeBufferBps = getPolymarketSizingFeeBufferBps();
     const feeMultiplier = 1 + feeBufferBps / 10_000;
+    const orderPriceSource = String(params.priceSource || "SIDE_BOOK").trim() || "SIDE_BOOK";
 
     const desiredCostUsd = Math.min(
       Math.max(requestedNotionalUsd > 0 ? requestedNotionalUsd : targetEntryNotionalUsd, minEntryNotionalUsd),
       maxEntryNotionalUsd,
       Math.max(0, this.config.polymarket.sizing.maxNotionalPerWindow)
     );
+    const budgetCapNotionalUsed = desiredCostUsd;
     const effectiveAffordableCostUsd =
       availableCashUsd !== null
         ? Math.max(0, availableCashUsd - reservedCashUsd - unsettledCashUsd)
         : Number.POSITIVE_INFINITY;
+    const affordableBudgetCostUsd = Math.min(effectiveAffordableCostUsd, budgetCapNotionalUsed);
 
     const tickValue = Number(tickSize);
     const marketableBufferFromBps = quotedPrice * (marketabilityBufferBps / 10_000);
@@ -199,20 +208,29 @@ export class PolymarketExecution {
         bestBid: Number.isFinite(Number(params.bidPrice)) ? Number(params.bidPrice) : null,
         bestAsk: Number.isFinite(Number(params.askPrice)) ? Number(params.askPrice) : null,
         chosenPrice: limitPrice,
-        priceSource: "LIVE_SIDE_BOOK",
+        priceSource: orderPriceSource,
         marketabilityBufferBps
       },
       "POLY_V2_ENTRY_PRICE_PLAN"
     );
 
-    const minVenueShares = getMinVenueShares();
-    const minVenueNotionalUsd = getMinVenueNotionalUsd();
-    const minSharesForVenueNotional =
-      minVenueNotionalUsd > 0 ? ceilToPrecision(minVenueNotionalUsd / Math.max(limitPrice, 0.0001), 6) : 0;
-    const minValidSize = Math.max(minVenueShares, minSharesForVenueNotional);
-    const minValidCostUsd = minValidSize * limitPrice * feeMultiplier;
-    const affordableCostUsd = Math.min(desiredCostUsd, effectiveAffordableCostUsd);
-    let shares = floorToPrecision(affordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
+    const minVenueShares = getMinVenueShares(this.config.polymarket.sizing.minSharesRequired);
+    const minVenueNotionalUsd = getMinVenueNotionalUsd(this.config.polymarket.sizing.minOrderNotional);
+    const effectiveVenueMinimums = computePolymarketEffectiveSizingBasis({
+      enabled: true,
+      orderPrice: limitPrice,
+      minVenueShares,
+      minVenueNotionalUsd,
+      feeBufferBps
+    });
+    const minValidSize = effectiveVenueMinimums.minValidSizeEffective;
+    const minValidCostUsd = effectiveVenueMinimums.minValidCostUsdEffective;
+    let shares = floorToPrecision(affordableBudgetCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
+    const preClampSize = shares;
+    const affordableShares = floorToPrecision(
+      affordableBudgetCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001),
+      6
+    );
     let estimatedCost = shares * limitPrice;
     let feeAdjustedCostUsd = estimatedCost * feeMultiplier;
 
@@ -225,24 +243,50 @@ export class PolymarketExecution {
         minOrderCostUsd: minValidCostUsd,
         chosenPrice: limitPrice,
         chosenSize: shares,
+        orderPriceSource,
+        preClampSize,
+        budgetCapNotionalUsed,
+        affordableShares,
         side: params.side,
         tokenId: params.tokenId
       },
       "POLY_V2_BUYING_POWER_CHECK"
     );
 
-    if (shares < minValidSize) {
-      if (!(effectiveAffordableCostUsd >= minValidCostUsd - 1e-9)) {
-        return {
-          action: "HOLD",
-          accepted: false,
-          filledShares: 0,
-          reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
-        };
-      }
+    if (shares < minValidSize && affordableBudgetCostUsd >= minValidCostUsd - 1e-9) {
       shares = minValidSize;
       estimatedCost = shares * limitPrice;
       feeAdjustedCostUsd = estimatedCost * feeMultiplier;
+    }
+    if (shares < minValidSize) {
+      this.logger.warn(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          side: params.side,
+          targetNotional: desiredCostUsd,
+          finalPrice: limitPrice,
+          minValidPriceBasis: effectiveVenueMinimums.minValidPriceBasis,
+          minValidSizeEffective: effectiveVenueMinimums.minValidSizeEffective,
+          minValidCostUsdEffective: effectiveVenueMinimums.minValidCostUsdEffective,
+          finalSize: shares,
+          estimatedCost,
+          minValidSize,
+          minValidCostUsd,
+          preClampSize,
+          budgetCapNotionalUsed,
+          affordableShares,
+          sizingRejectReason: "MIN_SHARES_UNAFFORDABLE",
+          orderPriceSource
+        },
+        "POLY_ORDER_SIZING_REJECT"
+      );
+      return {
+        action: "HOLD",
+        accepted: false,
+        filledShares: 0,
+        reason: "MIN_SHARES_UNAFFORDABLE"
+      };
     }
 
     shares = Math.min(shares, maxSharesPerEntry);
@@ -252,49 +296,75 @@ export class PolymarketExecution {
         action: "HOLD",
         accepted: false,
         filledShares: 0,
-        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+        reason: "MIN_SHARES_UNAFFORDABLE"
       };
     }
 
     estimatedCost = shares * limitPrice;
     feeAdjustedCostUsd = estimatedCost * feeMultiplier;
-    if (feeAdjustedCostUsd > effectiveAffordableCostUsd + 1e-9) {
-      shares = floorToPrecision(effectiveAffordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
+    if (feeAdjustedCostUsd > affordableBudgetCostUsd + 1e-9) {
+      shares = floorToPrecision(affordableBudgetCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001), 6);
       estimatedCost = shares * limitPrice;
       feeAdjustedCostUsd = estimatedCost * feeMultiplier;
     }
 
     if (shares < minValidSize || feeAdjustedCostUsd < minValidCostUsd - 1e-9) {
+      this.logger.warn(
+        {
+          marketId: params.marketId,
+          tokenId: params.tokenId,
+          side: params.side,
+          targetNotional: desiredCostUsd,
+          finalPrice: limitPrice,
+          minValidPriceBasis: effectiveVenueMinimums.minValidPriceBasis,
+          minValidSizeEffective: effectiveVenueMinimums.minValidSizeEffective,
+          minValidCostUsdEffective: effectiveVenueMinimums.minValidCostUsdEffective,
+          finalSize: shares,
+          estimatedCost,
+          minValidSize,
+          minValidCostUsd,
+          preClampSize,
+          budgetCapNotionalUsed,
+          affordableShares,
+          sizingRejectReason: "MIN_SHARES_UNAFFORDABLE",
+          orderPriceSource
+        },
+        "POLY_ORDER_SIZING_REJECT"
+      );
       return {
         action: "HOLD",
         accepted: false,
         filledShares: 0,
-        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+        reason: "MIN_SHARES_UNAFFORDABLE"
       };
     }
 
     const targetNotionalUsd = desiredCostUsd;
     const maxAffordableSize = Math.min(
       maxSharesPerEntry,
-      effectiveAffordableCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001)
+      affordableBudgetCostUsd / Math.max(limitPrice * feeMultiplier, 0.0001)
     );
     this.logger.info(
       {
         targetCostUsd: targetNotionalUsd,
         maxCostUsd: maxEntryNotionalUsd,
-        affordableCostUsd: Number.isFinite(effectiveAffordableCostUsd) ? effectiveAffordableCostUsd : null,
+        affordableCostUsd: Number.isFinite(affordableBudgetCostUsd) ? affordableBudgetCostUsd : null,
         selectedPrice: limitPrice,
         selectedSize: shares,
         minValidSize,
         minValidCostUsd,
         feeAdjustedCostUsd,
+        preClampSize,
+        budgetCapNotionalUsed,
+        affordableShares,
+        orderPriceSource,
         side: params.side,
         tokenId: params.tokenId
       },
       "POLY_V2_ENTRY_SIZING"
     );
 
-    if (estimatedCost > maxEntryNotionalUsd + 1e-9) {
+    if (estimatedCost > budgetCapNotionalUsed + 1e-9) {
       this.logger.warn(
         {
           marketId: params.marketId,
@@ -302,14 +372,22 @@ export class PolymarketExecution {
           side: params.side,
           targetNotional: targetNotionalUsd,
           finalPrice: limitPrice,
+          minValidPriceBasis: effectiveVenueMinimums.minValidPriceBasis,
+          minValidSizeEffective: effectiveVenueMinimums.minValidSizeEffective,
+          minValidCostUsdEffective: effectiveVenueMinimums.minValidCostUsdEffective,
           finalSize: shares,
           estimatedCost,
+          minValidSize,
+          minValidCostUsd,
           maxAffordableSize,
+          budgetCapNotionalUsed,
           maxEntryNotionalUsd,
           minEntryNotionalUsd,
           maxSharesPerEntry,
           intendedOrderMode: intendedOrderMode === "MARKETABLE" ? "MARKETABLE_ENTRY" : "RESTING_ENTRY",
-          maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow
+          maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow,
+          sizingRejectReason: "ORDER_COST_EXCEEDS_BUDGET",
+          orderPriceSource
         },
         "POLY_ORDER_SIZING_REJECT"
       );
@@ -320,7 +398,7 @@ export class PolymarketExecution {
         reason: "ORDER_COST_EXCEEDS_BUDGET"
       };
     }
-    if (feeAdjustedCostUsd > effectiveAffordableCostUsd + 1e-9) {
+    if (feeAdjustedCostUsd > affordableBudgetCostUsd + 1e-9) {
       this.logger.warn(
         {
           marketId: params.marketId,
@@ -331,6 +409,7 @@ export class PolymarketExecution {
           finalSize: shares,
           estimatedCost,
           maxAffordableSize,
+          budgetCapNotionalUsed,
           maxEntryNotionalUsd,
           minEntryNotionalUsd,
           maxSharesPerEntry,
@@ -338,7 +417,14 @@ export class PolymarketExecution {
           maxNotionalPerWindow: this.config.polymarket.sizing.maxNotionalPerWindow,
           knownAffordableUsd,
           reservedCashUsd,
-          unsettledCashUsd
+          unsettledCashUsd,
+          minValidPriceBasis: effectiveVenueMinimums.minValidPriceBasis,
+          minValidSizeEffective: effectiveVenueMinimums.minValidSizeEffective,
+          minValidCostUsdEffective: effectiveVenueMinimums.minValidCostUsdEffective,
+          minValidSize,
+          minValidCostUsd,
+          sizingRejectReason: "MIN_SHARES_UNAFFORDABLE",
+          orderPriceSource
         },
         "POLY_ORDER_SIZING_REJECT"
       );
@@ -346,7 +432,7 @@ export class PolymarketExecution {
         action: "HOLD",
         accepted: false,
         filledShares: 0,
-        reason: "INSUFFICIENT_BUYING_POWER_FOR_MIN_ORDER"
+        reason: "MIN_SHARES_UNAFFORDABLE"
       };
     }
     this.logger.info(
@@ -360,6 +446,10 @@ export class PolymarketExecution {
         estimatedCost,
         feeAdjustedCostUsd,
         maxAffordableSize,
+        budgetCapNotionalUsed,
+        preClampSize,
+        affordableShares,
+        orderPriceSource,
         maxEntryNotionalUsd,
         minEntryNotionalUsd,
         maxSharesPerEntry,
@@ -1326,8 +1416,8 @@ function ceilToPrecision(value: number, decimals: number): number {
   return Math.ceil(value * factor) / factor;
 }
 
-function getMinVenueShares(): number {
-  const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || 5);
+function getMinVenueShares(configuredValue?: number | null): number {
+  const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || configuredValue || 5);
   if (!Number.isFinite(envValue)) return 5;
   return Math.max(1, Math.floor(envValue));
 }
@@ -1356,8 +1446,8 @@ function getMaxSharesPerEntry(): number {
   return Math.max(1, Math.min(100_000, Math.floor(envValue)));
 }
 
-function getMinVenueNotionalUsd(): number {
-  const envValue = Number(process.env.POLYMARKET_MIN_ORDER_NOTIONAL_USD || 0);
+function getMinVenueNotionalUsd(configuredValue?: number | null): number {
+  const envValue = Number(process.env.POLYMARKET_MIN_ORDER_NOTIONAL_USD || configuredValue || 0);
   if (!Number.isFinite(envValue)) return 0;
   return Math.max(0, Math.min(100, envValue));
 }
@@ -1366,12 +1456,6 @@ function getMarketableBufferBps(): number {
   const envValue = Number(process.env.POLY_MARKETABLE_BUFFER_BPS || 50);
   if (!Number.isFinite(envValue)) return 50;
   return Math.max(0, Math.min(2_000, envValue));
-}
-
-function getSizingFeeBufferBps(): number {
-  const envValue = Number(process.env.POLY_LIVE_SIZING_FEE_BUFFER_BPS || 30);
-  if (!Number.isFinite(envValue)) return 30;
-  return Math.max(0, Math.min(1_000, envValue));
 }
 
 function normalizeEntryOrderMode(value: EntryOrderMode | string | undefined): EntryOrderMode {

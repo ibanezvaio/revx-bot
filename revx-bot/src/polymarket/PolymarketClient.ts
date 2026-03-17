@@ -1765,8 +1765,8 @@ export class PolymarketClient {
     const asks = this.parseLevels(obj.asks, "asks");
     return {
       tokenId,
-      bestBid: bids.length > 0 ? bids[0].price : 0,
-      bestAsk: asks.length > 0 ? asks[0].price : 1,
+      bestBid: bids.length > 0 ? bids[0].price : Number.NaN,
+      bestAsk: asks.length > 0 ? asks[0].price : Number.NaN,
       bids,
       asks,
       ts: Date.now()
