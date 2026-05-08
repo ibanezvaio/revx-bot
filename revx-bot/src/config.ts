@@ -1257,7 +1257,7 @@ export function loadConfig(): BotConfig {
     false
   );
   const polymarketLiveMinEntryRemainingSec = clampInt(
-    numberWithDefault("POLYMARKET_LIVE_MIN_REMAINING_SEC_TO_ENTER", 90),
+    numberWithDefault("POLYMARKET_LIVE_MIN_REMAINING_SEC_TO_ENTER", 20),
     1,
     300
   );
@@ -1272,7 +1272,7 @@ export function loadConfig(): BotConfig {
         "POLYMARKET_MIN_EDGE_THRESHOLD",
         "POLYMARKET_MIN_EDGE"
       ],
-      0.02
+      0.005
     ),
     0,
     0.25
@@ -1335,11 +1335,11 @@ export function loadConfig(): BotConfig {
     5_000,
     300_000
   );
-  const polymarketLiveScalpMode = boolWithDefault("POLYMARKET_SCALP_MODE", false);
+  const polymarketLiveScalpMode = boolWithDefault("POLYMARKET_SCALP_MODE", true);
   const polymarketLiveMaxEntriesPerWindow = clampInt(
     numberWithFallback(
       ["POLYMARKET_MAX_ENTRIES_PER_WINDOW", "POLY_V2_MAX_ENTRIES_PER_WINDOW"],
-      polymarketLiveScalpMode ? 3 : 1
+      polymarketLiveScalpMode ? 10 : 1
     ),
     1,
     20
@@ -1351,29 +1351,29 @@ export function loadConfig(): BotConfig {
       polymarketLegacyReentryCooldownMs
         ? Math.floor(Math.max(0, Number(polymarketLegacyReentryCooldownMs)) / 1000)
         : polymarketLiveScalpMode
-          ? 8
+          ? 2
           : 4
     ),
     1,
     120
   );
   const polymarketLiveScalpTp1Usd = clampNumber(
-    numberWithDefault("POLYMARKET_SCALP_TP1_USD", 0.12),
+    numberWithDefault("POLYMARKET_SCALP_TP1_USD", 0.03),
     0.01,
     100
   );
   const polymarketLiveScalpTp2Usd = clampNumber(
-    numberWithDefault("POLYMARKET_SCALP_TP2_USD", 0.25),
+    numberWithDefault("POLYMARKET_SCALP_TP2_USD", 0.06),
     0.01,
     100
   );
   const polymarketLiveScalpMaxHoldSec = clampInt(
-    numberWithDefault("POLYMARKET_SCALP_MAX_HOLD_SEC", 60),
+    numberWithDefault("POLYMARKET_SCALP_MAX_HOLD_SEC", 20),
     5,
     600
   );
   const polymarketLiveScalpTrailRetraceFrac = clampNumber(
-    numberWithDefault("POLYMARKET_SCALP_TRAIL_RETRACE_FRAC", 0.35),
+    numberWithDefault("POLYMARKET_SCALP_TRAIL_RETRACE_FRAC", 0.20),
     0.05,
     0.95
   );

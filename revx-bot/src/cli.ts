@@ -21,6 +21,7 @@ import { PolymarketClient } from "./polymarket/PolymarketClient";
 import { GammaSeedScanner } from "./polymarket/GammaSeedScanner";
 import { MarketScanner } from "./polymarket/MarketScanner";
 import { initNetworkTransport } from "./http/networkTransport";
+import { summarizePolymarketBlockers } from "./polymarket/live/blockerClassification";
 
 
 async function run(): Promise<void> {
@@ -541,6 +542,32 @@ async function run(): Promise<void> {
       });
 
       const recentFills = store.getRecentFills(10);
+      const attributionRevxSamples = store.getMetrics("attributionRevxSamples", 0, 1)[0]?.value ?? 0;
+      const attributionRevxAvgMarkout = store.getMetrics("attributionRevxAvgMarkoutBps", 0, 1)[0]?.value ?? 0;
+      const attributionRevxMultiplier = store.getMetrics("attributionRevxBuyMultiplier", 0, 1)[0]?.value ?? 1;
+      const attributionPolySamples = store.getMetrics("attributionPolySamples", 0, 1)[0]?.value ?? 0;
+      const attributionPolyAvgMarkout = store.getMetrics("attributionPolyAvgMarkoutBps", 0, 1)[0]?.value ?? 0;
+      const attributionPolyMultiplier = store.getMetrics("attributionPolyBudgetMultiplier", 0, 1)[0]?.value ?? 1;
+      const recentAttribution = store
+        .getRecentDecisionAttributions(8)
+        .filter((row) => row.symbol === config.symbol)
+        .map((row) => ({
+          ts: new Date(row.ts).toISOString(),
+          venue: row.venue,
+          action: row.action,
+          blocker: row.blocker ?? "-",
+          edge: row.edge,
+          reference_price: row.reference_price
+        }));
+      const polymarketBlockerSummary = summarizePolymarketBlockers(
+        store
+          .getRecentDecisionAttributions(120)
+          .filter((row) => row.symbol === config.symbol && row.venue === "POLYMARKET" && row.action === "HOLD")
+          .map((row) => ({
+            blocker: row.blocker,
+            edge: row.edge
+          }))
+      );
       const decisions = store.getRecentStrategyDecisions(5).map((d) => {
         const details = parseDecisionDetails(d.details_json);
         return {
@@ -582,6 +609,26 @@ async function run(): Promise<void> {
       );
       // eslint-disable-next-line no-console
       console.log(`realized PnL (today): ${fmt(realizedPnlToday, 2)} USD`);
+      // eslint-disable-next-line no-console
+      console.log(
+        `attribution REVX samples=${fmt(attributionRevxSamples, 0)} avgMarkout=${fmt(
+          attributionRevxAvgMarkout,
+          2
+        )}bps buyMult=${fmt(attributionRevxMultiplier, 2)} | POLY samples=${fmt(
+          attributionPolySamples,
+          0
+        )} avgMarkout=${fmt(attributionPolyAvgMarkout, 2)}bps budgetMult=${fmt(attributionPolyMultiplier, 2)}`
+      );
+      // eslint-disable-next-line no-console
+      console.log(
+        `poly blockers samples=${fmt(polymarketBlockerSummary.samples, 0)} structural=${fmt(
+          polymarketBlockerSummary.countsByCategory.STRUCTURAL ?? 0,
+          0
+        )} safety=${fmt(polymarketBlockerSummary.countsByCategory.SAFETY ?? 0, 0)} portfolio=${fmt(
+          polymarketBlockerSummary.countsByCategory.PORTFOLIO ?? 0,
+          0
+        )} positiveEdgeBlocked=${fmt(polymarketBlockerSummary.positiveEdgeBlockedCount, 0)}`
+      );
 
       // eslint-disable-next-line no-console
       console.log("\nActive Bot Orders (grouped):");
@@ -597,6 +644,17 @@ async function run(): Promise<void> {
       console.log("\nLast 5 Strategy Decisions:");
       // eslint-disable-next-line no-console
       console.table(decisions);
+
+      // eslint-disable-next-line no-console
+      console.log("\nRecent Decision Attribution:");
+      // eslint-disable-next-line no-console
+      console.table(recentAttribution);
+      if (polymarketBlockerSummary.topReasons.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log("\nRecent Polymarket Blockers:");
+        // eslint-disable-next-line no-console
+        console.table(polymarketBlockerSummary.topReasons);
+      }
 
       if (config.debugBalances) {
         const rawBalances = await client.getBalances();

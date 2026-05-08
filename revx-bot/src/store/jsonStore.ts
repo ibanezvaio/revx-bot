@@ -16,6 +16,7 @@ import {
   BalanceSnapshot,
   BotEvent,
   BotStatus,
+  DecisionAttributionRecord,
   ExternalVenueSnapshot,
   FillRecord,
   MetricRecord,
@@ -41,6 +42,7 @@ type JsonDb = {
   balances: BalanceSnapshot[];
   tickerSnapshots: TickerSnapshot[];
   strategyDecisions: StrategyDecision[];
+  decisionAttributions: DecisionAttributionRecord[];
   metrics: MetricRecord[];
   botEvents: BotEvent[];
   externalPriceSnapshots: ExternalVenueSnapshot[];
@@ -62,6 +64,7 @@ const ACTIVE_STATUSES = new Set([
 const MAX_ORDER_HISTORY = 20_000;
 const MAX_TICKER_SNAPSHOTS = 200_000;
 const MAX_STRATEGY_DECISIONS = 20_000;
+const MAX_DECISION_ATTRIBUTIONS = 50_000;
 const MAX_METRICS = 60_000;
 const DEFAULT_MAX_BOT_EVENTS = 10_000;
 const DEFAULT_MAX_SIGNAL_POINTS = 2_000;
@@ -76,6 +79,7 @@ export class JsonStore implements Store {
     balances: [],
     tickerSnapshots: [],
     strategyDecisions: [],
+    decisionAttributions: [],
     metrics: [],
     botEvents: [],
     externalPriceSnapshots: [],
@@ -112,6 +116,9 @@ export class JsonStore implements Store {
         balances: Array.isArray(parsed.balances) ? parsed.balances : [],
         tickerSnapshots: Array.isArray(parsed.tickerSnapshots) ? parsed.tickerSnapshots : [],
         strategyDecisions: Array.isArray(parsed.strategyDecisions) ? parsed.strategyDecisions : [],
+        decisionAttributions: Array.isArray(parsed.decisionAttributions)
+          ? (parsed.decisionAttributions as DecisionAttributionRecord[])
+          : [],
         metrics: Array.isArray(parsed.metrics) ? parsed.metrics : [],
         botEvents: Array.isArray(parsed.botEvents) ? parsed.botEvents : [],
         externalPriceSnapshots: Array.isArray(parsed.externalPriceSnapshots)
@@ -458,6 +465,24 @@ export class JsonStore implements Store {
 
   getRecentStrategyDecisions(limit: number): StrategyDecision[] {
     return [...this.state.strategyDecisions].sort((a, b) => b.ts - a.ts).slice(0, limit);
+  }
+
+  recordDecisionAttribution(record: DecisionAttributionRecord): void {
+    const idx = this.state.decisionAttributions.findIndex((row) => row.decision_id === record.decision_id);
+    if (idx === -1) {
+      this.state.decisionAttributions.push(record);
+    } else {
+      this.state.decisionAttributions[idx] = record;
+    }
+    trimTail(this.state.decisionAttributions, MAX_DECISION_ATTRIBUTIONS);
+    this.flush();
+  }
+
+  getRecentDecisionAttributions(limit: number, venue?: DecisionAttributionRecord["venue"]): DecisionAttributionRecord[] {
+    return [...this.state.decisionAttributions]
+      .filter((row) => !venue || row.venue === venue)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, limit);
   }
 
   recordMetric(metric: MetricRecord): void {

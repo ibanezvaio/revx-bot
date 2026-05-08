@@ -15,6 +15,7 @@ import {
 } from "./auth/clobClientFactory";
 import { buildCreateOrderInput, TickSize } from "./auth/requestBuilder";
 import { withRetry } from "./auth/retry";
+import { getPolymarketVenueMinSharesFloor } from "./sizingMinimums";
 import { OrderBookLevel, YesOrderBook } from "./types";
 
 type HttpMethod = "GET" | "POST" | "DELETE";
@@ -160,6 +161,7 @@ export class PolymarketClient {
   private readonly tickSizeCache = new Map<string, TickSize>();
   private readonly negRiskCache = new Map<string, boolean>();
   private readonly feeRateCache = new Map<string, number>();
+  private lastKnownFeeRateBps: number | null = null;
   private transientFailureCount = 0;
   private circuitOpenUntilTs = 0;
   private readonly circuitFailureThreshold = 5;
@@ -965,8 +967,10 @@ export class PolymarketClient {
       }
     };
 
-    const sellPoint = sellSide ? await fetchPricePoint(sellSide) : null;
-    const buyPoint = buySide ? await fetchPricePoint(buySide) : null;
+    const [sellPoint, buyPoint] = await Promise.all([
+      sellSide ? fetchPricePoint(sellSide) : Promise.resolve(null),
+      buySide ? fetchPricePoint(buySide) : Promise.resolve(null)
+    ]);
     if (sellPoint || buyPoint) {
       const bestBid =
         sellPoint && Number.isFinite(Number(sellPoint.price)) ? clamp(Number(sellPoint.price), 0.0001, 0.9999) : null;
@@ -1040,9 +1044,9 @@ export class PolymarketClient {
     const authClient = await this.getAuthClient();
     const authInfo = this.authClientInfo;
     const orderType = await this.getOrderTypeConstant("GTD");
-    const tickSize = params.tickSize ?? (await this.getTickSize(params.tokenId));
-    const negRisk = params.negRisk ?? (await this.getNegRisk(params.tokenId));
-    const feeRateBps = await this.getFeeRateBps(params.tokenId);
+    const tickSize = this.resolveTickSizeForLiveOrder(params.tokenId, params.tickSize);
+    const negRisk = this.resolveNegRiskForLiveOrder(params.tokenId, params.negRisk);
+    const feeRateBps = await this.getFeeRateBpsForLiveOrder(params.tokenId, params.executionGuard);
     const response = await this.runClobCall(
       "postOrder",
       async (attempt) => {
@@ -1059,10 +1063,6 @@ export class PolymarketClient {
         });
         const finalizedUserOrder = this.cloneJsonValue(userOrder);
         const finalizedOptions = this.cloneJsonValue(options);
-        const finalizedInputBeforeCreate = JSON.stringify({
-          userOrder: finalizedUserOrder,
-          options: finalizedOptions
-        });
         const signingPayloadSummary = this.summarizeOrderPayload({
           userOrder: finalizedUserOrder,
           options: finalizedOptions
@@ -1093,19 +1093,12 @@ export class PolymarketClient {
           "POLY_ORDER_ATTEMPT"
         );
         try {
-          const signedOrder = await authClient.createOrder(finalizedUserOrder, finalizedOptions);
-          this.assertPayloadUnchanged(
-            "Polymarket userOrder/options payload",
-            finalizedInputBeforeCreate,
-            { userOrder: finalizedUserOrder, options: finalizedOptions },
-            { payloadMutatedBetweenSignAndPost: false }
+          const signedOrder = await authClient.createOrder(
+            this.cloneJsonValue(finalizedUserOrder),
+            this.cloneJsonValue(finalizedOptions)
           );
-          const signedOrderBeforePost = JSON.stringify(signedOrder);
           const postingPayloadSummary = this.summarizeOrderPayload(signedOrder);
-          const result = await authClient.postOrder(signedOrder, orderType, false, false);
-          this.assertPayloadUnchanged("Polymarket signed order payload", signedOrderBeforePost, signedOrder, {
-            payloadMutatedBetweenSignAndPost: true
-          });
+          const result = await authClient.postOrder(this.cloneJsonValue(signedOrder), orderType, false, false);
           this.logger.info(
             {
               tokenId: params.tokenId,
@@ -1148,8 +1141,11 @@ export class PolymarketClient {
         }
       },
       {
-        isRetryable: (error) => isRetryableError(error) || isOrderRebuildRequiredError(error),
+        isRetryable: (error) => isOrderRebuildRequiredError(error),
         shouldContinue: params.executionGuard,
+        timeoutMs: this.getPostOrderTimeoutMs(params.ttlMs),
+        maxRetries: 1,
+        useScheduler: false,
         onRetry: (attempt, error, delayMs) => {
           if (this.config.debugHttp || process.env.DEBUG_POLY === "1") {
             this.logger.warn(
@@ -1324,37 +1320,44 @@ export class PolymarketClient {
     const raw = await this.runClobCall("getFeeRateBps", async () => publicClient.getFeeRateBps(tokenId));
     const value = Math.max(0, Math.floor(Number(raw || 0)));
     this.feeRateCache.set(tokenId, value);
+    this.lastKnownFeeRateBps = value;
     return value;
+  }
+
+  private resolveTickSizeForLiveOrder(tokenId: string, tickSize?: TickSize): TickSize {
+    if (tickSize) return tickSize;
+    const cached = this.tickSizeCache.get(tokenId);
+    if (cached) return cached;
+    this.logger.warn({ tokenId, fallbackTickSize: "0.01" }, "POLY_TICK_SIZE_FALLBACK");
+    return "0.01";
+  }
+
+  private resolveNegRiskForLiveOrder(tokenId: string, negRisk?: boolean): boolean {
+    if (negRisk !== undefined) return negRisk;
+    const cached = this.negRiskCache.get(tokenId);
+    if (cached !== undefined) return cached;
+    this.logger.warn({ tokenId, fallbackNegRisk: false }, "POLY_NEGRISK_FALLBACK");
+    return false;
+  }
+
+  private async getFeeRateBpsForLiveOrder(
+    tokenId: string,
+    executionGuard?: () => boolean
+  ): Promise<number | undefined> {
+    void executionGuard;
+    const cached = this.feeRateCache.get(tokenId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const optimisticFallback =
+      this.lastKnownFeeRateBps !== null ? this.lastKnownFeeRateBps : this.getLiveFallbackFeeRateBps();
+    this.feeRateCache.set(tokenId, optimisticFallback);
+    this.lastKnownFeeRateBps = optimisticFallback;
+    return optimisticFallback;
   }
 
   private cloneJsonValue<T>(value: T): T {
     return JSON.parse(JSON.stringify(value)) as T;
-  }
-
-  private assertPayloadUnchanged(
-    label: string,
-    before: string,
-    afterValue: unknown,
-    context: { payloadMutatedBetweenSignAndPost: boolean }
-  ): void {
-    const after = JSON.stringify(afterValue);
-    if (before !== after) {
-      const beforePayload = this.summarizeOrderPayload(parseJsonSafe(before));
-      const afterPayload = this.summarizeOrderPayload(afterValue);
-      this.logger.error(
-        {
-          label,
-          payloadMutatedBetweenSignAndPost: context.payloadMutatedBetweenSignAndPost,
-          signerAddress: this.authClientInfo?.signerAddress ?? null,
-          signatureType: this.authClientInfo?.signatureType ?? null,
-          funder: this.authClientInfo?.funder ?? null,
-          beforePayload,
-          afterPayload
-        },
-        "POLY_ORDER_PAYLOAD_MUTATED"
-      );
-      throw new Error(`${label} mutated after signing/finalization`);
-    }
   }
 
   private async runClobCall<T>(
@@ -1364,6 +1367,9 @@ export class PolymarketClient {
       isRetryable?: (error: unknown) => boolean;
       onRetry?: (attempt: number, error: unknown, delayMs: number) => void;
       shouldContinue?: () => boolean;
+      timeoutMs?: number;
+      maxRetries?: number;
+      useScheduler?: boolean;
     }
   ): Promise<T> {
     this.throwIfCircuitOpen(label);
@@ -1384,20 +1390,16 @@ export class PolymarketClient {
           throw new Error("STALE_ATTEMPT_ABORTED");
         }
       };
+      const timeoutMs = Math.max(1, Math.floor(options?.timeoutMs ?? this.getHttpTimeoutMs()));
+      const maxRetries = Math.max(0, Math.floor(options?.maxRetries ?? this.config.polymarket.http.maxRetries));
+      const runAttempt = (): Promise<T> => {
+        ensureShouldContinue();
+        return withTimeout(fn(++attempt), timeoutMs, `Polymarket CLOB call timeout (${label})`);
+      };
       const result = await withRetry(
-        () =>
-          this.requestScheduler.schedule(() =>
-            {
-              ensureShouldContinue();
-              return withTimeout(
-                fn(++attempt),
-                this.getHttpTimeoutMs(),
-                `Polymarket CLOB call timeout (${label})`
-              );
-            }
-          ),
+        () => ((options?.useScheduler ?? true) ? this.requestScheduler.schedule(runAttempt) : runAttempt()),
         {
-          maxRetries: this.config.polymarket.http.maxRetries,
+          maxRetries,
           baseDelayMs: this.config.polymarket.http.baseBackoffMs,
           maxDelayMs: this.config.polymarket.http.maxBackoffMs,
           jitterMs: this.config.polymarket.http.jitterMs,
@@ -1782,6 +1784,27 @@ export class PolymarketClient {
 
   private getHttpTimeoutMs(): number {
     return Math.max(15_000, Math.floor(this.config.polymarket.http.timeoutMs));
+  }
+
+  private getFeeRateTimeoutMs(): number {
+    const envValue = Number(process.env.POLY_V2_FEE_RATE_TIMEOUT_MS || 1_000);
+    if (!Number.isFinite(envValue)) return 1_000;
+    return Math.max(250, Math.min(5_000, Math.floor(envValue)));
+  }
+
+  private getLiveFallbackFeeRateBps(): number {
+    const envValue = Number(process.env.POLY_V2_FALLBACK_FEE_RATE_BPS || 1_000);
+    if (!Number.isFinite(envValue)) return 1_000;
+    return Math.max(0, Math.min(10_000, Math.floor(envValue)));
+  }
+
+  private getPostOrderTimeoutMs(ttlMs: number): number {
+    const explicitMs = Number(process.env.POLY_V2_POST_ORDER_TIMEOUT_MS || Number.NaN);
+    if (Number.isFinite(explicitMs)) {
+      return Math.max(1_000, Math.min(10_000, Math.floor(explicitMs)));
+    }
+    const normalizedTtlMs = Math.max(1_000, Math.floor(ttlMs));
+    return Math.min(3_000, Math.max(2_000, Math.floor(normalizedTtlMs * 0.5)));
   }
 
   private async probePublicEndpoint(
@@ -2200,8 +2223,8 @@ function computeLiveOrderExpirationSec(
   const nowSec = Math.floor(Number(nowMs) / 1000);
   const requestedTtlSec = Math.max(1, Math.ceil(Math.max(1000, Number(ttlMs || 0)) / 1000));
   const mandatoryLeadSec = 60;
-  const safetyBufferSec = 30;
-  const minExpirationSec = nowSec + 120;
+  const safetyBufferSec = 120;
+  const minExpirationSec = nowSec + 240;
   const expirationSec = Math.max(minExpirationSec, nowSec + mandatoryLeadSec + requestedTtlSec + safetyBufferSec);
   return {
     nowSec,
@@ -2438,6 +2461,17 @@ function validateTokenId(tokenId: string): void {
   }
 }
 
+export function testComputeLiveOrderExpirationSec(ttlMs: number, nowMs: number): {
+  nowSec: number;
+  expirationSec: number;
+  requestedTtlSec: number;
+  mandatoryLeadSec: number;
+  safetyBufferSec: number;
+  minExpirationSec: number;
+} {
+  return computeLiveOrderExpirationSec(ttlMs, nowMs);
+}
+
 function validatePrice(price: number): void {
   if (!Number.isFinite(price) || price <= 0 || price >= 1) {
     throw new Error(`Invalid price: ${price}`);
@@ -2462,9 +2496,15 @@ function normalizeOrderSizeForVenue(size: number): number {
 }
 
 function getMinVenueShares(): number {
-  const raw = Number(process.env.POLY_MIN_SHARES || 5);
-  if (!Number.isFinite(raw) || raw <= 0) return 5;
-  return raw;
+  const venueFloor = getPolymarketVenueMinSharesFloor();
+  const raw = Number(
+    process.env.POLY_MIN_SHARES ||
+      process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES ||
+      process.env.POLYMARKET_MIN_SHARES_REQUIRED ||
+      venueFloor
+  );
+  const normalized = Number.isFinite(raw) && raw > 0 ? raw : venueFloor;
+  return Math.max(normalized, venueFloor);
 }
 
 function asNumber(value: unknown): number {

@@ -409,6 +409,21 @@ export type StrategyDecision = {
   details_json: string;
 };
 
+export type DecisionAttributionVenue = "REVX" | "POLYMARKET";
+
+export type DecisionAttributionRecord = {
+  decision_id: string;
+  ts: number;
+  venue: DecisionAttributionVenue;
+  strategy: string;
+  symbol: string;
+  action: string;
+  blocker: string | null;
+  reference_price: number | null;
+  edge: number | null;
+  details_json: string;
+};
+
 export type MetricRecord = {
   ts: number;
   key: string;
@@ -503,6 +518,9 @@ export interface Store {
 
   recordStrategyDecision(decision: StrategyDecision): void;
   getRecentStrategyDecisions(limit: number): StrategyDecision[];
+
+  recordDecisionAttribution(record: DecisionAttributionRecord): void;
+  getRecentDecisionAttributions(limit: number, venue?: DecisionAttributionVenue): DecisionAttributionRecord[];
 
   recordMetric(metric: MetricRecord): void;
   getMetrics(key: string, sinceTs: number, limit: number): MetricRecord[];

@@ -12,6 +12,9 @@ import { BalanceState } from "../recon/BalanceState";
 import { orderSubmitState } from "../recon/OrderSubmitState";
 import { orderReconcileState } from "../recon/OrderReconcileState";
 import { RiskManager } from "../risk/RiskManager";
+import { RevxPortfolioQuotePolicy } from "../risk/PortfolioRiskCoordinator";
+import { buildDecisionAttributionRecord } from "../runtime/DecisionAttribution";
+import { SharedMarketIntelligence } from "../runtime/SharedMarketIntelligence";
 import { CrossVenueSignalEngine } from "../signal/CrossVenueSignalEngine";
 import { CrossVenueComputation } from "../signal/types";
 import {
@@ -43,6 +46,7 @@ import { MarketPhase, MarketShockController, MarketShockDecision } from "./Marke
 import { seedDebugState } from "./SeedDebugState";
 import { strategyHealthState } from "./StrategyHealthState";
 import { SignalsGuard, SignalsGuardDecision } from "./SignalsGuard";
+import { applyRevxPortfolioQuotePolicy } from "./portfolioPolicy";
 import { sleep } from "../util/time";
 import { getTradingTruthReporter, isDebugVerbosity } from "../logging/truth";
 
@@ -324,6 +328,8 @@ export class MakerStrategy {
   private lastTruthBalanceTotals: { usdTotal: number; btcTotal: number } | null = null;
   private lastTruthInventoryCapBlock: { ts: number; btcNotionalUsd: number; maxBtcNotionalUsd: number } | null = null;
   private readonly truthReporter: ReturnType<typeof getTradingTruthReporter>;
+  private portfolioQuotePolicy: RevxPortfolioQuotePolicy | null = null;
+  private lastPortfolioQuotePolicyLogKey = "";
   private lastShockDecision: MarketShockDecision = {
     phase: "STABILIZING",
     state: "STABILIZING",
@@ -391,6 +397,32 @@ export class MakerStrategy {
 
   stop(): void {
     this.running = false;
+  }
+
+  setPortfolioQuotePolicy(policy: RevxPortfolioQuotePolicy | null): void {
+    this.portfolioQuotePolicy = policy;
+    const nextKey = JSON.stringify(
+      policy
+        ? {
+            allowNewBuyRisk: policy.allowNewBuyRisk,
+            effectiveWorkingCapUsd: Number(policy.effectiveWorkingCapUsd.toFixed(2)),
+            effectiveTargetBtcNotionalUsd: Number(policy.effectiveTargetBtcNotionalUsd.toFixed(2)),
+            effectiveMaxBtcNotionalUsd: Number(policy.effectiveMaxBtcNotionalUsd.toFixed(2)),
+            buySizeMultiplier: Number(policy.buySizeMultiplier.toFixed(4)),
+            reason: policy.reason
+          }
+        : null
+    );
+    if (nextKey === this.lastPortfolioQuotePolicyLogKey) {
+      return;
+    }
+    this.lastPortfolioQuotePolicyLogKey = nextKey;
+    this.logger.warn(
+      {
+        portfolioQuotePolicy: policy
+      },
+      "REVX_PORTFOLIO_QUOTE_POLICY"
+    );
   }
 
   async start(): Promise<void> {
@@ -1828,14 +1860,33 @@ export class MakerStrategy {
     const equityUsd = normalizedBalancesCurrent.equityUsd;
     const hasTargetOverride = effectiveConfig.activeOverrideKeys.includes("targetBtcNotionalUsd");
     const hasMaxOverride = effectiveConfig.activeOverrideKeys.includes("maxBtcNotionalUsd");
-    const targetBtcNotionalUsd =
+    let targetBtcNotionalUsd =
       this.config.dynamicTargetBtc && !hasTargetOverride
         ? Math.max(0, equityUsd * 0.5)
         : effectiveConfig.targetBtcNotionalUsd;
-    const maxBtcNotionalUsd =
+    let maxBtcNotionalUsd =
       this.config.dynamicTargetBtc && !hasMaxOverride
         ? targetBtcNotionalUsd + this.config.dynamicTargetBufferUsd
         : Math.max(targetBtcNotionalUsd, effectiveConfig.maxBtcNotionalUsd);
+    let portfolioWorkingCapUsd = effectiveConfig.workingCapUsd;
+    let portfolioBuyBlockedReason: string | null = null;
+    if (this.portfolioQuotePolicy) {
+      portfolioWorkingCapUsd = Math.min(
+        effectiveConfig.workingCapUsd,
+        Math.max(0, this.portfolioQuotePolicy.effectiveWorkingCapUsd)
+      );
+      targetBtcNotionalUsd = Math.min(
+        targetBtcNotionalUsd,
+        Math.max(0, this.portfolioQuotePolicy.effectiveTargetBtcNotionalUsd)
+      );
+      maxBtcNotionalUsd = Math.max(
+        targetBtcNotionalUsd,
+        Math.min(maxBtcNotionalUsd, Math.max(0, this.portfolioQuotePolicy.effectiveMaxBtcNotionalUsd))
+      );
+      portfolioBuyBlockedReason = this.portfolioQuotePolicy.allowNewBuyRisk
+        ? null
+        : this.portfolioQuotePolicy.reason || "REVX_PORTFOLIO_BUY_GATE";
+    }
     const lowBtcGate =
       targetBtcNotionalUsd - (maxBtcNotionalUsd - targetBtcNotionalUsd) / 2;
 
@@ -2013,7 +2064,7 @@ export class MakerStrategy {
           minVolMoveBpsToQuote: this.config.minVolMoveBpsToQuote,
           volProtectMode: this.config.volProtectMode,
           cashReserveUsd: reserveUsd,
-          workingCapUsd: effectiveConfig.workingCapUsd,
+          workingCapUsd: portfolioWorkingCapUsd,
           targetBtcNotionalUsd,
           lowBtcGateUsd: lowBtcGate,
           maxActionsPerLoop: effectiveConfig.maxActionsPerLoop,
@@ -2063,6 +2114,11 @@ export class MakerStrategy {
       buyReasons.push(reason);
       sellReasons.push(reason);
     }
+    if (portfolioBuyBlockedReason) {
+      const reason = `PORTFOLIO_BUY_GATE (${portfolioBuyBlockedReason})`;
+      quoteBlockedReasons.push(reason);
+      buyReasons.push(reason);
+    }
 
     if (effectiveConfig.overridesActive) {
       this.logger.debug(
@@ -2098,6 +2154,9 @@ export class MakerStrategy {
 
     let buyLevels = effectiveConfig.levelsBuy;
     let sellLevels = effectiveConfig.levelsSell;
+    if (portfolioBuyBlockedReason) {
+      buyLevels = 0;
+    }
     const initialSellLevels = sellLevels;
     if (toxicReduceLevels) {
       const beforeBuy = buyLevels;
@@ -2244,6 +2303,21 @@ export class MakerStrategy {
     );
     let buyQuoteSizeUsd = initialQuoteSizing.buyQuoteSizeUsd;
     let sellQuoteSizeUsd = initialQuoteSizing.sellQuoteSizeUsd;
+    const portfolioSizing = applyRevxPortfolioQuotePolicy(
+      {
+        workingCapUsd: portfolioWorkingCapUsd,
+        targetBtcNotionalUsd,
+        maxBtcNotionalUsd,
+        buyQuoteSizeUsd,
+        minQuoteSizeUsd: this.config.minQuoteSizeUsd
+      },
+      this.portfolioQuotePolicy
+    );
+    portfolioWorkingCapUsd = portfolioSizing.workingCapUsd;
+    targetBtcNotionalUsd = portfolioSizing.targetBtcNotionalUsd;
+    maxBtcNotionalUsd = portfolioSizing.maxBtcNotionalUsd;
+    buyQuoteSizeUsd = portfolioSizing.buyQuoteSizeUsd;
+    portfolioBuyBlockedReason = portfolioSizing.blockedBuyReason;
     const competitivePostureRaw = resolveCompetitivePosture(
       hardHaltReasons,
       intelPosture.state,
@@ -2510,11 +2584,11 @@ export class MakerStrategy {
 
     const maxBuyByCap = Math.max(
       0,
-      Math.floor((effectiveConfig.workingCapUsd - buyOpenUsd) / Math.max(buyQuoteSizeUsd, 0.0000001))
+      Math.floor((portfolioWorkingCapUsd - buyOpenUsd) / Math.max(buyQuoteSizeUsd, 0.0000001))
     );
     if (maxBuyByCap < buyLevels) {
       buyReasons.push(
-        `Working cap ${fmtUsd(effectiveConfig.workingCapUsd)} limits buy levels to ${maxBuyByCap}`
+        `Working cap ${fmtUsd(portfolioWorkingCapUsd)} limits buy levels to ${maxBuyByCap}`
       );
       buyLevels = maxBuyByCap;
     }
@@ -3015,7 +3089,7 @@ export class MakerStrategy {
         minVolMoveBpsToQuote: this.config.minVolMoveBpsToQuote,
         volProtectMode: this.config.volProtectMode,
         cashReserveUsd: reserveUsd,
-        workingCapUsd: effectiveConfig.workingCapUsd,
+        workingCapUsd: portfolioWorkingCapUsd,
         targetBtcNotionalUsd,
         lowBtcGateUsd: lowBtcGate,
         maxActionsPerLoop: effectiveConfig.maxActionsPerLoop,
@@ -3965,6 +4039,26 @@ export class MakerStrategy {
       key: "intelState",
       value: intelStateToNumber(intelPosture.state)
     });
+    this.store.recordMetric({
+      ts: ticker.ts,
+      key: "portfolioRevxWorkingCapUsd",
+      value: portfolioWorkingCapUsd
+    });
+    this.store.recordMetric({
+      ts: ticker.ts,
+      key: "portfolioRevxTargetBtcNotionalUsd",
+      value: targetBtcNotionalUsd
+    });
+    this.store.recordMetric({
+      ts: ticker.ts,
+      key: "portfolioRevxMaxBtcNotionalUsd",
+      value: maxBtcNotionalUsd
+    });
+    this.store.recordMetric({
+      ts: ticker.ts,
+      key: "portfolioRevxBuyGate",
+      value: portfolioBuyBlockedReason ? 1 : 0
+    });
 
     this.store.recordStrategyDecision({
       ts: ticker.ts,
@@ -4225,9 +4319,100 @@ export class MakerStrategy {
           workingCapUsd: effectiveConfig.workingCapUsd,
           maxActiveOrders: effectiveConfig.maxActiveOrders,
           maxActionsPerLoop: effectiveConfig.maxActionsPerLoop
+        },
+        portfolio_policy: {
+          working_cap_usd: portfolioWorkingCapUsd,
+          target_btc_notional_usd: targetBtcNotionalUsd,
+          max_btc_notional_usd: maxBtcNotionalUsd,
+          buy_quote_size_usd: buyQuoteSizeUsd,
+          buy_gate_reason: portfolioBuyBlockedReason,
+          policy_source: this.portfolioQuotePolicy ? "PORTFOLIO_RISK_COORDINATOR" : "NONE"
         }
       })
     });
+    const sharedMarketIntelligence = new SharedMarketIntelligence({
+      store: this.store,
+      signalsEngine: this.signalsEngine ?? undefined,
+      intelEngine: this.intelEngine ?? undefined
+    });
+    const attributionAction =
+      quotePlan.hardHalt || !quotePlan.quoteEnabled
+        ? "HOLD"
+        : buyLevels > 0 && sellLevels > 0
+          ? "QUOTE_BOTH"
+          : buyLevels > 0
+            ? "QUOTE_BUY"
+            : sellLevels > 0
+              ? "QUOTE_SELL"
+              : "HOLD";
+    const attributionBlocker =
+      hardHaltReasons[0] ??
+      portfolioBuyBlockedReason ??
+      quoteBlockedReasons[0] ??
+      null;
+    this.store.recordDecisionAttribution(
+      buildDecisionAttributionRecord({
+        decisionId: `REVX:${this.config.symbol}:${ticker.ts}`,
+        ts: ticker.ts,
+        venue: "REVX",
+        strategy: "MAKER_STRATEGY",
+        symbol: this.config.symbol,
+        action: attributionAction,
+        blocker: attributionBlocker,
+        edge: this.lastHybridSignal?.basisBps ?? null,
+        referencePrice: sharedMarketIntelligence.getReferencePrice(this.config.symbol, ticker.ts),
+        directionalInputs: {
+          aggregate: this.lastSignalsSnapshot?.aggregate ?? null,
+          intelPosture,
+          venueBias: {
+            bias: this.lastHybridSignal?.bias ?? null,
+            confidence: Number.isFinite(Number(this.lastHybridSignal?.biasConfidence))
+              ? Math.max(0, Math.min(1, Number(this.lastHybridSignal?.biasConfidence)))
+              : 0,
+            ts: ticker.ts,
+            source: this.lastHybridSignal ? "REVX_HYBRID_SIGNAL" : "NONE"
+          }
+        },
+        market: {
+          mid: ticker.mid,
+          bid: ticker.bid,
+          ask: ticker.ask,
+          market_spread_bps: marketSpreadBps,
+          trend_move_bps: trendMoveBps,
+          inventory_ratio: inventoryRatio,
+          btc_notional_usd: btcNotional,
+          low_btc_gate_usd: lowBtcGate
+        },
+        decision: {
+          buy_levels: buyLevels,
+          sell_levels: sellLevels,
+          tob_mode: tobMode,
+          hard_halt: quotePlan.hardHalt,
+          hard_halt_reasons: hardHaltReasons,
+          quote_blocked_reasons: quoteBlockedReasons.slice(0, 12),
+          news_state: newsDecision.state,
+          signals_state: signalsDecision.state,
+          intel_state: intelPosture.state,
+          signal_bias: this.lastHybridSignal?.bias ?? null,
+          signal_bias_confidence: this.lastHybridSignal?.biasConfidence ?? null
+        },
+        portfolio: {
+          exposure_usd: normalizedBalancesCurrent.btcNotionalUsd,
+          realized_pnl_today_usd: rolling.realized_pnl_today_usd,
+          working_cap_usd: portfolioWorkingCapUsd,
+          target_btc_notional_usd: targetBtcNotionalUsd,
+          max_btc_notional_usd: maxBtcNotionalUsd,
+          buy_gate_reason: portfolioBuyBlockedReason,
+          policy_source: this.portfolioQuotePolicy ? "PORTFOLIO_RISK_COORDINATOR" : "NONE"
+        },
+        outcomeTracking: {
+          join_key: `REVX:${this.config.symbol}:${ticker.ts}`,
+          markout_horizons_sec: [60, 300, 900],
+          reference_symbol: this.config.symbol,
+          evaluation_mode: "REFERENCE_PRICE_MARKOUT"
+        }
+      })
+    );
 
     const nowForRefresh = Date.now();
     const hardRiskCancel =

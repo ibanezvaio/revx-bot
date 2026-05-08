@@ -48,6 +48,21 @@ type CandidateOutcome =
 
 export class Btc5mSelector {
   private readonly unavailableTokenIdsBySlug = new Map<string, Set<string>>();
+  private readonly unavailableMarketIdsBySlug = new Map<string, Set<string>>();
+  private readonly recentDiscoveredRowsBySlug = new Map<string, { rows: Record<string, unknown>[]; cachedAtTs: number }>();
+  private readonly recentMarketMetaById = new Map<
+    string,
+    {
+      active: boolean;
+      closed: boolean;
+      archived: boolean;
+      acceptingOrders: boolean;
+      enableOrderBook: boolean;
+      yesTokenId: string | null;
+      noTokenId: string | null;
+      cachedAtTs: number;
+    }
+  >();
 
   constructor(
     private readonly config: BotConfig,
@@ -94,6 +109,7 @@ export class Btc5mSelector {
       if (outcome.selected) {
         filteredCandidates.push(outcome.selected);
         candidatesAfterFilter += 1;
+        break;
       } else if (outcome.filteredOut === "EXTREME") {
         droppedExtreme += 1;
       } else if (outcome.filteredOut === "WIDE_SPREAD") {
@@ -148,6 +164,30 @@ export class Btc5mSelector {
     return Boolean(tokenSet?.has(normalizedTokenId));
   }
 
+  isMarketUnavailable(slug: string, marketId: string): boolean {
+    const normalizedSlug = String(slug || "").trim();
+    const normalizedMarketId = String(marketId || "").trim();
+    if (!normalizedSlug || !normalizedMarketId) return false;
+    const marketSet = this.unavailableMarketIdsBySlug.get(normalizedSlug);
+    return Boolean(marketSet?.has(normalizedMarketId));
+  }
+
+  markMarketUnavailable(slug: string, marketId: string, reason: string): void {
+    const normalizedSlug = String(slug || "").trim();
+    const normalizedMarketId = String(marketId || "").trim();
+    if (!normalizedSlug || !normalizedMarketId) return;
+    let marketSet = this.unavailableMarketIdsBySlug.get(normalizedSlug);
+    if (!marketSet) {
+      marketSet = new Set<string>();
+      this.unavailableMarketIdsBySlug.set(normalizedSlug, marketSet);
+    }
+    if (marketSet.has(normalizedMarketId)) {
+      return;
+    }
+    marketSet.add(normalizedMarketId);
+    this.logger.warn({ slug: normalizedSlug, marketId: normalizedMarketId, reason }, "POLY_V2_MARKET_UNAVAILABLE");
+  }
+
   markSideBookUnavailable(slug: string, tokenId: string, reason: string): void {
     const normalizedSlug = String(slug || "").trim();
     const normalizedTokenId = String(tokenId || "").trim();
@@ -174,29 +214,126 @@ export class Btc5mSelector {
   ): Promise<{ candidates: CandidateSeed[]; networkError: boolean }> {
     const candidates: CandidateSeed[] = [];
     let networkError = false;
+    const nowTs = Date.now();
+    this.pruneDiscoveryCache(nowTs, new Set(attemptedSlugs));
     const sources: Array<"current_slug" | "next_slug" | "prev_slug"> = ["current_slug", "next_slug", "prev_slug"];
 
     for (let index = 0; index < attemptedSlugs.length; index += 1) {
       const slug = attemptedSlugs[index];
       const source = sources[index] || "prev_slug";
-      try {
-        const rows = await this.client.getMarketsBySlugPathFirst(slug);
-        for (const row of rows) {
-          const hintScore = this.computeTradabilityHint(row as Record<string, unknown>);
-          candidates.push({
-            row: row as Record<string, unknown>,
-            expectedSlug: slug,
-            source,
-            alignmentRank: source === "current_slug" ? 0 : source === "next_slug" ? 1 : 2,
-            tradabilityHintScore: hintScore
-          });
+      let rows: Array<Record<string, unknown>> = [];
+      const cachedRows = this.getCachedDiscoveryRows(slug, nowTs);
+      const cacheAgeMs = nowTs - this.getCachedDiscoveryTs(slug);
+      if (cachedRows.length > 0 && cacheAgeMs <= this.getDiscoveryCachePreferMs()) {
+        rows = cachedRows;
+      } else {
+        try {
+          rows = (await this.client.getMarketsBySlugPathFirst(slug)) as Array<Record<string, unknown>>;
+          if (rows.length > 0) {
+            this.recentDiscoveredRowsBySlug.set(slug, {
+              rows: rows.map((row) => ({ ...row })),
+              cachedAtTs: nowTs
+            });
+          } else {
+            rows = cachedRows;
+            if (rows.length > 0) {
+              this.logger.warn(
+                { slug, cachedRowCount: rows.length, cacheAgeMs: nowTs - this.getCachedDiscoveryTs(slug) },
+                "POLY_V2_SELECTOR_DISCOVERY_CACHE_FALLBACK"
+              );
+            }
+          }
+        } catch {
+          networkError = true;
+          rows = cachedRows;
+          if (rows.length > 0) {
+            this.logger.warn(
+              { slug, cachedRowCount: rows.length, cacheAgeMs: nowTs - this.getCachedDiscoveryTs(slug) },
+              "POLY_V2_SELECTOR_DISCOVERY_CACHE_FALLBACK"
+            );
+          }
         }
-      } catch {
-        networkError = true;
+      }
+      for (const row of rows) {
+        const hintScore = this.computeTradabilityHint(row as Record<string, unknown>);
+        candidates.push({
+          row: row as Record<string, unknown>,
+          expectedSlug: slug,
+          source,
+          alignmentRank: source === "current_slug" ? 0 : source === "next_slug" ? 1 : 2,
+          tradabilityHintScore: hintScore
+        });
       }
     }
 
     return { candidates, networkError };
+  }
+
+  private getCachedDiscoveryRows(slug: string, nowTs: number): Array<Record<string, unknown>> {
+    const cached = this.recentDiscoveredRowsBySlug.get(slug);
+    if (!cached) return [];
+    if (nowTs - cached.cachedAtTs > this.getDiscoveryCacheTtlMs()) {
+      this.recentDiscoveredRowsBySlug.delete(slug);
+      return [];
+    }
+    return cached.rows.map((row) => ({ ...row }));
+  }
+
+  private getCachedDiscoveryTs(slug: string): number {
+    return this.recentDiscoveredRowsBySlug.get(slug)?.cachedAtTs ?? 0;
+  }
+
+  private getCachedMarketMeta(
+    marketId: string,
+    nowTs: number
+  ): {
+    active: boolean;
+    closed: boolean;
+    archived: boolean;
+    acceptingOrders: boolean;
+    enableOrderBook: boolean;
+    yesTokenId: string | null;
+    noTokenId: string | null;
+    cachedAtTs: number;
+  } | null {
+    const cached = this.recentMarketMetaById.get(marketId);
+    if (!cached) return null;
+    if (nowTs - cached.cachedAtTs > this.getDiscoveryCacheTtlMs()) {
+      this.recentMarketMetaById.delete(marketId);
+      return null;
+    }
+    return cached;
+  }
+
+  private cacheMarketMeta(
+    marketId: string,
+    meta: {
+      active: boolean;
+      closed: boolean;
+      archived: boolean;
+      acceptingOrders: boolean;
+      enableOrderBook: boolean;
+      yesTokenId: string | null;
+      noTokenId: string | null;
+      cachedAtTs: number;
+    }
+  ): void {
+    if (!meta.yesTokenId && !meta.noTokenId) {
+      return;
+    }
+    this.recentMarketMetaById.set(marketId, meta);
+  }
+
+  private getDiscoveryCacheTtlMs(): number {
+    const raw = Number(process.env.POLY_V2_DISCOVERY_CACHE_TTL_MS || 600_000);
+    if (!Number.isFinite(raw)) return 600_000;
+    return Math.max(1_000, Math.min(3_600_000, Math.floor(raw)));
+  }
+
+  private getDiscoveryCachePreferMs(): number {
+    const raw = Number(process.env.POLY_V2_DISCOVERY_CACHE_PREFER_MS || 120_000);
+    if (!Number.isFinite(raw)) return 120_000;
+    return Math.max(1_000, Math.min(this.getDiscoveryCacheTtlMs(), Math.floor(raw)));
   }
 
   private async evaluateCandidate(seed: CandidateSeed, tick: Btc5mTick): Promise<CandidateOutcome> {
@@ -206,6 +343,13 @@ export class Btc5mSelector {
         selected: null,
         reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
         filteredOut: null
+      };
+    }
+    if (this.isMarketUnavailable(candidate.slug, candidate.marketId)) {
+      return {
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        filteredOut: "INVALID"
       };
     }
 
@@ -220,44 +364,32 @@ export class Btc5mSelector {
     const extremeMax = this.getExtremePriceMaxConfig(extremeMin);
     const wideSpreadThreshold = this.getWideSpreadThresholdConfig();
 
-    const yesBook = await this.fetchSideBook(candidate.slug, "YES", candidate.yesTokenId);
-    if (!yesBook.bookable) {
-      return {
-        selected: null,
-        reason:
-          yesBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES,
-        filteredOut: null
-      };
-    }
+    const [yesBook, noBook] = await Promise.all([
+      this.fetchSideBook(candidate.slug, "YES", candidate.yesTokenId),
+      this.fetchSideBook(candidate.slug, "NO", candidate.noTokenId)
+    ]);
     const yesAsk = sanitizePrice(yesBook.book.bestAsk);
-
-    const noBook = await this.fetchSideBook(candidate.slug, "NO", candidate.noTokenId);
-    if (!noBook.bookable) {
-      return {
-        selected: null,
-        reason:
-          noBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-            : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO,
-        filteredOut: null
-      };
-    }
     const noAsk = sanitizePrice(noBook.book.bestAsk);
     const yesSpread = sanitizeSpread(yesBook.book.spread);
     const noSpread = sanitizeSpread(noBook.book.spread);
 
-    const invalidQuoteHit =
-      yesAsk === null ||
-      noAsk === null ||
-      yesSpread === null ||
-      noSpread === null ||
-      !Number.isFinite(yesAsk) ||
-      !Number.isFinite(noAsk) ||
-      !Number.isFinite(yesSpread) ||
-      !Number.isFinite(noSpread);
-    if (invalidQuoteHit) {
+    const yesQuoteValid =
+      yesBook.bookable &&
+      yesAsk !== null &&
+      yesSpread !== null &&
+      Number.isFinite(yesAsk) &&
+      Number.isFinite(yesSpread);
+    const noQuoteValid =
+      noBook.bookable &&
+      noAsk !== null &&
+      noSpread !== null &&
+      Number.isFinite(noAsk) &&
+      Number.isFinite(noSpread);
+
+    if (!yesQuoteValid && !noQuoteValid) {
+      const networkFailure =
+        yesBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR ||
+        noBook.reasonCode === BTC5M_SELECTOR_REASONS.NETWORK_ERROR;
       this.logCandidateSkip({
         candidate,
         skipReason: "INVALID_QUOTE",
@@ -271,39 +403,26 @@ export class Btc5mSelector {
       });
       return {
         selected: null,
-        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
+        reason: networkFailure ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR : BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
         filteredOut: "INVALID"
       };
     }
 
-    const extremeHit =
-      yesAsk >= extremeMax || yesAsk <= extremeMin || noAsk >= extremeMax || noAsk <= extremeMin;
-    if (extremeHit) {
-      this.logCandidateSkip({
-        candidate,
-        skipReason: "EXTREME_BOOK",
-        extremeMin,
-        extremeMax,
-        yesAsk,
-        noAsk,
-        yesSpread,
-        noSpread,
-        wideSpreadThreshold
-      });
-      return {
-        selected: null,
-        reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
-        filteredOut: "EXTREME"
-      };
-    }
+    const yesTradable =
+      yesQuoteValid && yesAsk !== null && yesSpread !== null && yesAsk < extremeMax && yesAsk > extremeMin && yesSpread < wideSpreadThreshold;
+    const noTradable =
+      noQuoteValid && noAsk !== null && noSpread !== null && noAsk < extremeMax && noAsk > extremeMin && noSpread < wideSpreadThreshold;
 
-    const wideSpreadHit =
-      (yesSpread !== null && Number.isFinite(yesSpread) && yesSpread >= wideSpreadThreshold) ||
-      (noSpread !== null && Number.isFinite(noSpread) && noSpread >= wideSpreadThreshold);
-    if (wideSpreadHit) {
+    if (!yesTradable && !noTradable) {
+      const extremeHit =
+        (yesQuoteValid && yesAsk !== null && (yesAsk >= extremeMax || yesAsk <= extremeMin)) ||
+        (noQuoteValid && noAsk !== null && (noAsk >= extremeMax || noAsk <= extremeMin));
+      const wideSpreadHit =
+        (yesQuoteValid && yesSpread !== null && yesSpread >= wideSpreadThreshold) ||
+        (noQuoteValid && noSpread !== null && noSpread >= wideSpreadThreshold);
       this.logCandidateSkip({
         candidate,
-        skipReason: "WIDE_SPREAD",
+        skipReason: extremeHit ? "EXTREME_BOOK" : wideSpreadHit ? "WIDE_SPREAD" : "INVALID_QUOTE",
         extremeMin,
         extremeMax,
         yesAsk,
@@ -315,7 +434,7 @@ export class Btc5mSelector {
       return {
         selected: null,
         reason: BTC5M_SELECTOR_REASONS.CANDIDATE_NOT_TRADABLE,
-        filteredOut: "WIDE_SPREAD"
+        filteredOut: extremeHit ? "EXTREME" : wideSpreadHit ? "WIDE_SPREAD" : "INVALID"
       };
     }
 
@@ -324,9 +443,37 @@ export class Btc5mSelector {
         ...candidate,
         chosenSide: null,
         selectedTokenId: null,
-        yesBook: yesBook.book,
-        noBook: noBook.book,
-        orderbookOk: true
+        yesBook: yesTradable
+          ? yesBook.book
+          : {
+              ...yesBook.book,
+              bookable: false,
+              reason:
+                yesBook.book.reason ||
+                (yesQuoteValid
+                  ? yesAsk !== null && (yesAsk >= extremeMax || yesAsk <= extremeMin)
+                    ? "EXTREME_BOOK"
+                    : yesSpread !== null && yesSpread >= wideSpreadThreshold
+                      ? "WIDE_SPREAD"
+                      : "INVALID_QUOTE"
+                  : "UNAVAILABLE")
+            },
+        noBook: noTradable
+          ? noBook.book
+          : {
+              ...noBook.book,
+              bookable: false,
+              reason:
+                noBook.book.reason ||
+                (noQuoteValid
+                  ? noAsk !== null && (noAsk >= extremeMax || noAsk <= extremeMin)
+                    ? "EXTREME_BOOK"
+                    : noSpread !== null && noSpread >= wideSpreadThreshold
+                      ? "WIDE_SPREAD"
+                      : "INVALID_QUOTE"
+                  : "UNAVAILABLE")
+            },
+        orderbookOk: yesTradable || noTradable
       },
       reason: "OK",
       filteredOut: null
@@ -388,6 +535,7 @@ export class Btc5mSelector {
     const row = seed.row;
     const marketId = pickString(row, ["id", "market_id", "conditionId", "condition_id"]);
     if (!marketId) return null;
+    const nowTs = Date.now();
 
     const rowSlug = pickString(row, ["slug", "market_slug", "eventSlug", "event_slug"]) || seed.expectedSlug;
     const expectedBucketStartSec = parseBucketStartSec(seed.expectedSlug);
@@ -399,14 +547,19 @@ export class Btc5mSelector {
       return null;
     }
 
-    const context = await this.client.getMarketContext(marketId).catch(() => null);
-    const active = context?.active ?? pickBoolean(row, ["active", "is_active"], true);
-    const closed = context?.closed ?? pickBoolean(row, ["closed", "is_closed", "resolved"], false);
-    const archived = context?.archived ?? pickBoolean(row, ["archived", "is_archived"], false);
+    const cachedMeta = this.getCachedMarketMeta(marketId, nowTs);
+    const context = cachedMeta ? null : await this.client.getMarketContext(marketId).catch(() => null);
+    const active = context?.active ?? cachedMeta?.active ?? pickBoolean(row, ["active", "is_active"], true);
+    const closed = context?.closed ?? cachedMeta?.closed ?? pickBoolean(row, ["closed", "is_closed", "resolved"], false);
+    const archived = context?.archived ?? cachedMeta?.archived ?? pickBoolean(row, ["archived", "is_archived"], false);
     const acceptingOrders =
-      context?.acceptingOrders ?? pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"], true);
+      context?.acceptingOrders ??
+      cachedMeta?.acceptingOrders ??
+      pickBoolean(row, ["accepting_orders", "acceptingOrders", "tradable"], true);
     const enableOrderBook =
-      context?.enableOrderBook ?? pickBoolean(row, ["enable_order_book", "enableOrderBook"], true);
+      context?.enableOrderBook ??
+      cachedMeta?.enableOrderBook ??
+      pickBoolean(row, ["enable_order_book", "enableOrderBook"], true);
     if (!active || closed || archived || !acceptingOrders || !enableOrderBook) {
       return null;
     }
@@ -418,8 +571,18 @@ export class Btc5mSelector {
       return null;
     }
 
-    const yesTokenId = context?.resolution.yesTokenId ?? extractTokenId(row, "YES");
-    const noTokenId = context?.resolution.noTokenId ?? extractTokenId(row, "NO");
+    const yesTokenId = context?.resolution.yesTokenId ?? cachedMeta?.yesTokenId ?? extractTokenId(row, "YES");
+    const noTokenId = context?.resolution.noTokenId ?? cachedMeta?.noTokenId ?? extractTokenId(row, "NO");
+    this.cacheMarketMeta(marketId, {
+      active,
+      closed,
+      archived,
+      acceptingOrders,
+      enableOrderBook,
+      yesTokenId,
+      noTokenId,
+      cachedAtTs: nowTs
+    });
 
     return {
       marketId,
@@ -456,6 +619,7 @@ export class Btc5mSelector {
       };
     }
 
+    let quoteFailedWithNetworkError = false;
     try {
       const quote = await this.client.getTokenPriceQuote(tokenId, { slug });
       const bestBid = sanitizePrice(quote.bestBid);
@@ -487,11 +651,7 @@ export class Btc5mSelector {
           reasonCode: side === "YES" ? BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_YES : BTC5M_SELECTOR_REASONS.ORDERBOOK_MISSING_NO
         };
       }
-      return {
-        book: emptySideBook(side, tokenId),
-        bookable: false,
-        reasonCode: BTC5M_SELECTOR_REASONS.NETWORK_ERROR
-      };
+      quoteFailedWithNetworkError = true;
     }
 
     try {
@@ -533,7 +693,9 @@ export class Btc5mSelector {
       return {
         book: emptySideBook(side, tokenId),
         bookable: false,
-        reasonCode: BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+        reasonCode: quoteFailedWithNetworkError
+          ? BTC5M_SELECTOR_REASONS.NETWORK_ERROR
+          : BTC5M_SELECTOR_REASONS.NETWORK_ERROR
       };
     }
   }
@@ -557,6 +719,25 @@ export class Btc5mSelector {
     for (const slug of this.unavailableTokenIdsBySlug.keys()) {
       if (!activeSlugs.has(slug)) {
         this.unavailableTokenIdsBySlug.delete(slug);
+      }
+    }
+    for (const slug of this.unavailableMarketIdsBySlug.keys()) {
+      if (!activeSlugs.has(slug)) {
+        this.unavailableMarketIdsBySlug.delete(slug);
+      }
+    }
+  }
+
+  private pruneDiscoveryCache(nowTs: number, activeSlugs: Set<string>): void {
+    const ttlMs = this.getDiscoveryCacheTtlMs();
+    for (const [slug, cached] of this.recentDiscoveredRowsBySlug.entries()) {
+      if (!activeSlugs.has(slug) || nowTs - cached.cachedAtTs > ttlMs) {
+        this.recentDiscoveredRowsBySlug.delete(slug);
+      }
+    }
+    for (const [marketId, cached] of this.recentMarketMetaById.entries()) {
+      if (nowTs - cached.cachedAtTs > ttlMs) {
+        this.recentMarketMetaById.delete(marketId);
       }
     }
   }
@@ -614,6 +795,16 @@ function extractTokenId(row: Record<string, unknown>, side: Btc5mSide): string |
   if (clobTokenIds.length >= 2) {
     return side === "YES" ? clobTokenIds[0] : clobTokenIds[1];
   }
+
+   const parsedTokens = parseTokens(row);
+   const preferredToken = parsedTokens.find((token) => token.outcome === (side === "YES" ? "yes" : "no"));
+   if (preferredToken?.tokenId) {
+     return preferredToken.tokenId;
+   }
+   const fallbackToken = parsedTokens.find((token) => token.outcome !== "other");
+   if (fallbackToken?.tokenId) {
+     return fallbackToken.tokenId;
+   }
   return null;
 }
 
@@ -626,8 +817,107 @@ function normalizeTickSize(value: string): "0.1" | "0.01" | "0.001" | "0.0001" |
 }
 
 function parseStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.map((row) => String(row || "").trim()).filter((row) => row.length > 0);
+  if (Array.isArray(value)) {
+    return value.map((row) => String(row || "").trim()).filter((row) => row.length > 0);
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed.map((row) => String(row || "").trim()).filter((row) => row.length > 0);
+      }
+    } catch {
+      return value
+        .split(",")
+        .map((row) => String(row || "").trim())
+        .filter((row) => row.length > 0);
+    }
+  }
+  return [];
+}
+
+function parseTokens(row: Record<string, unknown>): Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> {
+  const raw = row.tokens;
+  const outcomeNames = parseOutcomeNames(row);
+  const clobTokenIds = parseStringArray(row.clobTokenIds);
+
+  if (Array.isArray(raw) && raw.some((item) => item && typeof item === "object")) {
+    const out: Array<{ outcome: "yes" | "no" | "other"; tokenId: string }> = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object") continue;
+      const obj = item as Record<string, unknown>;
+      const tokenId = pickString(obj, ["token_id", "tokenId", "id", "clob_token_id"]);
+      if (!tokenId) continue;
+      out.push({
+        outcome: normalizeOutcomeName(pickString(obj, ["outcome", "name", "label"])),
+        tokenId
+      });
+    }
+    if (out.length > 0) return out;
+  }
+
+  if (Array.isArray(raw) && raw.every((item) => typeof item === "string" || typeof item === "number")) {
+    return raw
+      .map((item, idx) => {
+        const tokenId = String(item || "").trim();
+        if (!tokenId) return null;
+        return {
+          outcome: normalizeOutcomeName(String(outcomeNames[idx] || "")),
+          tokenId
+        };
+      })
+      .filter((row): row is { outcome: "yes" | "no" | "other"; tokenId: string } => row !== null);
+  }
+
+  if (clobTokenIds.length > 0) {
+    return clobTokenIds.map((tokenId, idx) => ({
+      outcome: normalizeOutcomeName(String(outcomeNames[idx] || "")),
+      tokenId
+    }));
+  }
+
+  return [];
+}
+
+function parseOutcomeNames(row: Record<string, unknown>): string[] {
+  if (Array.isArray(row.outcomes)) {
+    return row.outcomes.map((value) => String(value || "").trim()).filter((value) => value.length > 0);
+  }
+  if (typeof row.outcomes === "string" && row.outcomes.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(row.outcomes);
+      if (Array.isArray(parsed)) {
+        return parsed.map((value) => String(value || "").trim()).filter((value) => value.length > 0);
+      }
+    } catch {
+      return row.outcomes
+        .split(",")
+        .map((value) => String(value || "").trim())
+        .filter((value) => value.length > 0);
+    }
+  }
+  return [];
+}
+
+function normalizeOutcomeName(value: string): "yes" | "no" | "other" {
+  const outcomeRaw = String(value || "").trim().toLowerCase();
+  if (
+    outcomeRaw === "yes" ||
+    outcomeRaw.includes("up") ||
+    outcomeRaw.includes("higher") ||
+    outcomeRaw.includes("above")
+  ) {
+    return "yes";
+  }
+  if (
+    outcomeRaw === "no" ||
+    outcomeRaw.includes("down") ||
+    outcomeRaw.includes("lower") ||
+    outcomeRaw.includes("below")
+  ) {
+    return "no";
+  }
+  return "other";
 }
 
 function pickString(obj: Record<string, unknown>, keys: string[]): string {

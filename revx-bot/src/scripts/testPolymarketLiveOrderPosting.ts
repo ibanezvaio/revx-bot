@@ -47,7 +47,21 @@ async function runDelayedExpirationRetryScenario(): Promise<void> {
     schedule: async (fn: () => Promise<unknown>) => await fn()
   };
   clientAny.getHttpTimeoutMs = () => 60_000;
-  clientAny.getFeeRateBps = async () => 7;
+  clientAny.getFeeRateBpsForLiveOrder = async () => 7;
+  clientAny.runClobCall = async (
+    _label: string,
+    fn: (attempt: number) => Promise<unknown>,
+    options?: { isRetryable?: (error: unknown) => boolean }
+  ) => {
+    try {
+      return await fn(1);
+    } catch (error) {
+      if (options?.isRetryable?.(error)) {
+        return await fn(2);
+      }
+      throw error;
+    }
+  };
   clientAny.getAuthClient = async () => ({
     createOrder: async (userOrder: Record<string, unknown>) => ({
       signature: `sig-${attempts.length + 1}`,
@@ -107,7 +121,7 @@ async function runDelayedExpirationRetryScenario(): Promise<void> {
   }
 }
 
-async function runSignedPayloadMutationGuardScenario(): Promise<void> {
+async function runSdkPayloadMutationToleranceScenario(): Promise<void> {
   const base = loadConfig();
   const logger = buildLogger(base);
   const client = new PolymarketClient(base, logger);
@@ -119,9 +133,10 @@ async function runSignedPayloadMutationGuardScenario(): Promise<void> {
   clientAny.getHttpTimeoutMs = () => 60_000;
   clientAny.getTickSize = async () => "0.01";
   clientAny.getNegRisk = async () => false;
-  clientAny.getFeeRateBps = async () => 9;
+  clientAny.getFeeRateBpsForLiveOrder = async () => 9;
   clientAny.getOrderTypeConstant = async () => "GTD";
   let sawMutationLog = false;
+  let postedSignedOrder: Record<string, unknown> | null = null;
   const originalError = clientAny.logger.error.bind(clientAny.logger);
   clientAny.logger.error = (...args: unknown[]) => {
     const text = String(args[1] ?? args[0] ?? "");
@@ -135,24 +150,26 @@ async function runSignedPayloadMutationGuardScenario(): Promise<void> {
       userOrder.feeRateBps = 11;
       return { signature: "sig-bad", ...userOrder };
     },
-    postOrder: async () => {
-      throw new Error("postOrder should not run after mutation is detected");
+    postOrder: async (signedOrder: Record<string, unknown>) => {
+      postedSignedOrder = signedOrder;
+      return { orderID: "mutation-tolerated-order" };
     }
   });
 
-  let threw = false;
-  try {
-    await client.placeMarketableBuyYes({
-      tokenId: "123456789",
-      limitPrice: 0.49,
-      size: 10,
-      ttlMs: 15_000
-    });
-  } catch (error) {
-    threw = String((error as Error)?.message || "").includes("mutated after signing/finalization");
+  const placed = await client.placeMarketableBuyYes({
+    tokenId: "123456789",
+    limitPrice: 0.49,
+    size: 10,
+    ttlMs: 15_000
+  });
+  assert(placed.orderId === "mutation-tolerated-order", `expected mutation-tolerated-order, got ${String(placed.orderId)}`);
+  assert(postedSignedOrder !== null, "expected postOrder to run after SDK mutates its createOrder input clone");
+  if (!postedSignedOrder) {
+    throw new Error("expected postOrder to run after SDK mutates its createOrder input clone");
   }
-  assert(threw, "mutated userOrder payload should throw before postOrder");
-  assert(sawMutationLog, "payload mutation guard should emit POLY_ORDER_PAYLOAD_MUTATED");
+  const posted: Record<string, unknown> = postedSignedOrder;
+  assert(Number(posted["feeRateBps"]) === 11, `expected mutated feeRateBps to flow through signed order, got ${String(posted["feeRateBps"])}`);
+  assert(!sawMutationLog, "SDK-side payload normalization should not emit POLY_ORDER_PAYLOAD_MUTATED");
 }
 
 async function runTradeAuthContextScenario(): Promise<void> {
@@ -204,10 +221,123 @@ async function runTradeAuthContextScenario(): Promise<void> {
   assert(clientAny.authClientInfo?.funder === "0xFunder", "auth debug info funder mismatch");
 }
 
+async function runFastPostOrderProfileScenario(): Promise<void> {
+  const base = loadConfig();
+  const logger = buildLogger(base);
+  const client = new PolymarketClient(base, logger);
+  const clientAny = client as any;
+
+  let capturedLabel: string | null = null;
+  let capturedOptions: Record<string, unknown> | null = null;
+  clientAny.getAuthClient = async () => ({});
+  clientAny.getOrderTypeConstant = async () => "GTD";
+  clientAny.getTickSize = async () => "0.01";
+  clientAny.getNegRisk = async () => false;
+  clientAny.getFeeRateBpsForLiveOrder = async () => 7;
+  clientAny.runClobCall = async (label: string, _fn: (attempt: number) => Promise<unknown>, options?: unknown) => {
+    capturedLabel = label;
+    capturedOptions = (options ?? null) as Record<string, unknown> | null;
+    return { orderID: "fast-order" };
+  };
+
+  const placed = await client.placeMarketableBuyYes({
+    tokenId: "123456789",
+    limitPrice: 0.49,
+    size: 10,
+    ttlMs: 5_000
+  });
+
+  assert(placed.orderId === "fast-order", `expected orderId fast-order, got ${String(placed.orderId)}`);
+  assert(capturedLabel === "postOrder", `expected postOrder label, got ${String(capturedLabel)}`);
+  assert(capturedOptions?.["maxRetries"] === 1, `expected postOrder maxRetries=1, got ${String(capturedOptions?.["maxRetries"])}`);
+  assert(capturedOptions?.["useScheduler"] === false, `expected postOrder useScheduler=false, got ${String(capturedOptions?.["useScheduler"])}`);
+  assert(capturedOptions?.["timeoutMs"] === 2_500, `expected postOrder timeoutMs=2500, got ${String(capturedOptions?.["timeoutMs"])}`);
+}
+
+async function runFeeRateFallbackScenario(): Promise<void> {
+  const base = loadConfig();
+  const logger = buildLogger(base);
+  const client = new PolymarketClient(base, logger);
+  const clientAny = client as any;
+
+  let capturedLabel: string | null = null;
+  let capturedSignedOrder: Record<string, unknown> | null = null;
+  clientAny.getAuthClient = async () => ({
+    createOrder: async (userOrder: Record<string, unknown>) => ({ ...JSON.parse(JSON.stringify(userOrder)), signature: "sig" }),
+    postOrder: async (signedOrder: Record<string, unknown>) => {
+      capturedSignedOrder = signedOrder;
+      return { orderID: "fallback-order" };
+    }
+  });
+  clientAny.getOrderTypeConstant = async () => "GTD";
+  clientAny.getTickSize = async () => "0.01";
+  clientAny.getNegRisk = async () => false;
+  clientAny.getFeeRateBpsForLiveOrder = async () => undefined;
+  clientAny.runClobCall = async (label: string, fn: (attempt: number) => Promise<unknown>, _options?: unknown) => {
+    capturedLabel = label;
+    return await fn(1);
+  };
+
+  const placed = await client.placeMarketableBuyYes({
+    tokenId: "123456789",
+    limitPrice: 0.49,
+    size: 10,
+    ttlMs: 5_000
+  });
+
+  assert(placed.orderId === "fallback-order", `expected orderId fallback-order, got ${String(placed.orderId)}`);
+  assert(capturedLabel === "postOrder", `expected postOrder label, got ${String(capturedLabel)}`);
+  assert(capturedSignedOrder !== null, "expected signed order to be posted");
+  assert(
+    capturedSignedOrder?.["feeRateBps"] === undefined,
+    `expected feeRateBps to be omitted when fee lookup falls back, got ${String(capturedSignedOrder?.["feeRateBps"])}`
+  );
+}
+
+async function runTickSizeFallbackScenario(): Promise<void> {
+  const base = loadConfig();
+  const logger = buildLogger(base);
+  const client = new PolymarketClient(base, logger);
+  const clientAny = client as any;
+
+  let postedSignedOrder: Record<string, unknown> | null = null;
+  clientAny.getAuthClient = async () => ({
+    createOrder: async (userOrder: Record<string, unknown>) => ({ ...JSON.parse(JSON.stringify(userOrder)), signature: "sig" }),
+    postOrder: async (signedOrder: Record<string, unknown>) => {
+      postedSignedOrder = signedOrder;
+      return { orderID: "tick-fallback-order" };
+    }
+  });
+  clientAny.getOrderTypeConstant = async () => "GTD";
+  clientAny.getTickSize = async () => {
+    throw new Error("getTickSize should not be called on the live entry hot path");
+  };
+  clientAny.getNegRisk = async () => {
+    throw new Error("getNegRisk should not be called on the live entry hot path");
+  };
+  clientAny.getFeeRateBpsForLiveOrder = async () => 7;
+  clientAny.runClobCall = async (_label: string, fn: (attempt: number) => Promise<unknown>, _options?: unknown) => {
+    return await fn(1);
+  };
+
+  const placed = await client.placeMarketableBuyYes({
+    tokenId: "123456789",
+    limitPrice: 0.49,
+    size: 10,
+    ttlMs: 5_000
+  });
+
+  assert(placed.orderId === "tick-fallback-order", `expected tick-fallback-order, got ${String(placed.orderId)}`);
+  assert(postedSignedOrder !== null, "expected signed order to be posted");
+}
+
 async function run(): Promise<void> {
   await runDelayedExpirationRetryScenario();
-  await runSignedPayloadMutationGuardScenario();
+  await runSdkPayloadMutationToleranceScenario();
   await runTradeAuthContextScenario();
+  await runFastPostOrderProfileScenario();
+  await runFeeRateFallbackScenario();
+  await runTickSizeFallbackScenario();
   // eslint-disable-next-line no-console
   console.log("Polymarket live order posting tests: PASS");
 }

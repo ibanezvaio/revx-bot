@@ -69,6 +69,20 @@ function run(): void {
   });
   assert(lowEdge.notionalUsd === 0, `expected 0 notional for weak edge, got ${lowEdge.notionalUsd}`);
 
+  const minClamp = sizing.compute({
+    edge: 0.2,
+    pUpModel: 0.8,
+    yesAsk: 0.5,
+    conviction: 0.45,
+    remainingSec: 80,
+    entryMaxRemainingSec: 240,
+    remainingWindowBudget: 1,
+    remainingExposureBudget: 10,
+    remainingDailyLossBudget: 10
+  });
+  assert(minClamp.notionalUsd === 1, `expected live min-order clamp to 1, got ${minClamp.notionalUsd}`);
+  assert(minClamp.shares === 2, `expected clamped shares=2, got ${minClamp.shares}`);
+
   // eslint-disable-next-line no-console
   console.log("Polymarket Sizing tests: PASS");
 }

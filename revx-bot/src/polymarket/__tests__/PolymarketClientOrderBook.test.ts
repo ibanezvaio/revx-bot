@@ -1,6 +1,6 @@
 import { loadConfig } from "../../config";
 import { buildLogger } from "../../logger";
-import { PolymarketClient } from "../PolymarketClient";
+import { PolymarketClient, testComputeLiveOrderExpirationSec } from "../PolymarketClient";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -59,6 +59,13 @@ export async function runPolymarketClientOrderBookTests(): Promise<void> {
   );
   assert(parsedWithAsk.bestAsk === 0.56, `expected bestAsk=0.56, got ${String(parsedWithAsk.bestAsk)}`);
   assert(parsedWithAsk.bestBid === 0.55, `expected bestBid=0.55, got ${String(parsedWithAsk.bestBid)}`);
+
+  const expirationPlan = testComputeLiveOrderExpirationSec(1_500, 1_774_013_336_000);
+  assert(
+    expirationPlan.expirationSec - expirationPlan.nowSec >= 240,
+    `expected live expiration lead >= 240s, got ${expirationPlan.expirationSec - expirationPlan.nowSec}s`
+  );
+  assert(expirationPlan.safetyBufferSec === 120, `expected safetyBufferSec=120, got ${expirationPlan.safetyBufferSec}`);
 
   // eslint-disable-next-line no-console
   console.log("PolymarketClient orderbook tests: PASS");

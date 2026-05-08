@@ -1,6 +1,8 @@
 import { BotConfig } from "../../config";
 import { IntelEngine } from "../../intel/IntelEngine";
 import { Logger } from "../../logger";
+import { buildDecisionAttributionRecord } from "../../runtime/DecisionAttribution";
+import { SharedMarketIntelligence } from "../../runtime/SharedMarketIntelligence";
 import { SignalsEngine } from "../../signals/SignalsEngine";
 import { Store } from "../../store/Store";
 import { sleep } from "../../util/time";
@@ -9,14 +11,17 @@ import { PolymarketClient } from "../PolymarketClient";
 import { PolymarketExecution } from "../Execution";
 import { PolymarketRisk } from "../Risk";
 import { Sizing } from "../Sizing";
+import { getPolymarketVenueMinSharesFloor } from "../sizingMinimums";
 import { Btc5mExecutionGate } from "./Btc5mExecutionGate";
 import { BTC5M_SELECTOR_REASONS, Btc5mSelector } from "./Btc5mSelector";
+import { classifyPolymarketBlocker, summarizePolymarketBlockers } from "./blockerClassification";
 import { Btc5mDecision, Btc5mIntelligence, Btc5mSelectedMarket, Btc5mTick } from "./Btc5mTypes";
 
 type RunnerDeps = {
   store?: Store;
   intelEngine?: IntelEngine;
   signalsEngine?: SignalsEngine;
+  marketIntelligence?: SharedMarketIntelligence;
 };
 
 type RuntimeState = {
@@ -79,6 +84,7 @@ type RunnerExecutionBlocker =
   | "PROFIT_TAKE_IN_FLIGHT"
   | "MAX_ENTRIES_PER_WINDOW"
   | "MAX_OPEN_ENTRY_ORDERS_PER_WINDOW"
+  | "ORDER_STATUS_UNKNOWN"
   | "REENTRY_WAIT_CLEAR"
   | "REENTRY_COOLDOWN"
   | "POST_ROLLOVER_GRACE"
@@ -152,6 +158,14 @@ type ReferenceOracle = {
   source: string;
 };
 
+type PortfolioEntryPolicy = {
+  allowNewEntries: boolean;
+  additionalBudgetUsd: number;
+  reason: string | null;
+  source: string;
+  updatedTs: number;
+};
+
 type DispatchSelectionValidation = {
   tick: Btc5mTick;
   selected: Btc5mSelectedMarket | null;
@@ -167,9 +181,8 @@ export class Btc5mLiveRunner {
   private readonly sizing: Sizing;
   private readonly selector: Btc5mSelector;
   private readonly gate: Btc5mExecutionGate;
-  private readonly store?: Store;
-  private readonly intelEngine?: IntelEngine;
-  private readonly signalsEngine?: SignalsEngine;
+  private readonly store: Store | null;
+  private readonly marketIntelligence: SharedMarketIntelligence;
 
   private running = false;
   private stopRequested = false;
@@ -185,6 +198,14 @@ export class Btc5mLiveRunner {
   private executionAttemptSeq = 0;
   private executionCooldownUntilTs = 0;
   private entryAttemptCooldownUntilTs = 0;
+  private realizedPnlSessionUsd = 0;
+  private portfolioEntryPolicy: PortfolioEntryPolicy = {
+    allowNewEntries: true,
+    additionalBudgetUsd: Number.POSITIVE_INFINITY,
+    reason: null,
+    source: "BOOTSTRAP",
+    updatedTs: 0
+  };
   private invalidatedAttemptIds = new Set<string>();
   private finalizedAttemptIds = new Set<string>();
   private previousCurrentSlug: string | null = null;
@@ -248,9 +269,14 @@ export class Btc5mLiveRunner {
     private readonly logger: Logger,
     deps: RunnerDeps = {}
   ) {
-    this.store = deps.store;
-    this.intelEngine = deps.intelEngine;
-    this.signalsEngine = deps.signalsEngine;
+    this.store = deps.store ?? null;
+    this.marketIntelligence =
+      deps.marketIntelligence ??
+      new SharedMarketIntelligence({
+        store: deps.store,
+        intelEngine: deps.intelEngine,
+        signalsEngine: deps.signalsEngine
+      });
     this.client = new PolymarketClient(config, logger);
     this.execution = new PolymarketExecution(config, logger, this.client);
     this.risk = new PolymarketRisk(config, logger);
@@ -297,6 +323,14 @@ export class Btc5mLiveRunner {
     this.state.dispatchEligibilityReason = null;
     this.state.reselectionTriggered = false;
     this.state.handoffWaitTriggered = false;
+    this.realizedPnlSessionUsd = 0;
+    this.portfolioEntryPolicy = {
+      allowNewEntries: true,
+      additionalBudgetUsd: Number.POSITIVE_INFINITY,
+      reason: null,
+      source: "RUNNER_START",
+      updatedTs: Date.now()
+    };
     this.logger.warn(
       {
         minEdgeThresholdConfig: this.config.polymarket.live.minEdgeThreshold,
@@ -397,6 +431,30 @@ export class Btc5mLiveRunner {
     const nowTs = Date.now();
     const lastUpdateAgeSec =
       this.state.lastUpdateTs > 0 ? Math.max(0, Math.floor((nowTs - this.state.lastUpdateTs) / 1000)) : null;
+    const telemetryStartingResolved =
+      this.state.running &&
+      this.state.holdReason === "STARTING" &&
+      this.state.blockedBy === "STARTING";
+    const telemetryHoldReason = telemetryStartingResolved
+      ? this.state.fetchOk
+        ? this.state.candidatesBeforeFilter > 0
+          ? "DISCOVERY_IN_PROGRESS"
+          : this.state.warningState === "DISCOVERY_STALE"
+            ? "DISCOVERY_STALE"
+            : "AWAITING_DISCOVERY"
+        : this.state.lastFetchErr && this.state.lastFetchErr !== "STARTING"
+          ? this.state.lastFetchErr
+          : "STARTING"
+      : this.state.holdReason;
+    const telemetryBlockedBy = telemetryStartingResolved ? telemetryHoldReason : this.state.blockedBy;
+    const currentBlocker = classifyPolymarketBlocker(telemetryBlockedBy);
+    const blockerSummary = summarizePolymarketBlockers(
+      this.recentTicks
+        .map((row) => ({
+          blocker: typeof row.blocker === "string" ? row.blocker : null,
+          edge: finiteOrNull((row as { edge?: unknown }).edge)
+        }))
+    );
     return {
       latestPolymarket: null,
       latestModel: null,
@@ -441,7 +499,11 @@ export class Btc5mLiveRunner {
       desiredNotional: null,
       finalNotional: null,
       sizeBumped: null,
-      lastNormalizedError: this.state.blockedBy,
+      lastNormalizedError: telemetryBlockedBy,
+      portfolioEntryGateReason: this.portfolioEntryPolicy.reason,
+      portfolioEntryBudgetUsd: Number.isFinite(this.portfolioEntryPolicy.additionalBudgetUsd)
+        ? this.portfolioEntryPolicy.additionalBudgetUsd
+        : null,
       pollTrace: [],
       rolloverTrace: [],
       currentMarketSlug: this.state.selectedSlug ?? this.state.currentBucketSlug,
@@ -450,7 +512,7 @@ export class Btc5mLiveRunner {
         this.state.tickNowSec !== null && this.state.remainingSec !== null
           ? (this.state.tickNowSec + this.state.remainingSec) * 1000
           : null,
-      whyNotTrading: this.state.action === "HOLD" ? this.state.holdReason : null,
+      whyNotTrading: this.state.action === "HOLD" ? telemetryHoldReason : null,
       currentMarketStatus:
         !this.state.running
           ? "STARTING"
@@ -460,8 +522,8 @@ export class Btc5mLiveRunner {
       mode: this.config.polymarket.mode,
       polyMoney: false,
       lastAction: this.state.action === "HOLD" ? "HOLD" : "OPEN",
-      holdReason: this.state.holdReason,
-      blockedBy: this.state.blockedBy,
+      holdReason: telemetryHoldReason,
+      blockedBy: telemetryBlockedBy,
       entriesInWindow: this.state.entriesInWindow,
       exitsInWindow: this.state.exitsInWindow,
       realizedPnlWindowUsd: this.state.realizedPnlUsd,
@@ -471,8 +533,8 @@ export class Btc5mLiveRunner {
       reentryBlockedReason: this.state.reentryBlockedReason,
       timeInPositionSec: this.state.timeInPositionSec,
       scalpCycleId: this.state.scalpCycleId,
-      currentWindowHoldReason: this.state.holdReason,
-      holdCategory: this.state.holdReason ? "STRATEGY" : null,
+      currentWindowHoldReason: telemetryHoldReason,
+      holdCategory: telemetryHoldReason ? currentBlocker.category : null,
       strategyAction: this.state.action,
       selectedTokenId: this.state.selectedTokenId,
       selectedBookable: Boolean(this.state.selectedTokenId),
@@ -492,7 +554,7 @@ export class Btc5mLiveRunner {
             ? "next_slug"
             : null,
       selectionCommitTs: this.state.lastDecisionTs || null,
-      liveValidationReason: this.state.action === "HOLD" ? this.state.holdReason : "OK",
+      liveValidationReason: this.state.action === "HOLD" ? telemetryHoldReason : "OK",
       lastBookTs: null,
       lastQuoteTs: null,
       currentBucketSlug: this.state.currentBucketSlug,
@@ -556,10 +618,12 @@ export class Btc5mLiveRunner {
         lastModelTs: 0
       },
       state: {
-        holdDetailReason: this.state.holdReason,
-        dominantReject: this.state.blockedBy,
-        rejectCountsByStage: {},
-        sampleRejected: []
+        holdDetailReason: telemetryHoldReason,
+        dominantReject: telemetryBlockedBy,
+        rejectCountsByStage: blockerSummary.countsByStage,
+        rejectCountsByCategory: blockerSummary.countsByCategory,
+        positiveEdgeBlockedCount: blockerSummary.positiveEdgeBlockedCount,
+        sampleRejected: blockerSummary.topReasons
       },
       lastTrade: {
         id: null,
@@ -574,6 +638,59 @@ export class Btc5mLiveRunner {
       running: this.state.running,
       fetchOk: this.state.fetchOk
     };
+  }
+
+  getPortfolioSnapshot(): {
+    running: boolean;
+    exposureUsd: number;
+    realizedPnlUsd: number;
+    portfolioEntryGateReason: string | null;
+    portfolioEntryBudgetUsd: number | null;
+  } {
+    return {
+      running: this.running,
+      exposureUsd: this.execution.getTotalExposureUsd(),
+      realizedPnlUsd: this.realizedPnlSessionUsd,
+      portfolioEntryGateReason: this.portfolioEntryPolicy.reason,
+      portfolioEntryBudgetUsd: Number.isFinite(this.portfolioEntryPolicy.additionalBudgetUsd)
+        ? this.portfolioEntryPolicy.additionalBudgetUsd
+        : null
+    };
+  }
+
+  setPortfolioEntryPolicy(input: {
+    allowNewEntries: boolean;
+    additionalBudgetUsd: number;
+    reason: string | null;
+    source?: string;
+  }): void {
+    const next: PortfolioEntryPolicy = {
+      allowNewEntries: Boolean(input.allowNewEntries),
+      additionalBudgetUsd:
+        Number.isFinite(Number(input.additionalBudgetUsd)) && Number(input.additionalBudgetUsd) >= 0
+          ? Number(input.additionalBudgetUsd)
+          : 0,
+      reason: input.reason ? String(input.reason) : null,
+      source: String(input.source || "EXTERNAL_POLICY"),
+      updatedTs: Date.now()
+    };
+    if (
+      this.portfolioEntryPolicy.allowNewEntries === next.allowNewEntries &&
+      this.portfolioEntryPolicy.reason === next.reason &&
+      Math.abs(this.portfolioEntryPolicy.additionalBudgetUsd - next.additionalBudgetUsd) < 1e-9
+    ) {
+      return;
+    }
+    this.portfolioEntryPolicy = next;
+    this.logger.warn(
+      {
+        allowNewEntries: next.allowNewEntries,
+        additionalBudgetUsd: Number.isFinite(next.additionalBudgetUsd) ? next.additionalBudgetUsd : null,
+        reason: next.reason,
+        source: next.source
+      },
+      "POLY_V2_PORTFOLIO_ENTRY_POLICY"
+    );
   }
 
   private async runLoop(): Promise<void> {
@@ -611,10 +728,12 @@ export class Btc5mLiveRunner {
       );
       this.lastRolloverTs = tick.tickNowMs;
       this.invalidateSelectionCommit("ROLLOVER");
-      this.invalidateExecutionAttempt("ROLLOVER", {
-        currentSlug: tick.currentSlug,
-        selectedSlug: this.activeExecutionAttempt?.selectedSlug ?? null
-      });
+      if (this.shouldInvalidateExecutionAttemptForRollover(tick.currentSlug)) {
+        this.invalidateExecutionAttempt("ROLLOVER", {
+          currentSlug: tick.currentSlug,
+          selectedSlug: this.activeExecutionAttempt?.selectedSlug ?? null
+        });
+      }
     }
     this.previousCurrentSlug = tick.currentSlug;
 
@@ -668,7 +787,16 @@ export class Btc5mLiveRunner {
         chosenSide: null,
         action: "HOLD"
       });
-      this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: tickInvariant.reason });
+      this.recordDecisionAttribution({
+        tick,
+        reference: { price: null, ageMs: null, ts: null, source: "NONE" },
+        selected: null,
+        intelligence: null,
+        decision: null,
+        finalAction: "HOLD",
+        finalBlocker: tickInvariant.reason
+      });
+      this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: tickInvariant.reason, edge: null });
       this.refreshExecutionState(null);
       return;
     }
@@ -773,7 +901,16 @@ export class Btc5mLiveRunner {
         chosenSide: null,
         action: "HOLD"
       });
-      this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker });
+      this.recordDecisionAttribution({
+        tick,
+        reference,
+        selected: null,
+        intelligence: null,
+        decision: null,
+        finalAction: "HOLD",
+        finalBlocker: blocker
+      });
+      this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker, edge: null });
       this.refreshExecutionState(null);
       return;
     }
@@ -829,7 +966,21 @@ export class Btc5mLiveRunner {
         chosenSide: null,
         action: "HOLD"
       });
-      this.pushRecentTick({ tickNowSec: tick.tickNowSec, action: "HOLD", blocker: selectedInvariant.reason });
+      this.recordDecisionAttribution({
+        tick,
+        reference,
+        selected,
+        intelligence: null,
+        decision: null,
+        finalAction: "HOLD",
+        finalBlocker: selectedInvariant.reason
+      });
+      this.pushRecentTick({
+        tickNowSec: tick.tickNowSec,
+        action: "HOLD",
+        blocker: selectedInvariant.reason,
+        edge: null
+      });
       this.refreshExecutionState(null);
       return;
     }
@@ -854,6 +1005,7 @@ export class Btc5mLiveRunner {
     this.state.dispatchEligibilityReason = dispatchValidation.dispatchEligibilityReason;
     this.state.reselectionTriggered = dispatchValidation.reselectionTriggered;
     this.state.handoffWaitTriggered = dispatchValidation.handoffWaitTriggered;
+    const effectiveReference = this.getReferencePrice(dispatchValidation.tick.tickNowMs);
 
     if (dispatchValidation.dispatchEligibilityReason !== "ELIGIBLE_CURRENT" || !dispatchValidation.selected) {
       const holdTick = dispatchValidation.tick;
@@ -916,18 +1068,28 @@ export class Btc5mLiveRunner {
         maxSpread: this.config.polymarket.live.maxSpread,
         remainingSec: holdTick.remainingSec,
         minEntryRemainingSec: this.config.polymarket.live.minEntryRemainingSec,
-        oracleAgeMs: reference.ageMs,
+        oracleAgeMs: effectiveReference.ageMs,
         blocker: normalizedDispatchHoldReason,
         blockerSeverity: "hard",
         warning: null,
         chosenSide: null,
         action: "HOLD"
       });
+      this.recordDecisionAttribution({
+        tick: holdTick,
+        reference: effectiveReference,
+        selected: holdSelected ?? null,
+        intelligence: null,
+        decision: null,
+        finalAction: "HOLD",
+        finalBlocker: normalizedDispatchHoldReason
+      });
       this.pushRecentTick({
         tickNowSec: holdTick.tickNowSec,
         selectedSlug: holdSelected?.slug ?? null,
         action: "HOLD",
-        blocker: normalizedDispatchHoldReason
+        blocker: normalizedDispatchHoldReason,
+        edge: null
       });
       this.refreshExecutionState(holdSelected ?? null);
       return;
@@ -946,7 +1108,7 @@ export class Btc5mLiveRunner {
 
     const intelligence = this.resolveDirectionalIntelligence({
       nowMs: tickForCycle.tickNowMs,
-      referencePrice: reference.price,
+      referencePrice: effectiveReference.price,
       priceToBeat: selectedForCycle.priceToBeat,
       fallbackMid: selectedForCycle.yesBook.mid
     });
@@ -966,7 +1128,7 @@ export class Btc5mLiveRunner {
       tick: tickForCycle,
       selected: selectedForCycle,
       intelligence,
-      oracleAgeMs: reference.ageMs
+      oracleAgeMs: effectiveReference.ageMs
     });
     this.logger.warn(
       {
@@ -1082,13 +1244,23 @@ export class Btc5mLiveRunner {
       chosenSide: decision.chosenSide,
       action: finalAction
     });
+    this.recordDecisionAttribution({
+      tick: tickForCycle,
+      reference: effectiveReference,
+      selected: selectedForCycle,
+      intelligence,
+      decision,
+      finalAction,
+      finalBlocker
+    });
     this.pushRecentTick({
       tickNowSec: tickForCycle.tickNowSec,
       selectedSlug: selectedForCycle.slug,
       selectedTokenId,
       side: chosenSide,
       action: finalAction,
-      blocker: finalBlocker
+      blocker: finalBlocker,
+      edge: Number.isFinite(decision.edge) ? decision.edge : null
     });
     this.refreshExecutionState(selectedForCycle);
   }
@@ -1105,6 +1277,9 @@ export class Btc5mLiveRunner {
     }
     if (!input.allowExecution) {
       return { action: input.decision.action, blocker: null };
+    }
+    if (this.execution.hasUnknownOpenOrders()) {
+      return { action: "HOLD", blocker: "ORDER_STATUS_UNKNOWN" };
     }
     if (!this.canMutateVenueState()) {
       return { action: "HOLD", blocker: "LIVE_EXECUTION_DISABLED" };
@@ -1124,6 +1299,9 @@ export class Btc5mLiveRunner {
     if (this.activeProfitTakeAttempt) {
       return { action: "HOLD", blocker: "PROFIT_TAKE_IN_FLIGHT" };
     }
+    if (!this.portfolioEntryPolicy.allowNewEntries) {
+      return { action: "HOLD", blocker: this.portfolioEntryPolicy.reason || "PORTFOLIO_ENTRY_GATE" };
+    }
 
     const tokenId =
       input.decision.chosenSide === "YES"
@@ -1140,26 +1318,28 @@ export class Btc5mLiveRunner {
       Number.isFinite(input.decision.oracleAgeMs) &&
       input.decision.oracleAgeMs > input.decision.oracleHardBlockMs
     ) {
-      return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
+      return { action: "HOLD", blocker: "STALE_ORACLE_HARD_BLOCK" };
     }
-    const sideBookAvailable = await this.verifySideBookAvailableForExecution({
-      slug: input.selected.slug,
-      side: input.decision.chosenSide,
-      tokenId
-    });
+    const selectedSideBook = input.decision.chosenSide === "YES" ? input.selected.yesBook : input.selected.noBook;
+    const sideBookAvailable =
+      !this.selector.isSideBookUnavailable(input.selected.slug, tokenId) &&
+      Boolean(selectedSideBook?.bookable) &&
+      Number.isFinite(Number(selectedSideBook?.bestAsk)) &&
+      Number(selectedSideBook?.bestAsk) > 0;
     if (!sideBookAvailable) {
       return { action: "HOLD", blocker: "STALE_ATTEMPT_ABORTED" };
     }
-    if (input.selected.slug !== input.tick.currentSlug) {
+    if (!this.isExecutionSlugDispatchable(input.selected.slug, input.tick)) {
       this.logger.warn(
         {
           executionSlug: input.selected.slug,
           currentSlug: input.tick.currentSlug,
+          nextSlug: input.tick.nextSlug,
           selectedSlug: input.selected.slug,
           side: input.decision.chosenSide,
           tokenId,
           retryCount: 0,
-          reason: "INVARIANT_EXECUTION_SLUG_NOT_CURRENT"
+          reason: "INVARIANT_EXECUTION_SLUG_NOT_DISPATCHABLE"
         },
         "POLY_V2_SKIP_NEXT_MARKET_EXECUTION"
       );
@@ -1259,7 +1439,7 @@ export class Btc5mLiveRunner {
       if (active.postingStarted) {
         const activeAgeMs = Date.now() - active.createdTs;
         const staleByAge = activeAgeMs >= this.getUnfilledEntryMaxAgeMs();
-        const staleByRollover = active.executionSlug !== input.tick.currentSlug;
+        const staleByRollover = !this.isExecutionSlugDispatchable(active.executionSlug, input.tick);
         const staleBySuperseded = active.executionSlug !== input.selected.slug;
         const staleBySettlement = active.awaitingSettlement;
         const shouldClear =
@@ -1583,6 +1763,13 @@ export class Btc5mLiveRunner {
     });
   }
 
+  private shouldInvalidateExecutionAttemptForRollover(nextCurrentSlug: string): boolean {
+    const attempt = this.activeExecutionAttempt;
+    if (!attempt) return false;
+    if (this.invalidatedAttemptIds.has(attempt.attemptId)) return false;
+    return attempt.executionSlug !== nextCurrentSlug;
+  }
+
   private async cancelUnfilledOrdersForAttempt(
     attempt: ExecutionAttempt,
     reason: string
@@ -1720,6 +1907,10 @@ export class Btc5mLiveRunner {
         slug: this.activeExecutionAttempt.executionSlug,
         tokenId: this.activeExecutionAttempt.tokenId
       });
+      return;
+    }
+    if (this.execution.hasUnknownOpenOrders()) {
+      this.transitionExecutionState("COOLDOWN", "UNKNOWN_ORDER_STATE");
       return;
     }
     if (now < this.executionCooldownUntilTs || now < this.entryAttemptCooldownUntilTs) {
@@ -1868,7 +2059,7 @@ export class Btc5mLiveRunner {
   }
 
   private isExecutionSlugEligible(slug: string, tick: Btc5mTick): boolean {
-    return slug === tick.currentSlug;
+    return this.isExecutionSlugDispatchable(slug, tick);
   }
 
   private async verifySideBookAvailableForExecution(input: {
@@ -1931,8 +2122,8 @@ export class Btc5mLiveRunner {
   }
 
   private getProfitTakePollMs(): number {
-    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_POLL_MS || 750);
-    if (!Number.isFinite(envValue)) return 750;
+    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_POLL_MS || 250);
+    if (!Number.isFinite(envValue)) return 250;
     return Math.max(250, Math.min(10_000, Math.floor(envValue)));
   }
 
@@ -1947,8 +2138,8 @@ export class Btc5mLiveRunner {
   }
 
   private getEntryAttemptCooldownMs(): number {
-    const envValue = Number(process.env.POLY_V2_ENTRY_COOLDOWN_MS || 1_200);
-    if (!Number.isFinite(envValue)) return 1_200;
+    const envValue = Number(process.env.POLY_V2_ENTRY_COOLDOWN_MS || 500);
+    if (!Number.isFinite(envValue)) return 500;
     return Math.max(250, Math.min(60_000, Math.floor(envValue)));
   }
 
@@ -1961,14 +2152,14 @@ export class Btc5mLiveRunner {
     if (Number.isFinite(envSec) && envSec > 0) {
       return Math.max(250, Math.min(120_000, Math.floor(envSec * 1000)));
     }
-    const envMs = Number(process.env.POLY_V2_REENTRY_COOLDOWN_MS || 8_000);
-    if (!Number.isFinite(envMs)) return 8_000;
+    const envMs = Number(process.env.POLY_V2_REENTRY_COOLDOWN_MS || 2_000);
+    if (!Number.isFinite(envMs)) return 2_000;
     return Math.max(250, Math.min(120_000, Math.floor(envMs)));
   }
 
   private getProfitTakeMinEdge(): number {
-    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_MIN_EDGE || 0.01);
-    if (!Number.isFinite(envValue)) return 0.01;
+    const envValue = Number(process.env.POLY_V2_PROFIT_TAKE_MIN_EDGE || 0.005);
+    if (!Number.isFinite(envValue)) return 0.005;
     return Math.max(0.0001, Math.min(0.25, envValue));
   }
 
@@ -1976,39 +2167,39 @@ export class Btc5mLiveRunner {
     if (typeof this.config.polymarket.live.scalpMode === "boolean") {
       return this.config.polymarket.live.scalpMode;
     }
-    const normalized = String(process.env.POLYMARKET_SCALP_MODE || "false").trim().toLowerCase();
+    const normalized = String(process.env.POLYMARKET_SCALP_MODE || "true").trim().toLowerCase();
     return normalized === "1" || normalized === "true" || normalized === "yes";
   }
 
   private getScalpTp1Usd(): number {
     const cfg = Number(this.config.polymarket.live.scalpTp1Usd);
     if (Number.isFinite(cfg) && cfg > 0) return Math.max(0.01, Math.min(100, cfg));
-    const envValue = Number(process.env.POLYMARKET_SCALP_TP1_USD || 0.12);
-    if (!Number.isFinite(envValue)) return 0.12;
+    const envValue = Number(process.env.POLYMARKET_SCALP_TP1_USD || 0.03);
+    if (!Number.isFinite(envValue)) return 0.03;
     return Math.max(0.01, Math.min(100, envValue));
   }
 
   private getScalpTp2Usd(): number {
     const cfg = Number(this.config.polymarket.live.scalpTp2Usd);
     if (Number.isFinite(cfg) && cfg > 0) return Math.max(0.01, Math.min(100, cfg));
-    const envValue = Number(process.env.POLYMARKET_SCALP_TP2_USD || 0.25);
-    if (!Number.isFinite(envValue)) return 0.25;
+    const envValue = Number(process.env.POLYMARKET_SCALP_TP2_USD || 0.06);
+    if (!Number.isFinite(envValue)) return 0.06;
     return Math.max(0.01, Math.min(100, envValue));
   }
 
   private getScalpMaxHoldSec(): number {
     const cfg = Number(this.config.polymarket.live.scalpMaxHoldSec);
     if (Number.isFinite(cfg) && cfg > 0) return Math.max(5, Math.min(600, Math.floor(cfg)));
-    const envValue = Number(process.env.POLYMARKET_SCALP_MAX_HOLD_SEC || 60);
-    if (!Number.isFinite(envValue)) return 60;
+    const envValue = Number(process.env.POLYMARKET_SCALP_MAX_HOLD_SEC || 20);
+    if (!Number.isFinite(envValue)) return 20;
     return Math.max(5, Math.min(600, Math.floor(envValue)));
   }
 
   private getScalpTrailRetraceFrac(): number {
     const cfg = Number(this.config.polymarket.live.scalpTrailRetraceFrac);
     if (Number.isFinite(cfg) && cfg > 0) return Math.max(0.05, Math.min(0.95, cfg));
-    const envValue = Number(process.env.POLYMARKET_SCALP_TRAIL_RETRACE_FRAC || 0.35);
-    if (!Number.isFinite(envValue)) return 0.35;
+    const envValue = Number(process.env.POLYMARKET_SCALP_TRAIL_RETRACE_FRAC || 0.20);
+    if (!Number.isFinite(envValue)) return 0.20;
     return Math.max(0.05, Math.min(0.95, envValue));
   }
 
@@ -2056,6 +2247,13 @@ export class Btc5mLiveRunner {
     const envValue = Number(process.env.POLY_V2_NEXT_BUCKET_HANDOFF_WAIT_SEC || 12);
     if (!Number.isFinite(envValue)) return 12;
     return Math.max(0, Math.min(120, Math.floor(envValue)));
+  }
+
+  private getCurrentBucketMinDispatchRemainingSec(): number {
+    const minEntryRemainingSec = Math.max(1, Number(this.config.polymarket.live.minEntryRemainingSec || 1));
+    const envValue = Number(process.env.POLY_V2_CURRENT_BUCKET_MIN_DISPATCH_REMAINING_SEC || Number.NaN);
+    if (!Number.isFinite(envValue)) return minEntryRemainingSec;
+    return Math.max(minEntryRemainingSec, Math.min(180, Math.floor(envValue)));
   }
 
   private getWindowEntryState(slug: string): WindowEntryState {
@@ -2144,6 +2342,7 @@ export class Btc5mLiveRunner {
     const { slug, marketId, tokenId, side, realizedPnlUsd, reason, nowMs } = input;
     const state = this.getWindowEntryState(slug);
     state.realizedPnlUsd += realizedPnlUsd;
+    this.realizedPnlSessionUsd += realizedPnlUsd;
     state.exits += 1;
     state.cooldownUntilTs = Math.max(state.cooldownUntilTs, nowMs + this.getReentryCooldownMs());
     state.clearedSinceLastEntry = true;
@@ -2182,7 +2381,9 @@ export class Btc5mLiveRunner {
   }
 
   private hasOpenOrderForMarket(marketId: string): boolean {
-    return this.execution.getOpenOrders().some((row) => row.marketId === marketId && row.status === "NEW");
+    return this.execution.getOpenOrders().some(
+      (row) => row.marketId === marketId && (row.status === "NEW" || row.status === "UNKNOWN")
+    );
   }
 
   private async maybeDispatchProfitTake(input: {
@@ -2191,13 +2392,14 @@ export class Btc5mLiveRunner {
     allowExecution: boolean;
   }): Promise<string | null> {
     if (!input.allowExecution || !this.canMutateVenueState()) return null;
+    if (this.execution.hasUnknownOpenOrders()) return "ORDER_STATUS_UNKNOWN";
     if (input.selected.slug !== input.tick.currentSlug) return null;
     if (this.activeProfitTakeAttempt) return "PROFIT_TAKE_IN_FLIGHT";
     if (this.activeExecutionAttempt && this.isExecutionAttemptActive(this.activeExecutionAttempt)) {
       const active = this.activeExecutionAttempt;
       const activeAgeMs = Date.now() - active.createdTs;
       const staleByAge = activeAgeMs >= this.getUnfilledEntryMaxAgeMs();
-      const staleByRollover = active.executionSlug !== input.tick.currentSlug;
+      const staleByRollover = !this.isExecutionSlugDispatchable(active.executionSlug, input.tick);
       const staleBySettlement = active.awaitingSettlement || active.postReturned;
       if (active.postingStarted && (staleByAge || staleByRollover || staleBySettlement)) {
         const staleReason: ExecutionStaleReason = staleByRollover ? "ROLLOVER" : "STALE_AFTER_POST";
@@ -2512,7 +2714,7 @@ export class Btc5mLiveRunner {
     }
     const executionGuard = (): boolean => {
       if (!input.attempt) return true;
-      if (input.attempt.postingStarted) return true;
+      if (Date.now() > input.attempt.deadlineTs && !input.attempt.postReturned) return false;
       return this.isExecutionAttemptActive(input.attempt);
     };
 
@@ -2525,9 +2727,30 @@ export class Btc5mLiveRunner {
     if (oracleAgeMs !== null && Number.isFinite(oracleAgeMs) && oracleAgeMs > oracleHardBlockMs) {
       return { action: "HOLD", blocker: "STALE_ORACLE_HARD_BLOCK" };
     }
+    const minVenueShares = this.getMinVenueShares();
+    const advisoryPortfolioThrottle = this.isAdvisoryPortfolioThrottle(this.portfolioEntryPolicy.reason);
+    const minExecutableNotionalUsd =
+      input.decision.sideAsk > 0
+        ? Math.max(this.config.polymarket.sizing.minOrderNotional || 0, minVenueShares * input.decision.sideAsk)
+        : Math.max(0, this.config.polymarket.sizing.minOrderNotional || 0);
+    let remainingPortfolioBudget = Number.isFinite(this.portfolioEntryPolicy.additionalBudgetUsd)
+      ? Math.max(0, this.portfolioEntryPolicy.additionalBudgetUsd)
+      : Number.POSITIVE_INFINITY;
+    if (advisoryPortfolioThrottle && Number.isFinite(minExecutableNotionalUsd) && minExecutableNotionalUsd > 0) {
+      remainingPortfolioBudget = Math.max(remainingPortfolioBudget, minExecutableNotionalUsd);
+    }
+    if (!(remainingPortfolioBudget > 0)) {
+      return { action: "HOLD", blocker: this.portfolioEntryPolicy.reason || "PORTFOLIO_ENTRY_GATE" };
+    }
     const exposure = this.execution.getTotalExposureUsd();
-    const remainingExposureBudget = Math.max(0, this.config.polymarket.risk.maxExposure - exposure);
-    const remainingWindowBudget = Math.max(0, this.config.polymarket.sizing.maxNotionalPerWindow);
+    const remainingExposureBudget = Math.max(
+      0,
+      Math.min(this.config.polymarket.risk.maxExposure - exposure, remainingPortfolioBudget)
+    );
+    const remainingWindowBudget = Math.max(
+      0,
+      Math.min(this.config.polymarket.sizing.maxNotionalPerWindow, remainingPortfolioBudget)
+    );
 
     const computed = this.sizing.compute({
       edge: Math.max(0, input.decision.edge),
@@ -2545,12 +2768,15 @@ export class Btc5mLiveRunner {
       remainingDailyLossBudget: this.risk.getRemainingDailyLossBudget()
     });
 
-    let notionalUsd = Math.max(0, computed.notionalUsd);
-    const minVenueShares = this.getMinVenueShares();
+    let notionalUsd = Math.max(0, Math.min(computed.notionalUsd, remainingPortfolioBudget));
     if (input.decision.sideAsk > 0 && notionalUsd > 0) {
       const shares = notionalUsd / input.decision.sideAsk;
       if (shares < minVenueShares) {
-        notionalUsd = minVenueShares * input.decision.sideAsk;
+        const minNotionalUsd = minVenueShares * input.decision.sideAsk;
+        if (minNotionalUsd > remainingPortfolioBudget + 1e-9 && !advisoryPortfolioThrottle) {
+          return { action: "HOLD", blocker: this.portfolioEntryPolicy.reason || "PORTFOLIO_ENTRY_GATE" };
+        }
+        notionalUsd = minNotionalUsd;
       }
     }
     if (!(notionalUsd > 0)) {
@@ -2674,13 +2900,18 @@ export class Btc5mLiveRunner {
     if (selected.slug !== tick.currentSlug && selected.slug !== tick.nextSlug) {
       return { ok: false, reason: "SELECTED_SLUG_NOT_CURRENT_OR_NEXT" };
     }
-    if (
-      !selected.orderbookOk ||
-      !selected.yesTokenId ||
-      !selected.noTokenId ||
-      !selected.yesBook.bookable ||
-      !selected.noBook.bookable
-    ) {
+    if (!selected.orderbookOk || !selected.yesTokenId || !selected.noTokenId) {
+      return { ok: false, reason: "SELECTED_TOKEN_NOT_EXECUTABLE" };
+    }
+    const yesExecutable =
+      selected.yesBook.bookable &&
+      Number.isFinite(Number(selected.yesBook.bestAsk)) &&
+      Number(selected.yesBook.bestAsk) > 0;
+    const noExecutable =
+      selected.noBook.bookable &&
+      Number.isFinite(Number(selected.noBook.bestAsk)) &&
+      Number(selected.noBook.bestAsk) > 0;
+    if (!yesExecutable && !noExecutable) {
       return { ok: false, reason: "SELECTED_TOKEN_NOT_EXECUTABLE" };
     }
     return { ok: true };
@@ -2695,23 +2926,43 @@ export class Btc5mLiveRunner {
     let selected: Btc5mSelectedMarket | null = input.selected;
     let reselectionTriggered = false;
     let dispatchEligibilityReason = this.computeDispatchEligibilityReason(selected, dispatchTick);
+    const nextBucketPreselection = Boolean(
+      selected &&
+      dispatchEligibilityReason === "PREORDER_STALE_MARKET_SELECTION" &&
+      selected.slug === dispatchTick.nextSlug
+    );
     if (this.selectionVersion !== input.expectedSelectionVersion) {
       dispatchEligibilityReason = "SELECTION_VERSION_MISMATCH";
     }
     const shouldReselect =
-      this.state.warningState === "DISCOVERY_STALE" ||
-      dispatchEligibilityReason === "PREORDER_STALE_MARKET_SELECTION" ||
+      (dispatchEligibilityReason === "PREORDER_STALE_MARKET_SELECTION" && !nextBucketPreselection) ||
+      dispatchEligibilityReason === "TOO_LATE_FOR_ENTRY" ||
       dispatchEligibilityReason === "EXPIRED_WINDOW" ||
       dispatchEligibilityReason === "SELECTED_TOKEN_NOT_EXECUTABLE" ||
       dispatchEligibilityReason === "SELECTION_VERSION_MISMATCH";
 
     if (shouldReselect) {
       reselectionTriggered = true;
-      const reselection = await this.selector.select({ tick: dispatchTick });
-      selected = reselection.selected;
-      dispatchEligibilityReason = selected
-        ? this.computeDispatchEligibilityReason(selected, dispatchTick)
-        : String(reselection.reason || BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS);
+      const reselectionTimeoutMs = this.getDispatchReselectionTimeoutMs(dispatchTick);
+      let reselectionTimedOut = false;
+      const reselection = await Promise.race([
+        this.selector.select({ tick: dispatchTick }),
+        new Promise<null>((resolve) =>
+          setTimeout(() => {
+            reselectionTimedOut = true;
+            resolve(null);
+          }, reselectionTimeoutMs)
+        )
+      ]);
+      if (reselectionTimedOut || !reselection) {
+        selected = null;
+        dispatchEligibilityReason = "DISCOVERY_IN_PROGRESS";
+      } else {
+        selected = reselection.selected;
+        dispatchEligibilityReason = selected
+          ? this.computeDispatchEligibilityReason(selected, dispatchTick)
+          : String(reselection.reason || BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS);
+      }
       this.logger.warn(
         {
           previousSelectedSlug: input.selected.slug,
@@ -2719,7 +2970,9 @@ export class Btc5mLiveRunner {
           dispatchValidationBucket: dispatchTick.currentSlug,
           dispatchValidationRemainingSec: dispatchTick.remainingSec,
           dispatchEligibilityReason,
-          reselectionTriggered: true
+          reselectionTriggered: true,
+          timedOut: reselectionTimedOut || undefined,
+          timeoutMs: reselectionTimedOut ? reselectionTimeoutMs : undefined
         },
         "POLY_V2_DISPATCH_RESELECTION"
       );
@@ -2743,15 +2996,30 @@ export class Btc5mLiveRunner {
   private computeDispatchEligibilityReason(selected: Btc5mSelectedMarket | null, tick: Btc5mTick): string {
     if (!selected) return BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS;
     if (!this.isSelectedBookExecutable(selected)) return "SELECTED_TOKEN_NOT_EXECUTABLE";
+    const minEntryRemainingSec = Math.max(1, Number(this.config.polymarket.live.minEntryRemainingSec || 1));
+    const currentBucketMinDispatchRemainingSec = this.getCurrentBucketMinDispatchRemainingSec();
     if (selected.slug === tick.currentSlug) {
       if (tick.remainingSec <= 0 || selected.remainingSec <= 0) return "EXPIRED_WINDOW";
+      if (tick.remainingSec <= minEntryRemainingSec || selected.remainingSec <= minEntryRemainingSec) {
+        return "TOO_LATE_FOR_ENTRY";
+      }
+      if (
+        tick.remainingSec <= currentBucketMinDispatchRemainingSec ||
+        selected.remainingSec <= currentBucketMinDispatchRemainingSec
+      ) {
+        return "PREORDER_STALE_MARKET_SELECTION";
+      }
       return "ELIGIBLE_CURRENT";
     }
     if (selected.slug === tick.nextSlug) {
       if (tick.remainingSec <= this.getNextBucketHandoffWaitSec()) return "NEXT_BUCKET_HANDOFF_WAIT";
-      return "PREORDER_STALE_MARKET_SELECTION";
+      return "ELIGIBLE_CURRENT";
     }
     return "PREORDER_STALE_MARKET_SELECTION";
+  }
+
+  private isExecutionSlugDispatchable(executionSlug: string, tick: Btc5mTick): boolean {
+    return executionSlug === tick.currentSlug || executionSlug === tick.nextSlug;
   }
 
   private normalizeDispatchHoldReason(reason: string): string {
@@ -2766,21 +3034,33 @@ export class Btc5mLiveRunner {
     return reason;
   }
 
+  private getDispatchReselectionTimeoutMs(tick?: Btc5mTick): number {
+    const envValue = Number(process.env.POLY_V2_DISPATCH_RESELECTION_TIMEOUT_MS || 2000);
+    const normalizedBase = Number.isFinite(envValue) ? Math.max(250, Math.min(10_000, Math.floor(envValue))) : 2000;
+    if (!tick) return normalizedBase;
+    const freshBucketTimeoutMs = Number(process.env.POLY_V2_FRESH_BUCKET_DISPATCH_RESELECTION_TIMEOUT_MS || 5000);
+    const normalizedFreshBucketTimeoutMs = Number.isFinite(freshBucketTimeoutMs)
+      ? Math.max(250, Math.min(10_000, Math.floor(freshBucketTimeoutMs)))
+      : 5000;
+    if (tick.remainingSec >= 240) {
+      return Math.max(normalizedBase, normalizedFreshBucketTimeoutMs);
+    }
+    return normalizedBase;
+  }
+
   private isSelectedBookExecutable(selected: Btc5mSelectedMarket): boolean {
-    if (
-      !selected.orderbookOk ||
-      !selected.yesTokenId ||
-      !selected.noTokenId ||
-      !selected.yesBook.bookable ||
-      !selected.noBook.bookable
-    ) {
+    if (!selected.orderbookOk || !selected.yesTokenId || !selected.noTokenId) {
       return false;
     }
-    const yesAsk = Number(selected.yesBook.bestAsk);
-    const noAsk = Number(selected.noBook.bestAsk);
-    if (!Number.isFinite(yesAsk) || yesAsk <= 0) return false;
-    if (!Number.isFinite(noAsk) || noAsk <= 0) return false;
-    return true;
+    const yesExecutable =
+      selected.yesBook.bookable &&
+      Number.isFinite(Number(selected.yesBook.bestAsk)) &&
+      Number(selected.yesBook.bestAsk) > 0;
+    const noExecutable =
+      selected.noBook.bookable &&
+      Number.isFinite(Number(selected.noBook.bestAsk)) &&
+      Number(selected.noBook.bestAsk) > 0;
+    return yesExecutable || noExecutable;
   }
 
   private invalidateSelectionCommit(reason: string): void {
@@ -2888,6 +3168,94 @@ export class Btc5mLiveRunner {
     );
   }
 
+  private recordDecisionAttribution(input: {
+    tick: Btc5mTick;
+    reference: ReferenceOracle;
+    selected: Btc5mSelectedMarket | null;
+    intelligence: Btc5mIntelligence | null;
+    decision: Btc5mDecision | null;
+    finalAction: "BUY_YES" | "BUY_NO" | "HOLD";
+    finalBlocker: string | null;
+  }): void {
+    if (!this.store) {
+      return;
+    }
+    const blockerClassification = classifyPolymarketBlocker(input.finalBlocker);
+    const directionalInputs = this.marketIntelligence.getDirectionalInputs(input.tick.tickNowMs);
+    const decisionId = [
+      "POLY",
+      input.tick.tickNowMs,
+      input.selected?.slug ?? input.tick.currentSlug,
+      this.selectionVersion,
+      input.finalAction
+    ].join(":");
+    this.store.recordDecisionAttribution(
+      buildDecisionAttributionRecord({
+        decisionId,
+        ts: input.tick.tickNowMs,
+        venue: "POLYMARKET",
+        strategy: "BTC5M_LIVE_RUNNER",
+        symbol: this.config.symbol,
+        action: input.finalAction,
+        blocker: input.finalBlocker,
+        edge: input.decision?.edge ?? null,
+        referencePrice: input.reference,
+        directionalInputs,
+        market: {
+          current_slug: input.tick.currentSlug,
+          selected_slug: input.selected?.slug ?? null,
+          market_id: input.selected?.marketId ?? null,
+          price_to_beat: input.selected?.priceToBeat ?? null,
+          remaining_sec: input.tick.remainingSec,
+          selected_yes_ask: input.selected?.yesBook.bestAsk ?? null,
+          selected_no_ask: input.selected?.noBook.bestAsk ?? null,
+          selected_yes_spread: input.selected?.yesBook.spread ?? null,
+          selected_no_spread: input.selected?.noBook.spread ?? null,
+          selection_version: this.selectionVersion,
+          dispatch_eligibility_reason: this.state.dispatchEligibilityReason
+        },
+        decision: {
+          chosen_side: input.decision?.chosenSide ?? null,
+          threshold: input.decision?.threshold ?? null,
+          yes_edge: input.decision?.yesEdge ?? null,
+          no_edge: input.decision?.noEdge ?? null,
+          p_up_model: input.decision?.pUpModel ?? null,
+          intelligence_source: input.decision?.intelligenceSource ?? input.intelligence?.source ?? "NONE",
+          intelligence_posture: input.decision?.intelligencePosture ?? input.intelligence?.posture ?? null,
+          intelligence_score: input.decision?.intelligenceScore ?? input.intelligence?.score ?? null,
+          oracle_age_ms: input.decision?.oracleAgeMs ?? input.reference.ageMs ?? null,
+          warning: input.decision?.warning ?? null,
+          blocker_severity: input.decision?.blockerSeverity ?? (input.finalAction === "HOLD" ? "hard" : null),
+          blocker_category: blockerClassification.category,
+          blocker_stage: blockerClassification.stage,
+          positive_edge_blocked:
+            input.finalAction === "HOLD" &&
+            Number.isFinite(Number(input.decision?.edge)) &&
+            Number(input.decision?.edge) > 0
+        },
+        portfolio: {
+          allow_new_entries: this.portfolioEntryPolicy.allowNewEntries,
+          additional_budget_usd: Number.isFinite(this.portfolioEntryPolicy.additionalBudgetUsd)
+            ? this.portfolioEntryPolicy.additionalBudgetUsd
+            : null,
+          policy_reason: this.portfolioEntryPolicy.reason,
+          policy_source: this.portfolioEntryPolicy.source,
+          exposure_usd: this.execution.getTotalExposureUsd(),
+          realized_pnl_usd: this.realizedPnlSessionUsd,
+          entries_in_window: this.state.entriesInWindow,
+          exits_in_window: this.state.exitsInWindow
+        },
+        outcomeTracking: {
+          join_key: decisionId,
+          markout_horizons_sec: [60, 300],
+          reference_symbol: this.config.symbol,
+          evaluation_mode: "REFERENCE_PRICE_MARKOUT",
+          bucket_end_ts: input.selected?.endTs ?? null
+        }
+      })
+    );
+  }
+
   private logInvariantBroken(tick: Btc5mTick, reason: string, extra: Record<string, unknown>): void {
     this.logger.error(
       {
@@ -2905,8 +3273,13 @@ export class Btc5mLiveRunner {
   }
 
   private pushRecentTick(line: Record<string, unknown>): void {
+    const blockerClassification = classifyPolymarketBlocker(
+      typeof line.blocker === "string" ? line.blocker : null
+    );
     this.recentTicks.push({
       ts: Date.now(),
+      blockerCategory: blockerClassification.reason ? blockerClassification.category : null,
+      blockerStage: blockerClassification.reason ? blockerClassification.stage : null,
       ...line
     });
     if (this.recentTicks.length > 200) {
@@ -2915,52 +3288,7 @@ export class Btc5mLiveRunner {
   }
 
   private getReferencePrice(nowMs: number): ReferenceOracle {
-    if (!this.store) {
-      return { price: null, ageMs: null, ts: null, source: "NONE" };
-    }
-    const quotes = this.store
-      .getLatestVenueQuotes(this.config.symbol)
-      .filter((row) => Number.isFinite(row.mid) && row.mid !== null && Number(row.mid) > 0);
-    if (quotes.length > 0) {
-      const latestTs = Math.max(...quotes.map((row) => Number(row.ts || 0)));
-      const mids = quotes
-        .filter((row) => Number(row.ts || 0) >= latestTs - 5_000)
-        .map((row) => Number(row.mid))
-        .filter((row) => Number.isFinite(row) && row > 0)
-        .sort((a, b) => a - b);
-      const mid = mids.length > 0 ? mids[Math.floor(mids.length / 2)] : null;
-      const sourceVenues = quotes
-        .filter((row) => Number(row.ts || 0) >= latestTs - 5_000)
-        .map((row) => String(row.venue || "").trim())
-        .filter((row) => row.length > 0)
-        .sort()
-        .join(",");
-      return {
-        price: mid,
-        ageMs: latestTs > 0 ? Math.max(0, nowMs - latestTs) : null,
-        ts: latestTs > 0 ? latestTs : null,
-        source: sourceVenues ? `EXTERNAL_VENUES:${sourceVenues}` : "EXTERNAL_VENUES"
-      };
-    }
-
-    const latestTicker = this.store.getRecentTickerSnapshots(this.config.symbol, 1)[0] ?? null;
-    const tickerMid = latestTicker && Number.isFinite(latestTicker.mid) && latestTicker.mid > 0 ? latestTicker.mid : null;
-    const tickerTs = latestTicker && Number.isFinite(latestTicker.ts) && latestTicker.ts > 0 ? latestTicker.ts : null;
-    if (tickerMid !== null && tickerTs !== null) {
-      return {
-        price: tickerMid,
-        ageMs: Math.max(0, nowMs - tickerTs),
-        ts: tickerTs,
-        source: "TICKER_SNAPSHOT"
-      };
-    }
-
-    return {
-      price: null,
-      ageMs: null,
-      ts: null,
-      source: "NONE"
-    };
+    return this.marketIntelligence.getReferencePrice(this.config.symbol, nowMs);
   }
 
   private resolveDirectionalIntelligence(input: {
@@ -2978,9 +3306,12 @@ export class Btc5mLiveRunner {
     let rawSignalScore: number | null = null;
     let intelScore: number | null = null;
     let crossVenueBiasScore: number | null = null;
+    const directionalInputs = this.marketIntelligence.getDirectionalInputs(input.nowMs);
+    const aggregate = directionalInputs.aggregate;
+    const intelPosture = directionalInputs.intelPosture;
+    const venueBias = directionalInputs.venueBias;
 
-    if (this.signalsEngine && this.config.signalsEnabled) {
-      const aggregate = this.signalsEngine.getLatestAggregate();
+    if (aggregate && this.config.signalsEnabled) {
       const direction = directionToScore(aggregate.direction);
       const confidence = clampRange(Number(aggregate.confidence || 0), 0, 1);
       const impact = clampRange(Number(aggregate.impact || 0), 0, 1);
@@ -2996,26 +3327,24 @@ export class Btc5mLiveRunner {
       }
     }
 
-    if (this.intelEngine && this.config.enableIntel) {
-      const posture = this.intelEngine.getPosture(input.nowMs);
-      const direction = directionToScore(posture.direction);
-      const confidence = clampRange(Number(posture.confidence || 0), 0, 1);
-      const impact = clampRange(Number(posture.impact || 0), 0, 1);
-      if (posture.ts > 0 || confidence > 0 || impact > 0) {
+    if (intelPosture && this.config.enableIntel) {
+      const direction = directionToScore(intelPosture.direction);
+      const confidence = clampRange(Number(intelPosture.confidence || 0), 0, 1);
+      const impact = clampRange(Number(intelPosture.impact || 0), 0, 1);
+      if (intelPosture.ts > 0 || confidence > 0 || impact > 0) {
         const strength = clampRange(Math.max(0.1, impact) * confidence, 0, 1);
         intelScore = direction * strength;
         components.push({
           name: "INTEL_ENGINE",
           weight: 0.35,
           score: intelScore,
-          posture: String(posture.state || "NORMAL")
+          posture: String(intelPosture.state || "NORMAL")
         });
       }
     }
 
-    const status = this.store?.getBotStatus();
-    const signalBias = status?.quoting?.bias;
-    const signalBiasConfidence = status?.quoting?.biasConfidence;
+    const signalBias = venueBias.bias;
+    const signalBiasConfidence = venueBias.confidence;
     if (signalBias === "LONG" || signalBias === "SHORT" || signalBias === "NEUTRAL") {
       const direction = signalBias === "LONG" ? 1 : signalBias === "SHORT" ? -1 : 0;
       const confidence = clampRange(Number(signalBiasConfidence || 0), 0, 1);
@@ -3064,9 +3393,19 @@ export class Btc5mLiveRunner {
   }
 
   private getMinVenueShares(): number {
-    const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || 5);
-    if (!Number.isFinite(envValue)) return 5;
-    return Math.max(1, Math.floor(envValue));
+    const configuredValue = Number(
+      process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES ||
+        process.env.POLYMARKET_MIN_SHARES_REQUIRED ||
+        this.config.polymarket.sizing.minSharesRequired ||
+        5
+    );
+    const normalizedConfiguredValue = Number.isFinite(configuredValue) ? Math.max(1, Math.floor(configuredValue)) : 5;
+    return Math.max(normalizedConfiguredValue, getPolymarketVenueMinSharesFloor());
+  }
+
+  private isAdvisoryPortfolioThrottle(reason: string | null | undefined): boolean {
+    const normalized = String(reason || "").trim().toUpperCase();
+    return normalized.startsWith("ATTRIBUTION_POLY_");
   }
 
   private canMutateVenueState(): boolean {

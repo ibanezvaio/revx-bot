@@ -3,7 +3,11 @@ import { BotConfig } from "../config";
 import { Logger } from "../logger";
 import { sleep } from "../util/time";
 import { PolymarketClient } from "./PolymarketClient";
-import { computePolymarketEffectiveSizingBasis, getPolymarketSizingFeeBufferBps } from "./sizingMinimums";
+import {
+  computePolymarketEffectiveSizingBasis,
+  getPolymarketSizingFeeBufferBps,
+  getPolymarketVenueMinSharesFloor
+} from "./sizingMinimums";
 import { ExecutionResult, OpenOrderState, PositionState } from "./types";
 
 type SubmittedOrderMeta = {
@@ -21,6 +25,7 @@ type FillTracker = {
 
 type ExecutionLifecycleEvent = "posting_started" | "post_returned" | "reconcile_result";
 type EntryOrderMode = "MARKETABLE" | "RESTING";
+type LocalOrderStatus = OpenOrderState["status"];
 
 export class PolymarketExecution {
   private readonly openOrders = new Map<string, OpenOrderState>();
@@ -152,14 +157,17 @@ export class PolymarketExecution {
 
     let tickSize = params.tickSize;
     if (!tickSize) {
-      if (this.config.polymarket.mode !== "live") {
-        tickSize = "0.01";
-      } else {
-        try {
-          tickSize = await this.client.getTickSize(params.tokenId);
-        } catch {
-          tickSize = "0.01";
-        }
+      tickSize = "0.01";
+      if (this.config.polymarket.mode === "live") {
+        this.logger.warn(
+          {
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            side: params.side,
+            fallbackTickSize: tickSize
+          },
+          "POLY_V2_TICK_SIZE_FALLBACK"
+        );
       }
     }
     const knownAffordableUsd = readKnownAffordableUsd();
@@ -214,7 +222,9 @@ export class PolymarketExecution {
       "POLY_V2_ENTRY_PRICE_PLAN"
     );
 
-    const minVenueShares = getMinVenueShares(this.config.polymarket.sizing.minSharesRequired);
+    const minVenueShares = getMinVenueShares(this.config.polymarket.sizing.minSharesRequired, {
+      enforceVenueFloor: this.config.polymarket.mode === "live"
+    });
     const minVenueNotionalUsd = getMinVenueNotionalUsd(this.config.polymarket.sizing.minOrderNotional);
     const effectiveVenueMinimums = computePolymarketEffectiveSizingBasis({
       enabled: true,
@@ -465,7 +475,7 @@ export class PolymarketExecution {
         row.marketId === params.marketId &&
         row.tokenId === params.tokenId &&
         row.side === "BUY" &&
-        row.status === "NEW"
+        isActiveLocalOrderStatus(row.status)
     );
     if (hasOpenDuplicate) {
       return {
@@ -525,6 +535,7 @@ export class PolymarketExecution {
       marketId: params.marketId,
       tokenId: params.tokenId,
       side: "BUY",
+      positionSide: params.side,
       limitPrice,
       shares,
       notionalUsd: estimatedCost,
@@ -665,7 +676,9 @@ export class PolymarketExecution {
       });
       return out;
     } catch (error) {
-      openOrder.status = "REJECTED";
+      const normalizedReason = this.normalizeOrderRejectReason(error);
+      const unknownOrderState = normalizedReason === "ORDER_POST_STATUS_UNKNOWN";
+      openOrder.status = unknownOrderState ? "UNKNOWN" : "REJECTED";
       this.logger.error(
         { error, marketId: params.marketId, tokenId: params.tokenId, side: params.side },
         "POLY_LIVE_REJECT"
@@ -679,7 +692,19 @@ export class PolymarketExecution {
         payload.error = serializeErrorDetails(error);
       }
       this.logger.error(payload, "Polymarket order rejected");
-      const normalizedReason = this.normalizeOrderRejectReason(error);
+      if (unknownOrderState) {
+        this.logger.error(
+          {
+            localOrderId,
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            side: params.side,
+            venueOrderId: openOrder.venueOrderId ?? null,
+            errorSummary: shortErrorSummary(error)
+          },
+          "POLY_V2_ORDER_STATUS_UNKNOWN"
+        );
+      }
       const out: ExecutionResult = {
         action: entryAction,
         accepted: false,
@@ -696,9 +721,13 @@ export class PolymarketExecution {
         openOrder.venueOrderId && this.fillsByVenueOrderId.has(openOrder.venueOrderId)
           ? this.fillsByVenueOrderId.get(openOrder.venueOrderId)?.shares ?? 0
           : 0;
-      const releasedCashUsd = openOrder.side === "BUY" && !(filledShares > 0) ? Math.max(0, openOrder.notionalUsd) : 0;
+      const preserveLocalOrder = isUnknownLocalOrderStatus(openOrder.status);
+      const releasedCashUsd =
+        openOrder.side === "BUY" && !(filledShares > 0) && !preserveLocalOrder ? Math.max(0, openOrder.notionalUsd) : 0;
       const reservedCashUsdBefore = this.getReservedOpenBuyNotionalUsd();
-      this.openOrders.delete(localOrderId);
+      if (!preserveLocalOrder) {
+        this.openOrders.delete(localOrderId);
+      }
       const reservedCashUsdAfter = this.getReservedOpenBuyNotionalUsd();
       if (releasedCashUsd > 0) {
         this.logger.info(
@@ -715,6 +744,19 @@ export class PolymarketExecution {
           },
           "POLY_V2_RESERVED_BUYING_POWER_RELEASED"
         );
+      } else if (preserveLocalOrder && openOrder.side === "BUY") {
+        this.logger.warn(
+          {
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            localOrderId,
+            venueOrderId: openOrder.venueOrderId ?? null,
+            side: params.side,
+            reservedCashUsdBefore,
+            reservedCashUsdAfter
+          },
+          "POLY_V2_RESERVED_BUYING_POWER_HELD_UNKNOWN"
+        );
       }
     }
   }
@@ -730,7 +772,7 @@ export class PolymarketExecution {
     const maxAgeMs = Number.isFinite(params.maxAgeMs) ? Math.max(0, Number(params.maxAgeMs)) : 0;
     const shouldContinue = (): boolean => (params.executionGuard ? params.executionGuard() : true);
     const targets = Array.from(this.openOrders.values()).filter((row) => {
-      if (row.side !== "BUY" || row.status !== "NEW") return false;
+      if (row.side !== "BUY" || !isActiveLocalOrderStatus(row.status)) return false;
       if (row.marketId !== params.marketId) return false;
       if (params.tokenId && row.tokenId !== params.tokenId) return false;
       if ((row.matchedShares || 0) > 0) return false;
@@ -741,6 +783,18 @@ export class PolymarketExecution {
     for (const order of targets) {
       if (!shouldContinue()) break;
       if (!order.venueOrderId) {
+        if (isUnknownLocalOrderStatus(order.status)) {
+          this.logger.warn(
+            {
+              marketId: order.marketId,
+              tokenId: order.tokenId,
+              localOrderId: order.localOrderId,
+              reason: params.reason
+            },
+            "POLY_V2_UNCANCELLABLE_UNKNOWN_ORDER"
+          );
+          continue;
+        }
         order.status = "CANCELLED";
         cancelledCount += 1;
         continue;
@@ -771,14 +825,19 @@ export class PolymarketExecution {
   }
 
   countOpenEntryOrdersForMarket(marketId: string): number {
-    return Array.from(this.openOrders.values()).filter((row) => row.side === "BUY" && row.status === "NEW" && row.marketId === marketId)
-      .length;
+    return Array.from(this.openOrders.values()).filter(
+      (row) => row.side === "BUY" && isActiveLocalOrderStatus(row.status) && row.marketId === marketId
+    ).length;
+  }
+
+  hasUnknownOpenOrders(): boolean {
+    return Array.from(this.openOrders.values()).some((row) => isUnknownLocalOrderStatus(row.status));
   }
 
   private getReservedOpenBuyNotionalUsd(): number {
     let reserved = 0;
     for (const order of this.openOrders.values()) {
-      if (order.side !== "BUY" || order.status !== "NEW") continue;
+      if (order.side !== "BUY" || !isActiveLocalOrderStatus(order.status)) continue;
       const matchedShares = Number.isFinite(order.matchedShares) ? Number(order.matchedShares) : 0;
       const matchedNotional = Math.max(0, Math.min(order.shares, matchedShares) * order.limitPrice);
       reserved += Math.max(0, order.notionalUsd - matchedNotional);
@@ -789,7 +848,7 @@ export class PolymarketExecution {
   private getUnsettledOpenBuyNotionalUsd(): number {
     let unsettled = 0;
     for (const order of this.openOrders.values()) {
-      if (order.side !== "BUY" || order.status !== "NEW") continue;
+      if (order.side !== "BUY" || !isActiveLocalOrderStatus(order.status)) continue;
       const matchedShares = Number.isFinite(order.matchedShares) ? Number(order.matchedShares) : 0;
       const matchedNotional = Math.max(0, Math.min(order.shares, matchedShares) * order.limitPrice);
       unsettled += matchedNotional;
@@ -827,7 +886,7 @@ export class PolymarketExecution {
         row.marketId === params.marketId &&
         row.tokenId === params.tokenId &&
         row.side === "SELL" &&
-        row.status === "NEW"
+        isActiveLocalOrderStatus(row.status)
     );
     if (hasOpenDuplicate) {
       return {
@@ -887,6 +946,7 @@ export class PolymarketExecution {
       marketId: params.marketId,
       tokenId: params.tokenId,
       side: "SELL",
+      positionSide: params.side,
       limitPrice,
       shares,
       notionalUsd: shares * limitPrice,
@@ -972,7 +1032,9 @@ export class PolymarketExecution {
         reason: filledShares > 0 ? "LIVE_FILLED_OR_PARTIAL" : "LIVE_PLACED_NO_FILL"
       };
     } catch (error) {
-      openOrder.status = "REJECTED";
+      const normalizedReason = this.normalizeOrderRejectReason(error);
+      const unknownOrderState = normalizedReason === "ORDER_POST_STATUS_UNKNOWN";
+      openOrder.status = unknownOrderState ? "UNKNOWN" : "REJECTED";
       this.logger.error(
         { error, marketId: params.marketId, tokenId: params.tokenId, side: params.side },
         "POLY_LIVE_REJECT"
@@ -986,7 +1048,19 @@ export class PolymarketExecution {
         payload.error = serializeErrorDetails(error);
       }
       this.logger.error(payload, "Polymarket order rejected");
-      const normalizedReason = this.normalizeOrderRejectReason(error);
+      if (unknownOrderState) {
+        this.logger.error(
+          {
+            localOrderId,
+            marketId: params.marketId,
+            tokenId: params.tokenId,
+            side: params.side,
+            venueOrderId: openOrder.venueOrderId ?? null,
+            errorSummary: shortErrorSummary(error)
+          },
+          "POLY_V2_ORDER_STATUS_UNKNOWN"
+        );
+      }
       return {
         action: exitAction,
         accepted: false,
@@ -994,7 +1068,9 @@ export class PolymarketExecution {
         reason: normalizedReason
       };
     } finally {
-      this.openOrders.delete(localOrderId);
+      if (!isUnknownLocalOrderStatus(openOrder.status)) {
+        this.openOrders.delete(localOrderId);
+      }
     }
   }
 
@@ -1066,7 +1142,7 @@ export class PolymarketExecution {
     for (const local of this.openOrders.values()) {
       if (!shouldContinue()) return;
       if (!local.venueOrderId || !remoteOpenIds) continue;
-      if (!remoteOpenIds.has(local.venueOrderId) && local.status === "NEW") {
+      if (!remoteOpenIds.has(local.venueOrderId) && isActiveLocalOrderStatus(local.status)) {
         try {
           const status = await this.client.getOrder(local.venueOrderId, {
             executionGuard: options.shouldContinue
@@ -1092,6 +1168,10 @@ export class PolymarketExecution {
       }
     }
 
+    if (openOrders && recentTrades) {
+      this.reconcileUnknownOpenOrders(openOrders, recentTrades, nowTs);
+    }
+
     for (const trade of recentTrades || []) {
       if (!shouldContinue()) return;
       if (this.seenTradeIds.has(trade.id)) continue;
@@ -1105,7 +1185,8 @@ export class PolymarketExecution {
       this.recordFill(orderId, trade.size, trade.price);
     }
 
-    this.liveReadWarningState = degradedLabels.length > 0 ? "NETWORK_ERROR" : null;
+    this.liveReadWarningState =
+      degradedLabels.length > 0 ? "NETWORK_ERROR" : this.hasUnknownOpenOrders() ? "ORDER_STATUS_UNKNOWN" : null;
     if (degradedLabels.length > 0) {
       this.liveReadDegradedActive = true;
     } else if (this.liveReadDegradedActive) {
@@ -1206,7 +1287,7 @@ export class PolymarketExecution {
       exposure += Math.max(0, position.costUsd);
     }
     for (const order of this.openOrders.values()) {
-      if (order.side === "BUY") {
+      if (order.side === "BUY" && isActiveLocalOrderStatus(order.status)) {
         exposure += Math.max(0, order.notionalUsd);
       }
     }
@@ -1283,7 +1364,89 @@ export class PolymarketExecution {
     if (upper.includes("PRICE") && upper.includes("UNAVAILABLE")) {
       return "PRICE_UNAVAILABLE";
     }
+    if (
+      upper.includes("TIMEOUT") ||
+      upper.includes("ECONNRESET") ||
+      upper.includes("ETIMEDOUT") ||
+      upper.includes("EPIPE") ||
+      upper.includes("NETWORK") ||
+      upper.includes("SOCKET HANG UP")
+    ) {
+      return "ORDER_POST_STATUS_UNKNOWN";
+    }
     return "ORDER_POST_REJECTED";
+  }
+
+  private reconcileUnknownOpenOrders(
+    openOrders: Awaited<ReturnType<PolymarketClient["getOpenOrders"]>>,
+    recentTrades: Awaited<ReturnType<PolymarketClient["getRecentTrades"]>>,
+    nowTs: number
+  ): void {
+    const unknownOrders = Array.from(this.openOrders.values()).filter((row) => isUnknownLocalOrderStatus(row.status));
+    if (unknownOrders.length === 0) return;
+    for (const local of unknownOrders) {
+      const remoteOpenMatch = openOrders.some(
+        (row) => row.market === local.marketId && row.assetId === local.tokenId && row.side === local.side
+      );
+      const matchingTrades = recentTrades.filter((row) => {
+        if (row.assetId !== local.tokenId || row.side !== local.side) return false;
+        const matchTimeMs = parseTradeMatchTimeMs(row.matchTime);
+        return matchTimeMs === null || matchTimeMs >= local.createdTs - 5_000;
+      });
+      if (matchingTrades.length > 0) {
+        const matchedShares = matchingTrades.reduce((sum, row) => sum + Math.max(0, Number(row.size || 0)), 0);
+        const matchedNotional = matchingTrades.reduce(
+          (sum, row) => sum + Math.max(0, Number(row.size || 0)) * Math.max(0, Number(row.price || 0)),
+          0
+        );
+        const previouslyMatchedShares = Number.isFinite(Number(local.matchedShares)) ? Number(local.matchedShares) : 0;
+        const incrementalShares = Math.max(0, matchedShares - previouslyMatchedShares);
+        if (incrementalShares > 0) {
+          this.applyFill(
+            {
+              marketId: local.marketId,
+              tokenId: local.tokenId,
+              orderSide: local.side,
+              positionSide: local.positionSide,
+              limitPrice: local.limitPrice
+            },
+            incrementalShares,
+            matchedShares > 0 ? matchedNotional / matchedShares : local.limitPrice
+          );
+        }
+        local.matchedShares = matchedShares;
+      }
+      if (remoteOpenMatch) {
+        continue;
+      }
+      if ((local.matchedShares || 0) > 0) {
+        this.openOrders.delete(local.localOrderId);
+        this.logger.warn(
+          {
+            localOrderId: local.localOrderId,
+            marketId: local.marketId,
+            tokenId: local.tokenId,
+            side: local.side,
+            matchedShares: local.matchedShares
+          },
+          "POLY_V2_UNKNOWN_ORDER_RECONCILED"
+        );
+        continue;
+      }
+      if (nowTs >= local.expiresTs + 30_000) {
+        this.openOrders.delete(local.localOrderId);
+        this.logger.warn(
+          {
+            localOrderId: local.localOrderId,
+            marketId: local.marketId,
+            tokenId: local.tokenId,
+            side: local.side,
+            resolution: "EXPIRED_WITH_NO_REMOTE_EVIDENCE"
+          },
+          "POLY_V2_UNKNOWN_ORDER_RECONCILED"
+        );
+      }
+    }
   }
 
   private recordFill(orderId: string, sharesDelta: number, price: number, absolute = false): void {
@@ -1416,10 +1579,25 @@ function ceilToPrecision(value: number, decimals: number): number {
   return Math.ceil(value * factor) / factor;
 }
 
-function getMinVenueShares(configuredValue?: number | null): number {
-  const envValue = Number(process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES || configuredValue || 5);
-  if (!Number.isFinite(envValue)) return 5;
-  return Math.max(1, Math.floor(envValue));
+function getMinVenueShares(
+  configuredValue?: number | null,
+  options?: {
+    enforceVenueFloor?: boolean;
+  }
+): number {
+  const configuredMinShares = Number(
+    process.env.POLYMARKET_LIVE_MIN_VENUE_SHARES ||
+      process.env.POLYMARKET_MIN_SHARES_REQUIRED ||
+      configuredValue ||
+      5
+  );
+  const normalizedConfiguredMinShares = Number.isFinite(configuredMinShares)
+    ? Math.max(1, Math.floor(configuredMinShares))
+    : 5;
+  if (!options?.enforceVenueFloor) {
+    return normalizedConfiguredMinShares;
+  }
+  return Math.max(normalizedConfiguredMinShares, getPolymarketVenueMinSharesFloor());
 }
 
 function getMaxEntryNotionalUsd(): number {
@@ -1493,4 +1671,17 @@ function shortErrorSummary(error: unknown): string {
     .map((value) => String(value || "").trim())
     .filter((value) => value.length > 0 && value !== "0")
     .join(":");
+}
+
+function isActiveLocalOrderStatus(status: LocalOrderStatus): boolean {
+  return status === "NEW" || status === "UNKNOWN";
+}
+
+function isUnknownLocalOrderStatus(status: LocalOrderStatus): boolean {
+  return status === "UNKNOWN";
+}
+
+function parseTradeMatchTimeMs(value: string): number | null {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : null;
 }

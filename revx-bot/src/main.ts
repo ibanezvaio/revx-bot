@@ -1,24 +1,8 @@
 import { loadConfig } from "./config";
-import { Execution } from "./exec/Execution";
 import { buildLogger } from "./logger";
-import { MarketData } from "./md/MarketData";
-import { Reconciler } from "./recon/Reconciler";
-import { ExternalQuoteService } from "./quotes/ExternalQuoteService";
-import { RevXClient } from "./revx/RevXClient";
-import { RiskManager } from "./risk/RiskManager";
-import { CrossVenueSignalEngine } from "./signal/CrossVenueSignalEngine";
-import { NewsEngine } from "./news/NewsEngine";
-import { IntelEngine } from "./intel/IntelEngine";
-import { PerformanceEngine } from "./performance/PerformanceEngine";
-import { SignalEngine } from "./signals/SignalEngine";
-import { SignalsEngine } from "./signals/SignalsEngine";
-import { createStore } from "./store/factory";
-import { MakerStrategy } from "./strategy/MakerStrategy";
-import { DashboardServer } from "./web/DashboardServer";
-import { PolymarketEngine } from "./polymarket/PolymarketEngine";
-import { Btc5mLiveRunner } from "./polymarket/live/Btc5mLiveRunner";
 import { getTradingTruthReporter } from "./logging/truth";
 import { initNetworkTransport } from "./http/networkTransport";
+import { TradingCoordinator } from "./runtime/TradingCoordinator";
 
 async function main(): Promise<void> {
   initNetworkTransport();
@@ -26,13 +10,6 @@ async function main(): Promise<void> {
   const logger = buildLogger(config);
   const truthLogger = logger.child({ module: "truth" });
   getTradingTruthReporter(config, truthLogger);
-  const revxLogger = logger.child({ module: "revx" });
-  const reconLogger = logger.child({ module: "recon" });
-  const webLogger = logger.child({ module: "web" });
-  const pmLogger =
-    config.polymarket.enabled
-      ? logger.child({ module: "polymarket" })
-      : null;
   logger.info(
     {
       cwd: process.cwd(),
@@ -67,79 +44,13 @@ async function main(): Promise<void> {
     "Starting revx-bot"
   );
 
-  const store = createStore(config, logger);
-  store.init();
-
-  const client = new RevXClient(config, revxLogger);
-  const marketData = new MarketData(client, revxLogger);
-  const externalQuoteService = new ExternalQuoteService(config, revxLogger);
-  const risk = new RiskManager(config, revxLogger);
-  const signalEngine = new SignalEngine(config);
-  const crossVenueSignalEngine = new CrossVenueSignalEngine(config, logger);
-  const newsEngine = new NewsEngine(config, logger, store);
-  const signalsEngine = new SignalsEngine(config, logger, store);
-  const intelEngine = new IntelEngine(config, logger, newsEngine, signalsEngine);
-  const performanceEngine = config.performanceEnabled
-    ? new PerformanceEngine(config, revxLogger, store, marketData)
-    : undefined;
-  const polyLiveRunnerMode = String(process.env.POLY_LIVE_RUNNER || "").trim().toLowerCase();
-  const usePolymarketV2Runner =
-    config.polymarket.enabled &&
-    config.polymarket.mode === "live" &&
-    polyLiveRunnerMode === "v2";
-  const polymarketEngine =
-    config.polymarket.enabled
-      ? new PolymarketEngine(config, pmLogger ?? logger, { store })
-      : undefined;
-  const polymarketV2Runner =
-    usePolymarketV2Runner
-      ? new Btc5mLiveRunner(config, pmLogger ?? logger, { store, intelEngine, signalsEngine })
-      : undefined;
-  const polymarketRuntimeProvider = usePolymarketV2Runner ? polymarketV2Runner : polymarketEngine;
-  const execution = new Execution(config, revxLogger, client, store, config.dryRun);
-  const reconciler = new Reconciler(config, reconLogger, client, store, marketData, performanceEngine);
-  const dashboard = new DashboardServer(config, webLogger, store, execution.getRunId(), {
-    cancelAllBotOrders: async () => execution.cancelAllBotOrders(config.symbol)
-  }, externalQuoteService, newsEngine, signalsEngine, intelEngine, performanceEngine, polymarketRuntimeProvider);
-  const strategy = new MakerStrategy(
-    config,
-    revxLogger,
-    client,
-    store,
-    marketData,
-    execution,
-    reconciler,
-    risk,
-    signalEngine,
-    crossVenueSignalEngine,
-    newsEngine,
-    signalsEngine,
-    intelEngine
-  );
+  const coordinator = new TradingCoordinator(config, logger);
   let shuttingDown = false;
   const shutdown = async (signal: string, exitCode = 0): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.warn({ signal }, "Shutdown requested");
-
-    strategy.stop();
-    await polymarketV2Runner?.stop("SHUTDOWN");
-    await polymarketEngine?.stop("SHUTDOWN");
-    reconciler.stop();
-    externalQuoteService.stop();
-    newsEngine.stop();
-    signalsEngine.stop();
-    intelEngine.stop();
-    performanceEngine?.stop();
-    dashboard.stop();
-
-    try {
-      await execution.cancelAllBotOrders(config.symbol);
-    } catch (error) {
-      logger.error({ error }, "Failed cancelling bot orders during shutdown");
-    }
-
-    store.close();
+    await coordinator.stop("SHUTDOWN");
     process.exit(exitCode);
   };
 
@@ -152,66 +63,11 @@ async function main(): Promise<void> {
   });
 
   try {
-    dashboard.start();
-    if (config.polymarket.enabled) {
-      pmLogger?.warn(
-        {
-          enabled: config.polymarket.enabled,
-          mode: config.polymarket.mode,
-          fetchEnabled: config.polymarket.fetchEnabled,
-          liveConfirmed: config.polymarket.liveConfirmed,
-          liveExecutionEnabled: config.polymarket.liveExecutionEnabled,
-          killSwitch: config.polymarket.killSwitch,
-          seedSeriesPrefix: config.polymarket.marketQuery.seedSeriesPrefix || null,
-          seedEventSlugs: config.polymarket.marketQuery.seedEventSlugs,
-          sizing: config.polymarket.sizing,
-          risk: config.polymarket.risk,
-          cancelAllOnStart: config.polymarket.execution.cancelAllOnStart,
-          paperForceTrade: config.polymarket.paper.forceTrade,
-          paperForceIntervalSec: config.polymarket.paper.forceIntervalSec,
-          paperForceNotional: config.polymarket.paper.forceNotional
-        },
-        "Polymarket enabled in combined runtime"
-      );
-    }
-    if (config.polymarket.enabled) {
-      // Start Polymarket on its own async loop; never block RevX strategy cycle startup.
-      if (usePolymarketV2Runner) {
-        pmLogger?.warn(
-          { liveRunner: "v2", mode: config.polymarket.mode },
-          "POLY_LIVE_RUNNER=v2 enabled; legacy PolymarketEngine live entry loop disabled"
-        );
-        void polymarketV2Runner?.start().catch((error) => {
-          pmLogger?.error({ error }, "Polymarket v2 live runner failed to start");
-          void shutdown("POLY_V2_STARTUP_FAILED", 1);
-        });
-      } else {
-        void polymarketEngine?.start().catch((error) => {
-          pmLogger?.error({ error }, "Polymarket engine failed to start in combined runtime");
-        });
-      }
-    }
-    externalQuoteService.start();
-    newsEngine.start();
-    signalsEngine.start();
-    intelEngine.start();
-    performanceEngine?.start();
-    reconciler.start();
-    await strategy.start();
+    await coordinator.start();
   } finally {
     if (!shuttingDown) {
-      logger.error("Main loop exited without SIGINT/SIGTERM; stopping Polymarket with UNEXPECTED_EXIT");
+      await coordinator.stop("UNEXPECTED_EXIT");
     }
-    await polymarketV2Runner?.stop(shuttingDown ? "SHUTDOWN" : "UNEXPECTED_EXIT");
-    await polymarketEngine?.stop(shuttingDown ? "SHUTDOWN" : "UNEXPECTED_EXIT");
-    externalQuoteService.stop();
-    newsEngine.stop();
-    signalsEngine.stop();
-    intelEngine.stop();
-    performanceEngine?.stop();
-    dashboard.stop();
-    reconciler.stop();
-    store.close();
   }
 }
 

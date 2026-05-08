@@ -69,7 +69,13 @@ export class Sizing {
           : 0;
     } else {
       const cappedNotional = clamp(rawNotional, 0, Math.max(0, effectiveBudgetCap));
-      notionalUsd = cappedNotional >= minOrder ? cappedNotional : 0;
+      if (cappedNotional >= minOrder) {
+        notionalUsd = cappedNotional;
+      } else if (cappedNotional > 0 && effectiveBudgetCap >= minOrder) {
+        notionalUsd = minOrder;
+      } else {
+        notionalUsd = 0;
+      }
     }
 
     return {

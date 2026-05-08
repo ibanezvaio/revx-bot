@@ -144,13 +144,14 @@ export type OpenOrderState = {
   marketId: string;
   tokenId: string;
   side: "BUY" | "SELL";
+  positionSide: "YES" | "NO";
   limitPrice: number;
   shares: number;
   notionalUsd: number;
   matchedShares?: number;
   createdTs: number;
   expiresTs: number;
-  status: "NEW" | "CANCELLED" | "FILLED" | "REJECTED";
+  status: "NEW" | "CANCELLED" | "FILLED" | "REJECTED" | "UNKNOWN";
 };
 
 export type ExecutionResult = {

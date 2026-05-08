@@ -38,6 +38,7 @@ import { NewsEngine } from "../news/NewsEngine";
 import { SignalsEngine } from "../signals/SignalsEngine";
 import { SignalSnapshot } from "../signals/types";
 import { IntelEngine } from "../intel/IntelEngine";
+import { classifyPolymarketBlocker, summarizePolymarketBlockers } from "../polymarket/live/blockerClassification";
 import { PerformanceEngine } from "../performance/PerformanceEngine";
 import { AdaptiveStatus, AnalysisSummary, AnalysisWindowKey } from "../performance/types";
 import { renderEquityChartScript } from "../ui/components/EquityChart";
@@ -2403,6 +2404,56 @@ export class DashboardServer {
     const avgRestingMetric = this.store.getMetrics("avg_resting_time_seconds", oneHourAgo, 1)[0];
     const revxDegradedMetric = this.store.getMetrics("revx_degraded", now - 5 * 60 * 1000, 1)[0];
     const revxLastDegradedMetric = this.store.getMetrics("revx_last_degraded_ts", 0, 1)[0];
+    const attributionRevxSamplesMetric = this.store.getMetrics("attributionRevxSamples", 0, 1)[0];
+    const attributionRevxAvgMarkoutMetric = this.store.getMetrics("attributionRevxAvgMarkoutBps", 0, 1)[0];
+    const attributionRevxMultiplierMetric = this.store.getMetrics("attributionRevxBuyMultiplier", 0, 1)[0];
+    const attributionPolySamplesMetric = this.store.getMetrics("attributionPolySamples", 0, 1)[0];
+    const attributionPolyAvgMarkoutMetric = this.store.getMetrics("attributionPolyAvgMarkoutBps", 0, 1)[0];
+    const attributionPolyMultiplierMetric = this.store.getMetrics("attributionPolyBudgetMultiplier", 0, 1)[0];
+    const recentDecisionAttributionRows = this.store
+      .getRecentDecisionAttributions(120)
+      .filter((row) => row.symbol === this.config.symbol);
+    const recentDecisionAttributions = recentDecisionAttributionRows
+      .slice(0, 20)
+      .map((row) => {
+        const details = parseJsonObject(row.details_json);
+        const decision = parseJsonObject(details.decision);
+        const portfolio = parseJsonObject(details.portfolio);
+        const blockerClassification = classifyPolymarketBlocker(row.venue === "POLYMARKET" ? row.blocker : null);
+        return {
+          decisionId: row.decision_id,
+          ts: row.ts,
+          venue: row.venue,
+          strategy: row.strategy,
+          action: row.action,
+          blocker: row.blocker,
+          edge: row.edge,
+          referencePrice: row.reference_price,
+          chosenSide:
+            typeof decision.chosen_side === "string" && decision.chosen_side.trim().length > 0
+              ? decision.chosen_side
+              : null,
+          intelligenceSource:
+            typeof decision.intelligence_source === "string" && decision.intelligence_source.trim().length > 0
+              ? decision.intelligence_source
+              : null,
+          intelligenceScore: asNumber(decision.intelligence_score, Number.NaN),
+          policyReason:
+            typeof portfolio.policy_reason === "string" && portfolio.policy_reason.trim().length > 0
+              ? portfolio.policy_reason
+              : null,
+          blockerCategory: blockerClassification.reason ? blockerClassification.category : null,
+          blockerStage: blockerClassification.reason ? blockerClassification.stage : null
+        };
+      });
+    const polymarketBlockerSummary = summarizePolymarketBlockers(
+      recentDecisionAttributionRows
+        .filter((row) => row.venue === "POLYMARKET" && row.action === "HOLD")
+        .map((row) => ({
+          blocker: row.blocker,
+          edge: row.edge
+        }))
+    );
     const latestDecision = this.store.getRecentStrategyDecisions(1)[0];
     const latestDecisionDetails = parseJsonObject(latestDecision?.details_json);
     const latestDecisionQuotePlan = parseJsonObject(latestDecisionDetails.quote_plan);
@@ -2631,6 +2682,28 @@ export class DashboardServer {
           ok: intelHealth.providers.some((row) => row.ok),
           lastError: intelHealth.lastError || null
         }
+      },
+      attributionPolicy: {
+        revx: {
+          samples: Math.max(0, Math.floor(attributionRevxSamplesMetric?.value ?? 0)),
+          avgMarkoutBps: Number.isFinite(attributionRevxAvgMarkoutMetric?.value)
+            ? attributionRevxAvgMarkoutMetric?.value
+            : null,
+          buyMultiplier: Number.isFinite(attributionRevxMultiplierMetric?.value)
+            ? attributionRevxMultiplierMetric?.value
+            : null
+        },
+        polymarket: {
+          samples: Math.max(0, Math.floor(attributionPolySamplesMetric?.value ?? 0)),
+          avgMarkoutBps: Number.isFinite(attributionPolyAvgMarkoutMetric?.value)
+            ? attributionPolyAvgMarkoutMetric?.value
+            : null,
+          budgetMultiplier: Number.isFinite(attributionPolyMultiplierMetric?.value)
+            ? attributionPolyMultiplierMetric?.value
+            : null,
+          blockerSummary: polymarketBlockerSummary
+        },
+        recent: recentDecisionAttributions
       },
       market,
       quotes,

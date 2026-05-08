@@ -1321,6 +1321,19 @@ export class PolymarketEngine {
     };
   }
 
+  getPortfolioSnapshot(): {
+    running: boolean;
+    exposureUsd: number;
+    realizedPnlUsd: number;
+  } {
+    return {
+      running: this.running || this.polyEngineRunning,
+      exposureUsd: this.config.polymarket.mode === "paper" ? 0 : this.execution.getTotalExposureUsd(),
+      realizedPnlUsd:
+        this.config.polymarket.mode === "paper" ? Number(this.paperLedger.getSummary(Date.now()).totalPnlUsd || 0) : 0
+    };
+  }
+
   private getTickTimestamp(now: string | null | undefined): number {
     return toMs(now) || Date.now();
   }
@@ -17508,6 +17521,7 @@ function normalizeHoldReason(reason: string | null | undefined): string | null {
     return "PRICE_UNAVAILABLE";
   }
   if (upper.includes("SIDE_NOT_BOOKABLE") || upper.includes("MISSING_ORDERBOOK")) return "SIDE_NOT_BOOKABLE";
+  if (upper.includes("ORDER_POST_STATUS_UNKNOWN")) return "ORDER_POST_STATUS_UNKNOWN";
   if (upper.includes("ORDER_POST_REJECTED")) return "ORDER_POST_REJECTED";
   if (upper.includes("ORDER_FAILED") || upper.includes("LIVE_REJECTED")) return "ORDER_POST_REJECTED";
   if (upper.includes("SIZE (") && upper.includes("LOWER THAN THE MINIMUM: 5")) return "ORDER_SIZE_BELOW_MIN_SHARES";
@@ -17744,10 +17758,12 @@ function classifyHoldCategory(reason: string | null | undefined): HoldCategory {
     raw.includes("NON_CURRENT_OR_NEXT_WINDOW") ||
     raw.includes("ORDER_ABORT") ||
     raw.includes("LIVE_REJECTED") ||
+    raw.includes("ORDER_POST_STATUS_UNKNOWN") ||
     raw.includes("OPEN_ORDER_ALREADY_EXISTS") ||
     raw.includes("REMOTE_OPEN_ORDER_ALREADY_EXISTS") ||
     raw.includes("NON_POSITIVE_SIZE") ||
     raw.includes("ORDER_FAILED") ||
+    raw.includes("ORDER_POST_STATUS_UNKNOWN") ||
     raw.includes("ORDER_POST_REJECTED")
   ) {
     return "EXECUTION";

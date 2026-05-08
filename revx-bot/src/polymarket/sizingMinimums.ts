@@ -64,6 +64,14 @@ export function getPolymarketSizingFeeBufferBps(): number {
   return Math.max(0, Math.min(1_000, envValue));
 }
 
+export function getPolymarketVenueMinSharesFloor(): number {
+  const explicitVenueFloor = Number(process.env.POLYMARKET_VENUE_MIN_SHARES);
+  if (Number.isFinite(explicitVenueFloor) && explicitVenueFloor > 0) {
+    return Math.max(1, Math.floor(explicitVenueFloor));
+  }
+  return 5;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }

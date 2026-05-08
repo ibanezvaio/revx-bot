@@ -15,6 +15,7 @@ import {
   BalanceSnapshot,
   BotEvent,
   BotStatus,
+  DecisionAttributionRecord,
   ExternalVenueSnapshot,
   FillRecord,
   MetricRecord,
@@ -221,6 +222,25 @@ export class SQLiteStore implements Store {
         inventory_ratio REAL NOT NULL,
         details_json TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS decision_attributions (
+        decision_id TEXT PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        venue TEXT NOT NULL,
+        strategy TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        action TEXT NOT NULL,
+        blocker TEXT,
+        reference_price REAL,
+        edge REAL,
+        details_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_decision_attributions_ts
+        ON decision_attributions(ts);
+
+      CREATE INDEX IF NOT EXISTS idx_decision_attributions_venue_ts
+        ON decision_attributions(venue, ts);
 
       CREATE TABLE IF NOT EXISTS metrics (
         ts INTEGER NOT NULL,
@@ -1094,6 +1114,59 @@ export class SQLiteStore implements Store {
       `
       )
       .all(limit) as StrategyDecision[];
+  }
+
+  recordDecisionAttribution(record: DecisionAttributionRecord): void {
+    this.db
+      .prepare(
+        `
+        INSERT OR REPLACE INTO decision_attributions (
+          decision_id, ts, venue, strategy, symbol, action, blocker, reference_price, edge, details_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        record.decision_id,
+        record.ts,
+        record.venue,
+        record.strategy,
+        record.symbol,
+        record.action,
+        record.blocker ?? null,
+        record.reference_price ?? null,
+        record.edge ?? null,
+        record.details_json
+      );
+  }
+
+  getRecentDecisionAttributions(
+    limit: number,
+    venue?: DecisionAttributionRecord["venue"]
+  ): DecisionAttributionRecord[] {
+    if (venue) {
+      return this.db
+        .prepare(
+          `
+          SELECT decision_id, ts, venue, strategy, symbol, action, blocker, reference_price, edge, details_json
+            FROM decision_attributions
+           WHERE venue = ?
+           ORDER BY ts DESC
+           LIMIT ?
+        `
+        )
+        .all(venue, limit) as DecisionAttributionRecord[];
+    }
+    return this.db
+      .prepare(
+        `
+        SELECT decision_id, ts, venue, strategy, symbol, action, blocker, reference_price, edge, details_json
+          FROM decision_attributions
+         ORDER BY ts DESC
+         LIMIT ?
+      `
+      )
+      .all(limit) as DecisionAttributionRecord[];
   }
 
   recordMetric(metric: MetricRecord): void {

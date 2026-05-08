@@ -1,6 +1,8 @@
 import { deriveBtc5mTickContext } from "../btc5m";
 import { Btc5mLiveRunner } from "../live/Btc5mLiveRunner";
+import { BTC5M_SELECTOR_REASONS } from "../live/Btc5mSelector";
 import { Btc5mDecision, Btc5mSelectedMarket, Btc5mTick } from "../live/Btc5mTypes";
+import { SharedMarketIntelligence } from "../../runtime/SharedMarketIntelligence";
 
 type LogEntry = {
   level: "info" | "warn" | "error" | "debug";
@@ -14,6 +16,7 @@ type RunnerHarness = {
   executionMock: {
     cancelAllCalls: number;
     openEntryOrders: number;
+    hasUnknownOpenOrders: boolean;
   };
 };
 
@@ -25,6 +28,14 @@ function assert(condition: boolean, message: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (typeof value === "string") {
+    process.env[key] = value;
+  } else {
+    delete process.env[key];
+  }
 }
 
 function deepMerge<T extends Record<string, unknown>>(base: T, patch?: Record<string, unknown>): T {
@@ -110,7 +121,8 @@ function createHarness(configOverrides?: Record<string, unknown>): RunnerHarness
 
   const executionMock = {
     cancelAllCalls: 0,
-    openEntryOrders: 0
+    openEntryOrders: 0,
+    hasUnknownOpenOrders: false
   };
 
   (runner as any).execution = {
@@ -119,6 +131,7 @@ function createHarness(configOverrides?: Record<string, unknown>): RunnerHarness
     },
     cancelUnfilledEntryOrders: async () => ({ requestedCount: 1, cancelledCount: 1 }),
     countOpenEntryOrdersForMarket: () => executionMock.openEntryOrders,
+    hasUnknownOpenOrders: () => executionMock.hasUnknownOpenOrders,
     getPositions: () => [] as Array<Record<string, unknown>>,
     getOpenOrders: () => [] as Array<Record<string, unknown>>,
     getTotalExposureUsd: () => 0,
@@ -326,6 +339,26 @@ async function testRolloverStaleHandling(): Promise<void> {
   );
   assert(logEntries(logs, "POLY_V2_UNFILLED_ORDER_CANCEL_REQUEST").length === 1, "rollover: expected cancel request log");
   assertNoDanglingExecutionRefs(runner, "rollover");
+}
+
+async function testRolloverPreservesAttemptAlreadyTargetingNewBucket(): Promise<void> {
+  const { runner, logs } = createHarness();
+  const oldTick = makeTick();
+  const newTick = deriveBtc5mTickContext((oldTick.currentBucketStartSec + 300) * 1000 + 1_000);
+  const selected = makeSelected(newTick);
+  const decision = makeDecision(newTick);
+  (runner as any).activeExecutionAttempt = makeAttempt(newTick, selected, decision, {
+    attemptId: "att-rollover-preserved",
+    postingStarted: false
+  });
+  (runner as any).previousCurrentSlug = oldTick.currentSlug;
+  (runner as any).state.currentBucketSlug = oldTick.currentSlug;
+
+  const shouldInvalidate = (runner as any).shouldInvalidateExecutionAttemptForRollover(newTick.currentSlug);
+
+  assert(shouldInvalidate === false, "rollover-preserved: expected rollover to preserve attempt for new current bucket");
+  assertCleanupCount(logs, "ROLLOVER", 0, "rollover-preserved");
+  assert((runner as any).activeExecutionAttempt?.attemptId === "att-rollover-preserved", "rollover-preserved: attempt should remain active");
 }
 
 async function testSupersededSelectionHandling(): Promise<void> {
@@ -609,6 +642,7 @@ async function testScalpProfitTakeTp1AndTp2RealizePnl(): Promise<void> {
       }
     });
     (runner as any).execution = {
+      hasUnknownOpenOrders: () => false,
       getPositions: () => [
         {
           marketId: selected.marketId,
@@ -691,6 +725,7 @@ async function testScalpProfitTakeMaxHoldExit(): Promise<void> {
     }
   });
   (runner as any).execution = {
+    hasUnknownOpenOrders: () => false,
     getPositions: () => [
       {
         marketId: selected.marketId,
@@ -837,6 +872,99 @@ async function testNextBucketHandoffWaitPreventsDispatch(): Promise<void> {
   }
 }
 
+async function testNextBucketPreselectionDispatchesBeforeHandoffWait(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_680_000; // comfortably before handoff wait
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const tick = makeTick(nowMs);
+    const nextSelected = makeSelected(tick, {
+      slug: tick.nextSlug,
+      selectionSource: "next_slug"
+    });
+    (runner as any).selector = {
+      select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => ({
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: nextSelected,
+        reason: "OK"
+      }),
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+    (runner as any).getReferencePrice = () => ({ price: 100_000, ageMs: 100, ts: nowMs, source: "TEST" });
+    (runner as any).resolveDirectionalIntelligence = () => ({
+      source: "TEST",
+      posture: "TEST",
+      score: 0.5,
+      pUpModel: 0.55,
+      fallbackUsed: false
+    });
+    (runner as any).gate = {
+      evaluate: () => makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" })
+    };
+    (runner as any).maybeDispatchProfitTake = async () => null;
+    let dispatchCalls = 0;
+    (runner as any).dispatchExecutionAttempt = async () => {
+      dispatchCalls += 1;
+      return { action: "BUY_YES", blocker: null };
+    };
+
+    await (runner as any).processCycle(true);
+
+    assert(dispatchCalls === 1, `next-preentry: expected one dispatch call, got ${dispatchCalls}`);
+    assert((runner as any).state.blockedBy === null, "next-preentry: expected no structural blocker");
+    assert((runner as any).state.dispatchEligibilityReason === "ELIGIBLE_CURRENT", "next-preentry: dispatch eligibility mismatch");
+    assert((runner as any).state.selectedSlug === tick.nextSlug, "next-preentry: expected next slug to stay selected");
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testNextBucketAttemptRemainsActiveBeforeHandoff(): Promise<void> {
+  const { runner, logs } = createHarness();
+  const nowMs = 1_773_318_680_000;
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const tick = makeTick(nowMs);
+    const selected = makeSelected(tick, {
+      slug: tick.nextSlug,
+      selectionSource: "next_slug"
+    });
+    const decision = makeDecision(tick, { action: "BUY_NO", chosenSide: "NO" });
+    (runner as any).startExecutionAttempt = () => undefined;
+
+    const result = await (runner as any).dispatchExecutionAttempt({
+      tick,
+      selected,
+      decision,
+      allowExecution: true
+    });
+
+    const attempt = (runner as any).activeExecutionAttempt;
+    assert(result.action === "BUY_NO", `next-bucket-attempt-active: expected BUY_NO, got ${String(result.action)}`);
+    assert(result.blocker === null, `next-bucket-attempt-active: expected null blocker, got ${String(result.blocker)}`);
+    assert(attempt?.executionSlug === tick.nextSlug, "next-bucket-attempt-active: expected active attempt for next slug");
+    assert(
+      (runner as any).isExecutionSlugEligible(attempt.executionSlug, tick) === true,
+      "next-bucket-attempt-active: next-bucket execution slug should be eligible before handoff"
+    );
+    assert(
+      logEntries(logs, "POLY_V2_EXECUTION_ATTEMPT_CREATED").length === 1,
+      "next-bucket-attempt-active: expected attempt created log"
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
 async function testStaleSelectionTriggersReselection(): Promise<void> {
   const { runner } = createHarness();
   const staleMs = 1_773_318_890_000;
@@ -875,6 +1003,412 @@ async function testStaleSelectionTriggersReselection(): Promise<void> {
     assert(result.reselectionTriggered === true, "stale-reselection: expected reselectionTriggered=true");
     assert(result.selected?.slug === freshTick.currentSlug, "stale-reselection: expected fresh current slug after reselection");
     assert(result.dispatchEligibilityReason === "ELIGIBLE_CURRENT", "stale-reselection: expected ELIGIBLE_CURRENT after reselection");
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testLateCurrentSelectionReselectsNextBucketBeforeGate(): Promise<void> {
+  const { runner } = createHarness({
+    polymarket: {
+      live: {
+        minEntryRemainingSec: 60
+      }
+    }
+  });
+  const anchorTick = makeTick(1_773_318_800_000);
+  const bucketStartMs = anchorTick.currentBucketStartSec * 1000;
+  const staleMs = bucketStartMs + 205_000;
+  const freshMs = bucketStartMs + 245_000;
+  const staleTick = makeTick(staleMs);
+  const staleSelected = makeSelected(staleTick, { slug: staleTick.currentSlug });
+  const freshTick = makeTick(freshMs);
+  let selectorCalls = 0;
+  (runner as any).selector = {
+    select: async ({ tick }: { tick: Btc5mTick }) => {
+      selectorCalls += 1;
+      return {
+        tick,
+        attemptedSlugs: [tick.currentSlug, tick.nextSlug, tick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: makeSelected(tick, { slug: tick.nextSlug, selectionSource: "next_slug" }),
+        reason: "OK"
+      };
+    },
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  const originalDateNow = Date.now;
+  Date.now = () => freshMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected: staleSelected,
+      tick: staleTick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(staleTick.remainingSec > 60, `late-current-reselection: expected stale tick to begin entry-eligible, got ${staleTick.remainingSec}`);
+    assert(freshTick.remainingSec <= 60, `late-current-reselection: expected fresh tick to be too late, got ${freshTick.remainingSec}`);
+    assert(selectorCalls === 1, `late-current-reselection: expected selector reselection call once, got ${selectorCalls}`);
+    assert(result.reselectionTriggered === true, "late-current-reselection: expected reselectionTriggered=true");
+    assert(result.selected?.slug === freshTick.nextSlug, "late-current-reselection: expected next slug after reselection");
+    assert(
+      result.dispatchEligibilityReason === "ELIGIBLE_CURRENT",
+      `late-current-reselection: expected ELIGIBLE_CURRENT, got ${String(result.dispatchEligibilityReason)}`
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testCurrentBucketDispatchRemainsEligibleAboveConfiguredMinEntry(): Promise<void> {
+  const original = process.env.POLY_V2_CURRENT_BUCKET_MIN_DISPATCH_REMAINING_SEC;
+  delete process.env.POLY_V2_CURRENT_BUCKET_MIN_DISPATCH_REMAINING_SEC;
+  try {
+    const { runner } = createHarness({
+      polymarket: {
+        live: {
+          minEntryRemainingSec: 20
+        }
+      }
+    });
+    const anchorTick = makeTick(1_773_318_800_000);
+    const bucketStartMs = anchorTick.currentBucketStartSec * 1000;
+    const eligibleCurrentMs = bucketStartMs + 246_000;
+    const tick = makeTick(eligibleCurrentMs);
+    const selected = makeSelected(tick, { slug: tick.currentSlug });
+
+    assert(
+      tick.remainingSec > 20 && tick.remainingSec < 60,
+      `current-bucket-floor: expected remainingSec between 20 and 60, got ${tick.remainingSec}`
+    );
+    const reason = (runner as any).computeDispatchEligibilityReason(selected, tick);
+    assert(reason === "ELIGIBLE_CURRENT", `current-bucket-floor: expected ELIGIBLE_CURRENT, got ${String(reason)}`);
+  } finally {
+    restoreEnv("POLY_V2_CURRENT_BUCKET_MIN_DISPATCH_REMAINING_SEC", original);
+  }
+}
+
+async function testDispatchReselectionTimeoutFailsFast(): Promise<void> {
+  const { runner } = createHarness({
+    polymarket: {
+      live: {
+        minEntryRemainingSec: 60
+      }
+    }
+  });
+  const anchorTick = makeTick(1_773_318_800_000);
+  const bucketStartMs = anchorTick.currentBucketStartSec * 1000;
+  const staleMs = bucketStartMs + 205_000;
+  const freshMs = bucketStartMs + 245_000;
+  const staleTick = makeTick(staleMs);
+  const staleSelected = makeSelected(staleTick, { slug: staleTick.currentSlug });
+  let selectorCalls = 0;
+  (runner as any).selector = {
+    select: async () => {
+      selectorCalls += 1;
+      await new Promise(() => undefined);
+      return {
+        tick: makeTick(freshMs),
+        attemptedSlugs: [],
+        candidatesBeforeFilter: 0,
+        candidatesAfterFilter: 0,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: null,
+        reason: BTC5M_SELECTOR_REASONS.NO_CANDIDATE_MARKETS
+      };
+    },
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  (runner as any).getDispatchReselectionTimeoutMs = () => 1;
+  const originalDateNow = Date.now;
+  Date.now = () => freshMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected: staleSelected,
+      tick: staleTick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(selectorCalls === 1, `dispatch-reselection-timeout: expected one reselection call, got ${selectorCalls}`);
+    assert(result.reselectionTriggered === true, "dispatch-reselection-timeout: expected reselectionTriggered=true");
+    assert(result.selected === null, "dispatch-reselection-timeout: expected null selected after timeout");
+    assert(
+      result.dispatchEligibilityReason === "DISCOVERY_IN_PROGRESS",
+      `dispatch-reselection-timeout: expected DISCOVERY_IN_PROGRESS, got ${String(result.dispatchEligibilityReason)}`
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testAdvisoryAttributionThrottleStillAllowsMinimumExecutableTicket(): Promise<void> {
+  const { runner } = createHarness({
+    polymarket: {
+      sizing: {
+        maxNotionalPerWindow: 10,
+        minOrderNotional: 0.5,
+        minSharesRequired: 1
+      }
+    }
+  });
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, {
+    action: "BUY_YES",
+    chosenSide: "YES",
+    sideAsk: 0.23
+  });
+  let postedNotionalUsd = 0;
+  (runner as any).portfolioEntryPolicy = {
+    allowNewEntries: true,
+    additionalBudgetUsd: 0.84,
+    reason: "ATTRIBUTION_POLY_SOFT_THROTTLE",
+    source: "TEST"
+  };
+  (runner as any).execution.executeBuyYes = async (params: { notionalUsd: number }) => {
+    postedNotionalUsd = Number(params.notionalUsd || 0);
+    return { action: "BUY_YES", accepted: true, filledShares: 5, reason: null };
+  };
+
+  const result = await (runner as any).maybeExecuteDecision({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+
+  assert(result.action === "BUY_YES", `advisory-throttle: expected BUY_YES, got ${String(result.action)}`);
+  assert(result.blocker === null, `advisory-throttle: expected null blocker, got ${String(result.blocker)}`);
+  assert(
+    postedNotionalUsd >= 1.15 - 1e-9,
+    `advisory-throttle: expected minimum executable notional >=1.15, got ${String(postedNotionalUsd)}`
+  );
+}
+
+async function testNextBucketPreselectionSkipsRedundantReselection(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_680_000; // comfortably before handoff wait
+  const tick = makeTick(nowMs);
+  const nextSelected = makeSelected(tick, {
+    slug: tick.nextSlug,
+    selectionSource: "next_slug"
+  });
+  let selectorCalls = 0;
+  (runner as any).selector = {
+    select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => {
+      selectorCalls += 1;
+      return {
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: makeSelected(selectorTick, { slug: selectorTick.nextSlug, selectionSource: "next_slug" }),
+        reason: "OK"
+      };
+    },
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected: nextSelected,
+      tick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(selectorCalls === 0, `next-preselection: expected no reselection call, got ${selectorCalls}`);
+    assert(result.reselectionTriggered === false, "next-preselection: expected reselectionTriggered=false");
+    assert(result.selected?.slug === tick.nextSlug, "next-preselection: expected selected next slug to be retained");
+    assert(
+      result.dispatchEligibilityReason === "ELIGIBLE_CURRENT",
+      `next-preselection: expected ELIGIBLE_CURRENT, got ${String(result.dispatchEligibilityReason)}`
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testFreshSelectionIgnoresPriorDiscoveryStaleWarning(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_680_000;
+  const tick = makeTick(nowMs);
+  const selected = makeSelected(tick, {
+    slug: tick.currentSlug,
+    selectionSource: "current_slug"
+  });
+  let selectorCalls = 0;
+  (runner as any).state.warningState = "DISCOVERY_STALE";
+  (runner as any).selector = {
+    select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => {
+      selectorCalls += 1;
+      return {
+        tick: selectorTick,
+        attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+        candidatesBeforeFilter: 1,
+        candidatesAfterFilter: 1,
+        droppedExtreme: 0,
+        droppedWideSpread: 0,
+        droppedInvalid: 0,
+        selected: makeSelected(selectorTick, { slug: selectorTick.currentSlug, selectionSource: "current_slug" }),
+        reason: "OK"
+      };
+    },
+    isSideBookUnavailable: () => false,
+    markSideBookUnavailable: () => undefined
+  };
+  const originalDateNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const result = await (runner as any).validateSelectionForDispatch({
+      selected,
+      tick,
+      expectedSelectionVersion: (runner as any).selectionVersion
+    });
+    assert(selectorCalls === 0, `fresh-selection-stale-warning: expected no reselection call, got ${selectorCalls}`);
+    assert(result.reselectionTriggered === false, "fresh-selection-stale-warning: expected reselectionTriggered=false");
+    assert(result.selected?.slug === tick.currentSlug, "fresh-selection-stale-warning: expected current slug retained");
+    assert(
+      result.dispatchEligibilityReason === "ELIGIBLE_CURRENT",
+      `fresh-selection-stale-warning: expected ELIGIBLE_CURRENT, got ${String(result.dispatchEligibilityReason)}`
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+}
+
+async function testDispatchExecutionAttemptPreservesStaleOracleBlocker(): Promise<void> {
+  const { runner } = createHarness();
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, {
+    action: "BUY_YES",
+    chosenSide: "YES",
+    oracleAgeMs: 35_000,
+    oracleHardBlockMs: 30_000
+  });
+  (runner as any).verifySideBookAvailableForExecution = async () => true;
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+  assert(result.action === "HOLD", `stale-oracle-dispatch: expected HOLD, got ${String(result.action)}`);
+  assert(
+    result.blocker === "STALE_ORACLE_HARD_BLOCK",
+    `stale-oracle-dispatch: expected STALE_ORACLE_HARD_BLOCK, got ${String(result.blocker)}`
+  );
+}
+
+async function testDispatchExecutionUsesSelectedExecutableBookWithoutReprobe(): Promise<void> {
+  const { runner, logs } = createHarness();
+  const tick = makeTick();
+  const selected = makeSelected(tick, {
+    yesBook: {
+      side: "YES",
+      tokenId: "yes-token",
+      bestBid: 0.48,
+      bestAsk: 0.5,
+      mid: 0.49,
+      spread: 0.02,
+      quoteTs: Date.now(),
+      bookable: true,
+      reason: null
+    }
+  });
+  const decision = makeDecision(tick, { action: "BUY_YES", chosenSide: "YES" });
+  let startCalls = 0;
+  (runner as any).startExecutionAttempt = () => {
+    startCalls += 1;
+  };
+  (runner as any).client.getTokenPriceQuote = async () => {
+    throw new Error("quote reprobe should not run");
+  };
+
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+
+  assert(result.action === "BUY_YES", `selected-book-dispatch: expected BUY_YES, got ${String(result.action)}`);
+  assert(result.blocker === null, `selected-book-dispatch: expected null blocker, got ${String(result.blocker)}`);
+  assert(startCalls === 1, `selected-book-dispatch: expected one attempt start, got ${startCalls}`);
+  assert(
+    logEntries(logs, "POLY_V2_EXECUTION_ATTEMPT_CREATED").length === 1,
+    "selected-book-dispatch: expected exactly one attempt created log"
+  );
+}
+
+async function testProcessCycleRefreshesReferenceAfterSlowSelection(): Promise<void> {
+  const { runner } = createHarness();
+  const nowMs = 1_773_318_680_000;
+  const originalDateNow = Date.now;
+  let currentNowMs = nowMs;
+  Date.now = () => currentNowMs;
+  try {
+    const tick = makeTick(nowMs);
+    const selected = makeSelected(tick, { slug: tick.currentSlug, selectionSource: "current_slug" });
+    let referenceCalls = 0;
+    let observedOracleAgeMs: number | null = null;
+    (runner as any).getReferencePrice = (requestedNowMs: number) => {
+      referenceCalls += 1;
+      if (referenceCalls === 1) {
+        return { price: 100_000, ageMs: 600_000, ts: requestedNowMs - 600_000, source: "STALE" };
+      }
+      return { price: 100_000, ageMs: 100, ts: requestedNowMs - 100, source: "FRESH" };
+    };
+    (runner as any).selector = {
+      select: async ({ tick: selectorTick }: { tick: Btc5mTick }) => {
+        currentNowMs = nowMs + 35_000;
+        return {
+          tick: selectorTick,
+          attemptedSlugs: [selectorTick.currentSlug, selectorTick.nextSlug, selectorTick.prevSlug],
+          candidatesBeforeFilter: 1,
+          candidatesAfterFilter: 1,
+          droppedExtreme: 0,
+          droppedWideSpread: 0,
+          droppedInvalid: 0,
+          selected: makeSelected(makeTick(currentNowMs), { slug: makeTick(currentNowMs).currentSlug, selectionSource: "current_slug" }),
+          reason: "OK"
+        };
+      },
+      isSideBookUnavailable: () => false,
+      markSideBookUnavailable: () => undefined
+    };
+    (runner as any).resolveDirectionalIntelligence = () => ({
+      source: "TEST",
+      posture: "TEST",
+      score: 0.5,
+      pUpModel: 0.55,
+      fallbackUsed: false
+    });
+    (runner as any).gate = {
+      evaluate: ({ tick: gateTick, oracleAgeMs }: { tick: Btc5mTick; oracleAgeMs: number | null }) =>
+        makeDecision(gateTick, { action: "BUY_YES", chosenSide: "YES", oracleAgeMs: oracleAgeMs ?? null })
+    };
+    (runner as any).maybeDispatchProfitTake = async () => null;
+    (runner as any).dispatchExecutionAttempt = async ({ decision }: { decision: Btc5mDecision }) => {
+      observedOracleAgeMs = decision.oracleAgeMs;
+      return { action: "BUY_YES", blocker: null };
+    };
+
+    await (runner as any).processCycle(true);
+
+    assert(referenceCalls >= 2, `refresh-reference: expected at least 2 reference reads, got ${referenceCalls}`);
+    assert(observedOracleAgeMs === 100, `refresh-reference: expected fresh oracle age 100, got ${String(observedOracleAgeMs)}`);
+    assert((runner as any).state.action === "BUY_YES", `refresh-reference: expected BUY_YES action, got ${String((runner as any).state.action)}`);
   } finally {
     Date.now = originalDateNow;
   }
@@ -1175,6 +1709,221 @@ async function testBlockerNormalizationSnapshot(): Promise<void> {
   }
 }
 
+async function testSynthesizedSharedMarketIntelligenceBridge(): Promise<void> {
+  const nowMs = Date.now();
+  const marketIntelligence = new SharedMarketIntelligence({
+    store: {
+      getLatestVenueQuotes: () => [
+        { venue: "coinbase", mid: 100_250, ts: nowMs - 250 },
+        { venue: "binance", mid: 100_200, ts: nowMs - 150 }
+      ],
+      getRecentTickerSnapshots: () => []
+    } as any,
+    signalsEngine: {
+      getLatestAggregate: () => ({
+        direction: "UP",
+        confidence: 0.8,
+        impact: 0.7,
+        ts: nowMs - 100,
+        latestTs: nowMs - 100,
+        state: "RISK_ON"
+      })
+    } as any,
+    intelEngine: {
+      getPosture: () => ({
+        direction: "UP",
+        confidence: 0.6,
+        impact: 0.9,
+        ts: nowMs - 80,
+        state: "MOMENTUM_UP"
+      })
+    } as any
+  });
+  marketIntelligence.publishVenueBias({
+    bias: "LONG",
+    confidence: 0.65,
+    ts: nowMs - 100,
+    source: "TEST_SHARED_BIAS"
+  });
+  const runner = new Btc5mLiveRunner(
+    makeConfig({ signalsEnabled: true, enableIntel: true }) as any,
+    {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+      debug: () => undefined
+    } as any,
+    {
+      marketIntelligence
+    }
+  );
+
+  const reference = (runner as any).getReferencePrice(nowMs);
+  assert(reference.price === 100_250, `shared-intel: expected median quote 100250, got ${String(reference.price)}`);
+  assert(
+    reference.source === "EXTERNAL_VENUES:binance,coinbase",
+    `shared-intel: unexpected source ${String(reference.source)}`
+  );
+
+  const intelligence = (runner as any).resolveDirectionalIntelligence({
+    nowMs,
+    referencePrice: reference.price,
+    priceToBeat: 100_000,
+    fallbackMid: 0.51
+  });
+  assert(intelligence.fallbackUsed === false, "shared-intel: expected shared intelligence path, not fallback");
+  assert(
+    intelligence.source === "SIGNALS_ENGINE+INTEL_ENGINE+CROSS_VENUE_BIAS",
+    `shared-intel: unexpected intelligence source ${String(intelligence.source)}`
+  );
+  assert(intelligence.crossVenueBiasScore === 0.65, `shared-intel: expected bias score 0.65, got ${intelligence.crossVenueBiasScore}`);
+}
+
+async function testSharedMarketIntelligencePrefersFresherTickerSnapshot(): Promise<void> {
+  const nowMs = Date.now();
+  const marketIntelligence = new SharedMarketIntelligence({
+    store: {
+      getLatestVenueQuotes: () => [{ venue: "coinbase", mid: 100_250, ts: nowMs - 60_000 }],
+      getRecentTickerSnapshots: () => [
+        { symbol: "BTC-USD", bid: 100_090, ask: 100_110, mid: 100_100, last: 100_100, ts: nowMs - 250 }
+      ]
+    } as any
+  });
+  const runner = new Btc5mLiveRunner(
+    makeConfig() as any,
+    {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+      debug: () => undefined
+    } as any,
+    {
+      marketIntelligence
+    }
+  );
+
+  const reference = (runner as any).getReferencePrice(nowMs);
+  assert(reference.price === 100_100, `shared-intel-freshest: expected ticker mid 100100, got ${String(reference.price)}`);
+  assert(reference.source === "TICKER_SNAPSHOT", `shared-intel-freshest: unexpected source ${String(reference.source)}`);
+  assert(reference.ageMs !== null && reference.ageMs < 5_000, `shared-intel-freshest: unexpected age ${String(reference.ageMs)}`);
+}
+
+async function testPortfolioEntryPolicyBlocksExecution(): Promise<void> {
+  const { runner } = createHarness();
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { chosenSide: "YES", action: "BUY_YES" });
+  (runner as any).setPortfolioEntryPolicy({
+    allowNewEntries: false,
+    additionalBudgetUsd: 0,
+    reason: "POLYMARKET_DAILY_LOSS_LIMIT",
+    source: "TEST"
+  });
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+  assert(result.action === "HOLD", `portfolio-gate: expected HOLD, got ${result.action}`);
+  assert(
+    result.blocker === "POLYMARKET_DAILY_LOSS_LIMIT",
+    `portfolio-gate: unexpected blocker ${String(result.blocker)}`
+  );
+}
+
+async function testUnknownOrderStateBlocksExecution(): Promise<void> {
+  const { runner, executionMock } = createHarness();
+  const tick = makeTick();
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { chosenSide: "YES", action: "BUY_YES" });
+  executionMock.hasUnknownOpenOrders = true;
+
+  const result = await (runner as any).dispatchExecutionAttempt({
+    tick,
+    selected,
+    decision,
+    allowExecution: true
+  });
+  assert(result.action === "HOLD", `unknown-order-state: expected HOLD, got ${String(result.action)}`);
+  assert(
+    result.blocker === "ORDER_STATUS_UNKNOWN",
+    `unknown-order-state: unexpected blocker ${String(result.blocker)}`
+  );
+}
+
+function testDecisionAttributionIsPersisted(): void {
+  const recorded: Array<Record<string, unknown>> = [];
+  const tick = makeTick();
+  const runner = new Btc5mLiveRunner(
+    makeConfig() as any,
+    {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+      debug: () => undefined
+    } as any,
+    {
+      store: {
+        recordDecisionAttribution: (row: Record<string, unknown>) => recorded.push(row)
+      } as any,
+      marketIntelligence: new SharedMarketIntelligence({
+        store: {
+          getLatestVenueQuotes: () => [{ venue: "coinbase", mid: 100_100, ts: tick.tickNowMs - 200 }],
+          getRecentTickerSnapshots: () => []
+        } as any,
+        signalsEngine: {
+          getLatestAggregate: () => ({
+            direction: "UP",
+            confidence: 0.7,
+            impact: 0.6,
+            ts: tick.tickNowMs - 100,
+            latestTs: tick.tickNowMs - 100,
+            state: "RISK_ON",
+            reasons: ["TEST_SIGNAL"]
+          })
+        } as any,
+        intelEngine: {
+          getPosture: () => ({
+            direction: "UP",
+            confidence: 0.55,
+            impact: 0.5,
+            ts: tick.tickNowMs - 50,
+            state: "MOMENTUM_UP",
+            widenBps: 0,
+            sizeCut: 0,
+            skewBps: 0,
+            haltUntilTs: 0,
+            reasons: ["TEST_INTEL"]
+          })
+        } as any
+      })
+    }
+  );
+  const selected = makeSelected(tick);
+  const decision = makeDecision(tick, { chosenSide: "YES", action: "BUY_YES" });
+  (runner as any).recordDecisionAttribution({
+    tick,
+    reference: { price: 100_100, ageMs: 250, ts: tick.tickNowMs - 250, source: "TEST_REFERENCE" },
+    selected,
+    intelligence: {
+      source: "TEST_INTELLIGENCE",
+      posture: "RISK_ON",
+      score: 0.8,
+      pUpModel: 0.55
+    },
+    decision,
+    finalAction: "BUY_YES",
+    finalBlocker: null
+  });
+  assert(recorded.length === 1, `decision-attribution: expected 1 record, got ${recorded.length}`);
+  assert(recorded[0].venue === "POLYMARKET", `decision-attribution: unexpected venue ${String(recorded[0].venue)}`);
+  assert(recorded[0].action === "BUY_YES", `decision-attribution: unexpected action ${String(recorded[0].action)}`);
+  const details = JSON.parse(String(recorded[0].details_json || "{}")) as Record<string, unknown>;
+  assert(details.schema === "decision_attribution.v1", "decision-attribution: missing schema");
+  assert((details.market as Record<string, unknown>).selected_slug === selected.slug, "decision-attribution: missing slug");
+}
+
 export async function runBtc5mLiveRunnerStateMachineTests(): Promise<void> {
   const tests: Array<{ name: string; fn: () => Promise<void> }> = [
     { name: "single active attempt invariant", fn: testSingleActiveAttemptInvariant },
@@ -1184,6 +1933,7 @@ export async function runBtc5mLiveRunnerStateMachineTests(): Promise<void> {
     { name: "scalp TP1/TP2 exits realize pnl", fn: testScalpProfitTakeTp1AndTp2RealizePnl },
     { name: "scalp max-hold exit fires", fn: testScalpProfitTakeMaxHoldExit },
     { name: "rollover stale cleanup", fn: testRolloverStaleHandling },
+    { name: "rollover preserves attempt already targeting new bucket", fn: testRolloverPreservesAttemptAlreadyTargetingNewBucket },
     { name: "superseded selection cleanup", fn: testSupersededSelectionHandling },
     { name: "deadline exceeded before post", fn: testDeadlineExceededBeforePost },
     { name: "deadline exceeded after posting started", fn: testDeadlineExceededAfterPostingStarted },
@@ -1192,11 +1942,27 @@ export async function runBtc5mLiveRunnerStateMachineTests(): Promise<void> {
     { name: "manual stop path", fn: testManualStopPath },
     { name: "profit take in-flight gating", fn: testProfitTakeInflightGating },
     { name: "next-bucket handoff wait prevents dispatch", fn: testNextBucketHandoffWaitPreventsDispatch },
+    { name: "next-bucket preselection dispatches before handoff wait", fn: testNextBucketPreselectionDispatchesBeforeHandoffWait },
+    { name: "next-bucket attempt remains active before handoff", fn: testNextBucketAttemptRemainsActiveBeforeHandoff },
     { name: "stale selection triggers reselection", fn: testStaleSelectionTriggersReselection },
+    { name: "late current selection reselects next bucket before gate", fn: testLateCurrentSelectionReselectsNextBucketBeforeGate },
+    { name: "current bucket dispatch remains eligible above configured min entry", fn: testCurrentBucketDispatchRemainsEligibleAboveConfiguredMinEntry },
+    { name: "dispatch reselection timeout fails fast", fn: testDispatchReselectionTimeoutFailsFast },
+    { name: "advisory attribution throttle still allows minimum executable ticket", fn: testAdvisoryAttributionThrottleStillAllowsMinimumExecutableTicket },
+    { name: "next bucket preselection skips redundant reselection", fn: testNextBucketPreselectionSkipsRedundantReselection },
+    { name: "fresh selection ignores prior discovery stale warning", fn: testFreshSelectionIgnoresPriorDiscoveryStaleWarning },
+    { name: "dispatch execution preserves stale oracle blocker", fn: testDispatchExecutionAttemptPreservesStaleOracleBlocker },
+    { name: "dispatch execution uses selected executable book without reprobe", fn: testDispatchExecutionUsesSelectedExecutableBookWithoutReprobe },
+    { name: "process cycle refreshes reference after slow selection", fn: testProcessCycleRefreshesReferenceAfterSlowSelection },
     { name: "validated path avoids expired window abort", fn: testValidatedPathAvoidsExpiredWindowAbortReason },
     { name: "all candidates filtered emits no-viable hold", fn: testAllCandidatesFilteredEmitsNoViableHold },
     { name: "selection version mismatch blocks dispatch", fn: testSelectionVersionMismatchBlocksDispatch },
-    { name: "blocker normalization snapshot", fn: testBlockerNormalizationSnapshot }
+    { name: "blocker normalization snapshot", fn: testBlockerNormalizationSnapshot },
+    { name: "shared intelligence bridge", fn: testSynthesizedSharedMarketIntelligenceBridge },
+    { name: "shared intelligence prefers fresher ticker snapshot", fn: testSharedMarketIntelligencePrefersFresherTickerSnapshot },
+    { name: "portfolio entry policy blocks execution", fn: testPortfolioEntryPolicyBlocksExecution },
+    { name: "unknown order state blocks execution", fn: testUnknownOrderStateBlocksExecution },
+    { name: "decision attribution is persisted", fn: async () => testDecisionAttributionIsPersisted() }
   ];
 
   for (const test of tests) {
